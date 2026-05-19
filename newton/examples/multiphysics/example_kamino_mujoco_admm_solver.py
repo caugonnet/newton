@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 import numpy as np
@@ -59,17 +60,55 @@ def _make_kamino_config() -> SolverKamino.Config:
     return config
 
 
-def _capture_frame_graph(model: newton.Model, simulate: Callable[[], None], *, enabled: bool = True):
+def _capture_frame_graph(
+    model: newton.Model,
+    simulate: Callable[..., None],
+    *,
+    enabled: bool = True,
+    solver: SolverAdmmCoupled | None = None,
+):
     if not enabled or not model.device.is_cuda:
         return None
 
+    if solver is not None and os.environ.get("ADMM_STF_TOP_LEVEL_GRAPH", "").lower() in ("1", "true", "yes", "on"):
+        return _capture_frame_graph_stf(model, simulate, solver)
+
+    scoped_capture = solver.scoped_capture() if solver is not None else wp.ScopedCapture()
     with wp.ScopedDevice(model.device):
-        with wp.ScopedCapture() as capture:
+        with scoped_capture as capture:
             simulate()
 
     if capture.graph is None:
         raise RuntimeError(f"CUDA graph capture failed on device {model.device}")
+    dump_path = os.environ.get("ADMM_DUMP_GRAPH_DOT")
+    if dump_path:
+        import warp.stf_experimental as wp_stf  # noqa: PLC0415
+
+        wp_stf.dump_dot(capture.graph, dump_path, flags=0)
+        print(f"[kamino_mujoco_admm_solver] wrote cudaGraph_t DOT to {dump_path}", flush=True)
     return capture.graph
+
+
+def _capture_frame_graph_stf(model: newton.Model, simulate: Callable[..., None], solver: SolverAdmmCoupled):
+    import warp.stf_experimental as wp_stf  # noqa: PLC0415
+
+    if not wp_stf.is_available():
+        return None
+
+    graph = wp_stf.task_graph()
+    try:
+        wp_stf.warmup(device=model.device)
+        with wp.ScopedDevice(model.device):
+            with graph:
+                simulate(graph.context)
+        dump_path = os.environ.get("ADMM_STF_DUMP_GRAPH_DOT")
+        if dump_path:
+            wp_stf.dump_dot(graph.raw, dump_path, flags=0)
+            print(f"[kamino_mujoco_admm_solver] wrote STF cudaGraph_t DOT to {dump_path}", flush=True)
+        return graph
+    except Exception:
+        graph.finalize()
+        raise
 
 
 def _launch_frame_graph(model: newton.Model, graph) -> bool:
@@ -77,7 +116,11 @@ def _launch_frame_graph(model: newton.Model, graph) -> bool:
         return False
 
     with wp.ScopedDevice(model.device):
-        wp.capture_launch(graph)
+        if hasattr(graph, "launch"):
+            graph.launch()
+            wp.synchronize_device(model.device)
+        else:
+            wp.capture_launch(graph)
     return True
 
 
@@ -293,13 +336,46 @@ class Example:
         self._joint_checks.append((parent, parent_point, child, child_point))
 
     def capture(self):
-        self.graph = _capture_frame_graph(self.model, self.simulate, enabled=self.use_graph)
+        if self.use_graph and self.device.is_cuda and os.environ.get("ADMM_STF_TOP_LEVEL_GRAPH", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            self._warmup_stf_capture()
+        self.graph = _capture_frame_graph(self.model, self.simulate_stf, enabled=self.use_graph, solver=self.solver)
+
+    def _warmup_stf_capture(self):
+        # Kamino specializes several Warp kernels on first use; force that outside
+        # STF task capture so Warp does not try to unload/reload modules mid-capture.
+        self.simulate()
+        wp.synchronize_device(self.device)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def simulate_stf(self, ctx=None, phase_token=None):
+        if ctx is None:
+            self.simulate()
+            return
+
+        if phase_token is None:
+            phase_token = ctx.dep(self.state_0.body_f)
+
+        for _ in range(self.sim_substeps):
+            with ctx.task(phase_token.write(), symbol="newton_frame_pre_step"):
+                self.state_0.clear_forces()
+                self.viewer.apply_forces(self.state_0)
+
+            with self.solver.use_stf_graph_context(ctx, phase_token):
+                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):

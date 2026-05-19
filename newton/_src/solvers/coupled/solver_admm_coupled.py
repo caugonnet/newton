@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import warp as wp
@@ -19,6 +21,7 @@ from ..coupling import (
     CouplingHook,
     CouplingInputStateFlags,
 )
+from .._stf_support import stf_capture_kwargs
 from ..flags import SolverNotifyFlags
 from .admm_contact_stream import (
     AdmmContactStream,
@@ -68,7 +71,7 @@ from .admm_utils import (
     velocity_proximal_shift_particle_kernel,
 )
 from .model_view import ModelView
-from .solver_coupled import SolverCoupled, SolverEntry, _copy_prefix
+from .solver_coupled import SolverCoupled, SolverEntry, _copy_prefix, _copy_state
 
 if TYPE_CHECKING:
     from ...sim import Contacts, Control, Model, ModelBuilder, State
@@ -76,6 +79,10 @@ if TYPE_CHECKING:
 
 _DEFAULT_DETECTION_MARGIN = 0.01
 """Default ADMM contact detection margin [m] when a ContactPair leaves it unset."""
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -549,6 +556,8 @@ class SolverAdmmCoupled(SolverCoupled):
         coupling: SolverAdmmCoupled.Config,
     ) -> None:
         self._admm_coupling = coupling
+        self._enable_stf = _env_flag("ADMM_STF_ENABLE")
+        """Run per-entry sub-solver steps as STF tasks when warp.stf_experimental is available."""
         self._admm_buffers: dict[str, _AdmmBuffers] = {}
         self._admm_rr_groups: list[_AdmmRigidRigidAttachmentGroup] = []
         self._admm_rr_angular_groups: list[_AdmmRigidRigidAngularAttachmentGroup] = []
@@ -614,6 +623,60 @@ class SolverAdmmCoupled(SolverCoupled):
                 count += min(int(group.active_count_max.numpy()[0]), group.count)
         self._admm_collision_contact_count_max = max(self._admm_collision_contact_count_max, count)
         return self._admm_collision_contact_count_max
+
+    def capture_kwargs(self) -> dict[str, object]:
+        """Return ``wp.ScopedCapture`` kwargs compatible with the active STF setting."""
+
+        return stf_capture_kwargs(self._enable_stf)
+
+    def scoped_capture(self, **extra) -> wp.ScopedCapture:
+        """Return a :class:`wp.ScopedCapture` configured for the active STF setting."""
+
+        kwargs = self.capture_kwargs()
+        kwargs.update(extra)
+        return wp.ScopedCapture(**kwargs)
+
+    @contextmanager
+    def use_stf_graph_context(self, ctx: Any, token: Any | None = None):
+        """Use a caller-owned stackable STF context while recording this solver."""
+
+        previous = getattr(self, "_stf_graph_context", None)
+        previous_token = getattr(self, "_stf_graph_token", None)
+        self._stf_graph_context = ctx
+        self._stf_graph_token = token
+        try:
+            yield
+        finally:
+            self._stf_graph_token = previous_token
+            self._stf_graph_context = previous
+
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Step ADMM, optionally recording the whole step as STF tasks."""
+
+        stf_graph_context = getattr(self, "_stf_graph_context", None)
+        if stf_graph_context is None:
+            super().step(state_in, state_out, control, contacts, dt)
+            return
+
+        phase_token = getattr(self, "_stf_graph_token", None)
+        if phase_token is None:
+            phase_token = stf_graph_context.token()
+
+        with stf_graph_context.task(phase_token.rw(), symbol="admm_distribute_state"):
+            self._distribute_state(state_in, dt=dt)
+
+        self._step_coupled_with_stf_graph_context(stf_graph_context, state_in, control, contacts, dt)
+
+        with stf_graph_context.task(phase_token.rw(), symbol="admm_reconcile_state"):
+            _copy_state(state_in, state_out)
+            self._reconcile_state(state_out)
 
     def _customize_view(self, name: str, view: ModelView, body_indices: wp.array) -> None:
         """Apply ADMM proximal mass scaling before sub-solver construction."""
@@ -1544,6 +1607,11 @@ class SolverAdmmCoupled(SolverCoupled):
     ) -> None:
         """Run ADMM iterations over all sub-solvers."""
         del state_out
+        stf_graph_context = getattr(self, "_stf_graph_context", None)
+        if stf_graph_context is not None:
+            self._step_coupled_with_stf_graph_context(stf_graph_context, state_in, control, contacts, dt)
+            return
+
         coupling = self._admm_coupling
         iters = max(1, int(coupling.iterations))
         self._refresh_collision_contact_groups(state_in)
@@ -1593,6 +1661,83 @@ class SolverAdmmCoupled(SolverCoupled):
                     wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
 
             self._update_admm_dual(k, dt)
+
+    def _step_coupled_with_stf_graph_context(
+        self,
+        ctx: Any,
+        state_in: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Run ADMM iterations as coarse tasks in a caller-owned STF graph."""
+
+        coupling = self._admm_coupling
+        iters = max(1, int(coupling.iterations))
+        phase_token = getattr(self, "_stf_graph_token", None)
+        if phase_token is None:
+            phase_token = ctx.token()
+
+        with ctx.task(phase_token.rw(), symbol="admm_begin_step"):
+            self._refresh_collision_contact_groups(state_in)
+
+            for name, entry in self._entries.items():
+                buf = self._admm_buffers[name]
+                if buf.body_q_n is not None:
+                    wp.copy(buf.body_q_n, entry.state_0.body_q)
+                    wp.copy(buf.body_qd_n, entry.state_0.body_qd)
+                    wp.copy(buf.body_qd_k, entry.state_0.body_qd)
+                if buf.particle_q_n is not None:
+                    wp.copy(buf.particle_q_n, entry.state_0.particle_q)
+                    wp.copy(buf.particle_qd_n, entry.state_0.particle_qd)
+                    wp.copy(buf.particle_qd_k, entry.state_0.particle_qd)
+                if buf.joint_q_n is not None:
+                    wp.copy(buf.joint_q_n, entry.state_0.joint_q)
+                    wp.copy(buf.joint_qd_n, entry.state_0.joint_qd)
+                    wp.copy(buf.joint_qd_k, entry.state_0.joint_qd)
+
+            self._admm_begin_step(dt)
+
+        entries = list(self._entries.values())
+        for k in range(iters):
+            with ctx.task(phase_token.rw(), symbol="admm_prepare_inputs"):
+                for name, entry in self._entries.items():
+                    self._prepare_admm_iteration_state(
+                        entry,
+                        self._admm_buffers[name],
+                        state_in,
+                        dt,
+                        iteration_restart=k > 0,
+                    )
+
+                self._accumulate_admm_forces(k, dt)
+
+                for name, entry in self._entries.items():
+                    self._apply_admm_force_inputs(entry, self._admm_buffers[name], dt)
+
+            entry_tokens = []
+            for entry in entries:
+                entry_token = ctx.token()
+                entry_tokens.append(entry_token)
+                with ctx.task(phase_token.read(), entry_token.write(), symbol=f"admm_entry_{entry.name}"):
+                    self._step_entry(entry, control, contacts, dt)
+
+            with ctx.task(
+                *(entry_token.read() for entry_token in entry_tokens),
+                phase_token.rw(),
+                symbol="admm_snapshot_velocities",
+            ):
+                for name, entry in self._entries.items():
+                    buf = self._admm_buffers[name]
+                    if buf.body_qd_k is not None:
+                        wp.copy(buf.body_qd_k, entry.state_1.body_qd)
+                    if buf.particle_qd_k is not None:
+                        wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
+                    if buf.joint_qd_k is not None:
+                        wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
+
+            with ctx.task(phase_token.rw(), symbol="admm_update_dual"):
+                self._update_admm_dual(k, dt)
 
     def _refresh_collision_contact_groups(self, state_in: State) -> None:
         if (
