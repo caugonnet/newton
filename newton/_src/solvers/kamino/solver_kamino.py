@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         ConstraintStabilizationConfig,
         DVISolverConfig,
         ForwardKinematicsSolverConfig,
+        LOXSolverConfig,
         MaterialManagerConfig,
         PADMMSolverConfig,
     )
@@ -138,7 +139,6 @@ class SolverKamino(SolverBase, CouplingInterface):
           nonsmooth dynamics using the alternating direction method of multipliers.
           International Journal for Numerical Methods in Engineering, 122(16), 4093-4113.
           https://onlinelibrary.wiley.com/doi/full/10.1002/nme.6693
-
     After constructing :class:`ModelKamino`, :class:`StateKamino`, :class:`ControlKamino` and :class:`ContactsKamino`
     objects, this physics solver may be used to advance the simulation state forward in time.
 
@@ -164,7 +164,8 @@ class SolverKamino(SolverBase, CouplingInterface):
 
         sparse_jacobian: bool | None = None
         """
-        Whether to use a sparse Jacobian representation. When unspecified, defaults to `True` for DVI and `False`
+        Whether the solver should use a sparse Jacobian. ``None`` selects the
+        backend default: sparse for DVI and ``"lox"``, and dense
         for PADMM.
         """
 
@@ -226,6 +227,13 @@ class SolverKamino(SolverBase, CouplingInterface):
         If `None`, default values will be used.
         """
 
+        lox: LOXSolverConfig | None = None
+        """
+        Configurations for the LOX dynamics solver.\n
+        See :class:`LOXSolverConfig` for more details.\n
+        If `None`, default values will be used.
+        """
+
         fk: ForwardKinematicsSolverConfig | None = None
         """
         Configurations for the forward kinematics solver.\n
@@ -254,7 +262,7 @@ class SolverKamino(SolverBase, CouplingInterface):
         Defaults to `"euler"`.
         """
 
-        dynamics_solver: Literal["padmm", "dvi"] = "padmm"
+        dynamics_solver: Literal["padmm", "dvi", "lox"] = "padmm"
         """
         The forward dynamics solver to use. Construct the config with this value
         so solver-dependent defaults are initialized consistently. Defaults to
@@ -305,6 +313,7 @@ class SolverKamino(SolverBase, CouplingInterface):
             config.CollisionDetectorConfig.register_custom_attributes(builder)
             config.PADMMSolverConfig.register_custom_attributes(builder)
             config.DVISolverConfig.register_custom_attributes(builder)
+            config.LOXSolverConfig.register_custom_attributes(builder)
             config.MaterialManagerConfig.register_custom_attributes(builder)
 
             # Register KaminoSceneAPI custom attributes for each individual solver-level configurations
@@ -359,6 +368,7 @@ class SolverKamino(SolverBase, CouplingInterface):
                 "dynamics": config.ConstrainedDynamicsConfig,
                 "padmm": config.PADMMSolverConfig,
                 "dvi": config.DVISolverConfig,
+                "lox": config.LOXSolverConfig,
                 "fk": config.ForwardKinematicsSolverConfig,
                 "materials": config.MaterialManagerConfig,
             }
@@ -391,7 +401,13 @@ class SolverKamino(SolverBase, CouplingInterface):
             from ._src.core.joints import JointCorrectionMode  # noqa: PLC0415
 
             # Ensure that the sparsity settings are compatible with each other
-            if self.sparse_dynamics and not self.sparse_jacobian:
+            sparse_jacobian = self.sparse_jacobian
+            if sparse_jacobian is None:
+                sparse_jacobian = self.dynamics_solver in {"dvi", "lox"}
+            elif not isinstance(sparse_jacobian, bool):
+                raise ValueError(f"Invalid sparse_jacobian: {sparse_jacobian}. Must be a boolean or None.")
+
+            if self.sparse_dynamics and not sparse_jacobian:
                 raise ValueError(
                     "Sparsity setting mismatch: `sparse_dynamics` solver "
                     "option requires that `sparse_jacobian` is set to `True`."
@@ -406,6 +422,8 @@ class SolverKamino(SolverBase, CouplingInterface):
                 raise ValueError("PADMM solver config cannot be None.")
             elif self.dvi is None:
                 raise ValueError("DVI solver config cannot be None.")
+            elif self.lox is None:
+                raise ValueError("LOX solver config cannot be None.")
 
             # Validate specialized sub-configurations
             # using their own built-in validations
@@ -417,9 +435,10 @@ class SolverKamino(SolverBase, CouplingInterface):
             self.dynamics.validate()
             self.padmm.validate()
             self.dvi.validate()
+            self.lox.validate()
             self.materials.validate()
 
-            supported_dynamics_solvers = {"padmm", "dvi"}
+            supported_dynamics_solvers = {"padmm", "dvi", "lox"}
             if self.dynamics_solver not in supported_dynamics_solvers:
                 raise ValueError(
                     f"Invalid dynamics solver: {self.dynamics_solver}. Must be one of {supported_dynamics_solvers}."
@@ -429,6 +448,15 @@ class SolverKamino(SolverBase, CouplingInterface):
                     "The DVI solver currently requires `dynamics.preconditioning=False` so convergence checks and "
                     "contact cone updates stay in physical constraint units."
                 )
+            if self.dynamics_solver == "lox":
+                if self.sparse_dynamics:
+                    raise ValueError("The LOX solver requires dense dynamics.")
+                if self.dynamics.linear_solver_type != "LLTB":
+                    raise ValueError("The LOX solver requires the LLTB linear solver.")
+                if self.integrator != "euler":
+                    raise ValueError("The LOX solver requires the Euler integrator.")
+                if self.angular_velocity_damping != 0.0:
+                    raise ValueError("The LOX solver does not support angular velocity damping.")
 
             # Conversion to JointCorrectionMode will raise an error if the input string is invalid.
             JointCorrectionMode.from_string(self.rotation_correction)
@@ -454,7 +482,7 @@ class SolverKamino(SolverBase, CouplingInterface):
             from . import config  # noqa: PLC0415
 
             if self.sparse_jacobian is None:
-                self.sparse_jacobian = self.dynamics_solver == "dvi"
+                self.sparse_jacobian = self.dynamics_solver in {"dvi", "lox"}
 
             # Default-initialize any sub-configurations that were not explicitly provided by the user
             if self.collision_detector is None and self.use_collision_detector:
@@ -483,6 +511,8 @@ class SolverKamino(SolverBase, CouplingInterface):
                 # Storage backends share one convergence schedule; sparse
                 # optimizations must not silently weaken DVI semantics.
                 self.dvi = config.DVISolverConfig()
+            if self.lox is None:
+                self.lox = config.LOXSolverConfig()
             if self.materials is None:
                 self.materials = config.MaterialManagerConfig()
 
@@ -757,6 +787,7 @@ class SolverKamino(SolverBase, CouplingInterface):
         )
         # Scratch scalar for material update validation
         self._material_update_conflict = wp.empty(1, dtype=wp.int32, device=model.device)
+        self._built_friction_active = self.model.joint_friction.numpy() > 0.0
 
         # Create a collision detector if enabled in the config, otherwise
         # set to `None` to disable internal collision detection in Kamino
@@ -812,6 +843,39 @@ class SolverKamino(SolverBase, CouplingInterface):
         # Initialize the internal Kamino control wrapper
         self._control_kamino = self._kamino.ControlKamino()
         self._control_kamino.finalize(self._model_kamino)
+
+    @property
+    def metrics(self) -> Any | None:
+        """Solution metrics evaluator, or ``None`` when metrics are disabled.
+
+        Enable metrics with :attr:`Config.compute_solution_metrics` and access
+        the per-world metric arrays through ``solver.metrics.data`` after each
+        call to :meth:`step`.
+        """
+        return self._solver_kamino.metrics
+
+    def joint_penalty_scale_seed(self, dt: float) -> list[float]:
+        """Estimate and apply a timestep-aware structural ALM penalty scale.
+
+        Call this once after constructing the solver and before capturing or
+        stepping the simulation. The estimate uses the model's initial state,
+        structural Jacobian, and implicit joint dynamics. It uses a low
+        percentile of the normalized structural spectrum to avoid sensitivity
+        to isolated near-null modes. It performs a one-time dense structural
+        analysis and synchronizes with the host; it is not intended for a
+        captured loop.
+
+        This operation is available only for the LOX backend with
+        the augmented structural-joint solve.
+
+        Args:
+            dt: Simulation time step [s].
+
+        Returns:
+            The estimated and applied dimensionless structural ALM penalty
+            scale for each world.
+        """
+        return self._solver_kamino.joint_penalty_scale_seed(dt)
 
     @override
     def reset(
@@ -1281,6 +1345,9 @@ class SolverKamino(SolverBase, CouplingInterface):
         if not check_dof and not check_actuation and not check_axes:
             return
 
+        if check_dof and self._config.dynamics_solver == "lox":
+            self._check_joint_friction_topology()
+
         sentinel = self._kamino.validate_model_joint_updates(
             self.model,
             self._model_kamino.joints,
@@ -1339,6 +1406,20 @@ class SolverKamino(SolverBase, CouplingInterface):
                 f"Invalid joint configuration for SolverKamino:\n"
                 f"  - joint {joint} ({self.model.joint_label[joint]!r}): "
                 "gimbal axes must preserve the solver's original handedness"
+            )
+
+    def _check_joint_friction_topology(self) -> None:
+        """Check that the allocated scalar joint-friction rows remain valid."""
+        values = self.model.joint_friction.numpy()
+        if not np.isfinite(values).all() or np.any(values < 0.0):
+            raise ValueError("Joint friction values must be finite and nonnegative.")
+        current_active = values > 0.0
+        changed = np.flatnonzero(current_active != self._built_friction_active)
+        if changed.size > 0:
+            dof = int(changed[0])
+            raise RuntimeError(
+                f"Changing joint-friction constraint topology for DOF {dof} is not supported; "
+                "recreate SolverKamino to apply a zero-to-positive or positive-to-zero friction change."
             )
 
     def _update_actuation_types(self) -> None:

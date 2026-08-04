@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
@@ -27,6 +28,7 @@ __all__ = [
     "ConstraintStabilizationConfig",
     "DVISolverConfig",
     "ForwardKinematicsSolverConfig",
+    "LOXSolverConfig",
     "PADMMSolverConfig",
 ]
 
@@ -923,6 +925,150 @@ class DVISolverConfig:
                 f"DVI contact warmstart method is not implemented: {self.contact_warmstart_method}. "
                 f"Choose one of {sorted(implemented_contact_warmstart_methods)}."
             )
+
+    @override
+    def __post_init__(self):
+        """Post-initialization to validate configurations."""
+        self.validate()
+
+
+@dataclass
+class LOXSolverConfig:
+    """A container to hold configurations for the LOX forward dynamics solver."""
+
+    nonlinear_iterations: int = 1
+    """Fixed smooth nonlinear iterations per time step."""
+
+    max_iterations: int = 25
+    """Maximum LOX splitting iterations per nonlinear iteration."""
+
+    projection_iterations: int = 3
+    """Fixed unilateral projection sweeps per splitting iteration."""
+
+    projection_method: Literal["jacobi", "gauss_seidel"] = "jacobi"
+    """Body-space unilateral projection method."""
+
+    position_tolerance: float = 1.0e-5
+    """Translational end-of-step convergence tolerance [m]."""
+
+    rotation_tolerance: float = 1.0e-5
+    """Rotational end-of-step convergence tolerance [rad]."""
+
+    velocity_tolerance: float = 1.0e-5
+    """Consensus dual-velocity convergence tolerance [m/s or rad/s]."""
+
+    weight_sigma: float = 1.0e-3
+    """Relative lower scale used by the inertia-normalized body-weight clamp."""
+
+    weight_beta: float = 4.0
+    """Upper normalized smooth-weight threshold used by the body-weight heuristic."""
+
+    joint_penalty_scale: float = 100.0
+    """Dimensionless scale for effective-mass structural penalties and consensus weights."""
+
+    joint_multiplier_projected_fraction: float = 1.0
+    """Fraction of projected-twist feedback in structural updates, in [0, 1].
+
+    Direct structural updates clamp the effective fraction to ``0.5``.
+    """
+
+    joint_warmstart_factor: float = 0.5
+    """Fraction of the previous structural reaction used to warm-start the next time step."""
+
+    joint_solve_direct: bool = False
+    """Whether to solve structural joints with the direct Schur method."""
+
+    impact_velocity_threshold: float = 1.0e-3
+    """Minimum approaching normal speed that enables restitution [m/s]."""
+
+    contact_warmstart_method: Literal[
+        "key_and_position",
+        "geom_pair_net_force",
+        "geom_pair_net_wrench",
+        "key_and_position_with_net_force_backup",
+        "key_and_position_with_net_wrench_backup",
+    ] = "key_and_position"
+    """Method used to warm-start contacts."""
+
+    @override
+    @staticmethod
+    def register_custom_attributes(builder: ModelBuilder) -> None:
+        """Register LOX custom attributes supported by the Kamino USD schema.
+
+        LOX-specific tuning options are currently Python-only. The shared
+        ``max_solver_iterations`` attribute is registered by
+        :class:`PADMMSolverConfig`.
+        """
+
+    @override
+    @staticmethod
+    def from_model(model: Model, **kwargs: dict[str, Any]) -> LOXSolverConfig:
+        """Creates a :class:`LOXSolverConfig` from model attributes if available.
+
+        Args:
+            model: The Newton model from which to parse configurations.
+        """
+        cfg = LOXSolverConfig(**kwargs)
+        kamino_attrs = getattr(model, "kamino", None)
+        if kamino_attrs is not None and hasattr(kamino_attrs, "max_solver_iterations"):
+            max_iterations = int(kamino_attrs.max_solver_iterations.numpy()[0])
+            if max_iterations >= 0:
+                cfg.max_iterations = max_iterations
+        cfg.validate()
+        return cfg
+
+    @override
+    def validate(self) -> None:
+        """Validates the current values held by this config instance."""
+        from ._src.solvers.warmstart import WarmstarterContacts  # noqa: PLC0415
+
+        iteration_fields = {
+            "nonlinear_iterations": self.nonlinear_iterations,
+            "max_iterations": self.max_iterations,
+            "projection_iterations": self.projection_iterations,
+        }
+        for name, value in iteration_fields.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"Invalid {name}: {value}. Must be an integer greater than or equal to one.")
+        if self.projection_method not in ("jacobi", "gauss_seidel"):
+            raise ValueError(
+                f"Invalid projection_method: {self.projection_method}. Must be 'jacobi' or 'gauss_seidel'."
+            )
+
+        if not np.isfinite(self.position_tolerance) or self.position_tolerance <= 0.0:
+            raise ValueError(f"Invalid position_tolerance: {self.position_tolerance}. Must be greater than zero.")
+        if not np.isfinite(self.rotation_tolerance) or self.rotation_tolerance <= 0.0:
+            raise ValueError(f"Invalid rotation_tolerance: {self.rotation_tolerance}. Must be greater than zero.")
+        if not np.isfinite(self.velocity_tolerance) or self.velocity_tolerance <= 0.0:
+            raise ValueError(f"Invalid velocity_tolerance: {self.velocity_tolerance}. Must be greater than zero.")
+        if not np.isfinite(self.weight_sigma) or self.weight_sigma <= 0.0 or self.weight_sigma > 1.0:
+            raise ValueError(f"Invalid weight_sigma: {self.weight_sigma}. Must be in range (0, 1].")
+        if not np.isfinite(self.weight_beta) or self.weight_beta < 1.0:
+            raise ValueError(f"Invalid weight_beta: {self.weight_beta}. Must be at least one.")
+        if not np.isfinite(self.joint_penalty_scale) or self.joint_penalty_scale <= 0.0:
+            raise ValueError(f"Invalid joint_penalty_scale: {self.joint_penalty_scale}. Must be greater than zero.")
+        if (
+            not np.isfinite(self.joint_multiplier_projected_fraction)
+            or self.joint_multiplier_projected_fraction < 0.0
+            or self.joint_multiplier_projected_fraction > 1.0
+        ):
+            raise ValueError(
+                "Invalid joint_multiplier_projected_fraction: "
+                f"{self.joint_multiplier_projected_fraction}. Must be in range [0, 1]."
+            )
+        if (
+            not np.isfinite(self.joint_warmstart_factor)
+            or self.joint_warmstart_factor < 0.0
+            or self.joint_warmstart_factor > 1.0
+        ):
+            raise ValueError(f"Invalid joint_warmstart_factor: {self.joint_warmstart_factor}. Must be in range [0, 1].")
+        if not isinstance(self.joint_solve_direct, bool):
+            raise ValueError(f"Invalid joint_solve_direct: {self.joint_solve_direct}. Must be a boolean.")
+        if not np.isfinite(self.impact_velocity_threshold) or self.impact_velocity_threshold < 0.0:
+            raise ValueError(
+                f"Invalid impact_velocity_threshold: {self.impact_velocity_threshold}. Must be non-negative."
+            )
+        WarmstarterContacts.Method.from_string(self.contact_warmstart_method)
 
     @override
     def __post_init__(self):

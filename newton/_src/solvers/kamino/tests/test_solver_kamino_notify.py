@@ -21,6 +21,7 @@ def _build_revolute(
     *,
     dynamic: bool = False,
     limited: bool = False,
+    friction: float = 0.0,
     actuator_mode: newton.JointTargetMode = newton.JointTargetMode.NONE,
     body_com: wp.vec3f | None = None,
     shape_materials: tuple[tuple[float, float], ...] | None = None,
@@ -79,6 +80,7 @@ def _build_revolute(
         limit_upper=1.0 if limited else None,
         armature=1.0 if dynamic else 0.0,
         damping=0.0,
+        friction=friction,
         target_ke=0.0,
         target_kd=0.0,
         actuator_mode=actuator_mode,
@@ -207,6 +209,26 @@ class TestKaminoNotifyModelChanged(unittest.TestCase):
         )
         self.assertEqual(warning.call_count, 2)
         _assert_model_arrays_unchanged(model, snapshot)
+
+    def test_lox_joint_friction_magnitude_updates_preserve_topology(self):
+        model = _build_revolute(friction=1.0)
+        solver = SolverKamino(model, config=SolverKamino.Config(dynamics_solver="lox"))
+
+        model.joint_friction.fill_(2.0)
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+
+        model.joint_friction.zero_()
+        with self.assertRaisesRegex(RuntimeError, "joint-friction constraint topology"):
+            solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+
+        zero_model = _build_revolute(friction=0.0)
+        zero_solver = SolverKamino(
+            zero_model,
+            config=SolverKamino.Config(dynamics_solver="lox"),
+        )
+        zero_model.joint_friction.fill_(1.0)
+        with self.assertRaisesRegex(RuntimeError, "joint-friction constraint topology"):
+            zero_solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
 
     def test_aliased_properties_reference_newton(self):
         """Every aliased Newton array shares storage with Kamino, so in-place edits need no notify."""

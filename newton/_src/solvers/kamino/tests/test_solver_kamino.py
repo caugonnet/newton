@@ -11,6 +11,7 @@ import warp as wp
 
 import newton
 import newton._src.solvers.kamino.config as kamino_config
+from newton._src.solvers.kamino._src.core.builder import ModelBuilderKamino
 from newton._src.solvers.kamino._src.core.control import ControlKamino
 from newton._src.solvers.kamino._src.core.data import DataKamino
 from newton._src.solvers.kamino._src.core.joints import JointActuationType
@@ -24,10 +25,15 @@ from newton._src.solvers.kamino._src.kinematics.jacobians import DenseSystemJaco
 from newton._src.solvers.kamino._src.kinematics.joints import JointCorrectionMode, compute_joints_data
 from newton._src.solvers.kamino._src.kinematics.limits import LimitsKamino
 from newton._src.solvers.kamino._src.models.builders import testing
-from newton._src.solvers.kamino._src.models.builders.basics import build_boxes_fourbar
+from newton._src.solvers.kamino._src.models.builders.basics import (
+    build_box_on_plane,
+    build_boxes_fourbar,
+    build_boxes_hinged,
+)
 from newton._src.solvers.kamino._src.models.builders.utils import make_homogeneous_builder
 from newton._src.solvers.kamino._src.solver_kamino_impl import SolverKaminoImpl
 from newton._src.solvers.kamino._src.solvers import PADMMSolver
+from newton._src.solvers.kamino._src.solvers.lox.solver import _low_mode_eigenvalue
 from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino.examples import print_progress_bar
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
@@ -116,6 +122,7 @@ def assert_solver_config(testcase: unittest.TestCase, config: SolverKaminoImpl.C
     testcase.assertIsInstance(config.constraints, kamino_config.ConstraintStabilizationConfig)
     testcase.assertIsInstance(config.dynamics, kamino_config.ConstrainedDynamicsConfig)
     testcase.assertIsInstance(config.padmm, kamino_config.PADMMSolverConfig)
+    testcase.assertIsInstance(config.lox, kamino_config.LOXSolverConfig)
     testcase.assertIsInstance(config.rotation_correction, str)
 
 
@@ -364,9 +371,22 @@ class TestSolverKaminoConfig(unittest.TestCase):
     def test_00_make_default(self):
         config = SolverKaminoImpl.Config()
         assert_solver_config(self, config)
+        self.assertEqual(config.dynamics_solver, "padmm")
+        self.assertFalse(config.sparse_jacobian)
         self.assertEqual(config.rotation_correction, "twopi")
         self.assertEqual(config.dynamics.linear_solver_type, "LLTB")
         self.assertEqual(config.padmm.warmstart_mode, "containers")
+        self.assertEqual(config.lox.nonlinear_iterations, 1)
+        self.assertEqual(config.lox.max_iterations, 25)
+        self.assertEqual(config.lox.projection_iterations, 3)
+        self.assertEqual(config.lox.projection_method, "jacobi")
+        self.assertEqual(config.lox.velocity_tolerance, 1.0e-5)
+        self.assertEqual(config.lox.weight_sigma, 1.0e-3)
+        self.assertEqual(config.lox.weight_beta, 4.0)
+        self.assertEqual(config.lox.joint_penalty_scale, 100.0)
+        self.assertEqual(config.lox.joint_multiplier_projected_fraction, 1.0)
+        self.assertEqual(config.lox.joint_warmstart_factor, 0.5)
+        self.assertFalse(config.lox.joint_solve_direct)
 
     def test_01_make_explicit(self):
         config = SolverKaminoImpl.Config(
@@ -378,6 +398,52 @@ class TestSolverKaminoConfig(unittest.TestCase):
         self.assertEqual(config.rotation_correction, "continuous")
         self.assertEqual(config.dynamics.linear_solver_type, "CR")
         self.assertEqual(config.padmm.warmstart_mode, "internal")
+
+    def test_02_lox_config_validation(self):
+        config = SolverKaminoImpl.Config(dynamics_solver="lox")
+        self.assertEqual(config.dynamics_solver, "lox")
+
+        invalid_values = (
+            {"nonlinear_iterations": 0},
+            {"max_iterations": 0},
+            {"projection_iterations": 0},
+            {"projection_method": "invalid"},
+            {"position_tolerance": 0.0},
+            {"rotation_tolerance": 0.0},
+            {"velocity_tolerance": 0.0},
+            {"weight_sigma": 0.0},
+            {"weight_sigma": 1.1},
+            {"weight_beta": 0.0},
+            {"weight_beta": 0.5},
+            {"joint_penalty_scale": 0.0},
+            {"joint_multiplier_projected_fraction": -0.1},
+            {"joint_multiplier_projected_fraction": 1.1},
+            {"joint_warmstart_factor": -0.1},
+            {"joint_warmstart_factor": 1.1},
+            {"joint_solve_direct": 1},
+            {"impact_velocity_threshold": -1.0},
+            {"position_tolerance": float("nan")},
+            {"velocity_tolerance": float("nan")},
+            {"weight_beta": float("inf")},
+            {"joint_multiplier_projected_fraction": float("nan")},
+            {"joint_warmstart_factor": float("nan")},
+            {"impact_velocity_threshold": float("nan")},
+        )
+        for kwargs in invalid_values:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                kamino_config.LOXSolverConfig(**kwargs)
+
+        with self.assertRaises(ValueError):
+            SolverKaminoImpl.Config(dynamics_solver="invalid")
+        SolverKaminoImpl.Config(dynamics_solver="lox", sparse_jacobian=True)
+        with self.assertRaises(ValueError):
+            SolverKaminoImpl.Config(
+                dynamics_solver="lox",
+                sparse_jacobian=True,
+                sparse_dynamics=True,
+            )
+        with self.assertRaises(ValueError):
+            SolverKaminoImpl.Config(dynamics_solver="lox", integrator="moreau")
 
 
 class TestCollisionCapacityInitialization(unittest.TestCase):
@@ -509,6 +575,56 @@ class TestSolverKaminoImpl(unittest.TestCase):
         self.assertIsInstance(solver, SolverKaminoImpl)
         assert_solver_components(self, solver)
         self.assertIsNone(solver._limits.data.wid)
+
+    def test_backend_specific_sparse_jacobian_default(self):
+        builder = make_homogeneous_builder(num_worlds=1, build_fn=build_boxes_fourbar)
+        model = builder.finalize(device=self.default_device)
+
+        padmm_solver = SolverKaminoImpl(model=model, config=SolverKaminoImpl.Config())
+        self.assertIsInstance(padmm_solver._jacobians, DenseSystemJacobians)
+
+        lox_config = SolverKaminoImpl.Config(dynamics_solver="lox")
+        lox_solver = SolverKaminoImpl(model=model, config=lox_config)
+        self.assertIsInstance(lox_solver._jacobians, SparseSystemJacobians)
+
+        lox_dense_solver = SolverKaminoImpl(
+            model=model,
+            config=SolverKaminoImpl.Config(dynamics_solver="lox", sparse_jacobian=False),
+        )
+        self.assertIsInstance(lox_dense_solver._jacobians, DenseSystemJacobians)
+
+    def test_joint_penalty_scale_seed(self):
+        builder = ModelBuilderKamino(default_world=False)
+        builder.add_builder(build_box_on_plane(ground=False))
+        builder.add_builder(build_boxes_hinged(ground=False))
+        model = builder.finalize(device=self.default_device)
+        seeds = []
+        for sparse_jacobian in (False, True):
+            config = SolverKaminoImpl.Config(
+                dynamics_solver="lox",
+                sparse_jacobian=sparse_jacobian,
+            )
+            config.lox.joint_penalty_scale = 123.0
+            solver = SolverKaminoImpl(model=model, config=config)
+
+            with self.assertRaises(ValueError):
+                solver.joint_penalty_scale_seed(0.0)
+
+            seed = solver.joint_penalty_scale_seed(0.001)
+            self.assertEqual(len(seed), 2)
+            self.assertTrue(np.all(np.isfinite(seed)))
+            self.assertTrue(np.all(np.asarray(seed) > 0.0))
+            self.assertAlmostEqual(seed[0], 123.0)
+            self.assertNotAlmostEqual(seed[1], seed[0])
+            np.testing.assert_allclose(solver.solver_fd.joint_penalty_scale.numpy(), seed)
+            self.assertEqual(config.lox.joint_penalty_scale, 123.0)
+            seeds.append(seed)
+        np.testing.assert_allclose(seeds[1], seeds[0], rtol=0.0, atol=0.0)
+
+    def test_joint_penalty_scale_seed_uses_low_percentile(self):
+        np.testing.assert_equal(_low_mode_eigenvalue(np.arange(1.0, 50.0)), 1.0)
+        np.testing.assert_equal(_low_mode_eigenvalue(np.arange(1.0, 51.0)), 2.0)
+        np.testing.assert_equal(_low_mode_eigenvalue(np.arange(1.0, 101.0)), 3.0)
 
     ###
     # Test Reset Operations
