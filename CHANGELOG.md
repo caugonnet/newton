@@ -10,6 +10,7 @@
 - Add a `damping` parameter to `ModelBuilder.add_joint_ball()` that applies passive angular damping to all three ball-joint DOFs; when omitted, `ModelBuilder.default_joint_cfg.damping` applies.
 - Add per-world `xforms` argument to `ModelBuilder.replicate()` for batching explicitly positioned worlds.
 - Add cubic and triplanar `SensorTiledCamera` texture projection modes for shapes without authored UVs.
+- Add the experimental `SolverKamino` LOX backend through `SolverKamino.Config(dynamics_solver="lox")`, with graph-capturable rigid, articulated, cable, cloth, and tetrahedral soft-body dynamics; joint limits, drives, damping, friction, effort limits, and warm starts; Newton rigid/soft contact and deformable self-contact; configurable projection and linear-solve strategies; convergence diagnostics and runtime topology updates; and support across compatible examples.
 - Add CUDA-graph-capturable rebuildable sparse grids to `SolverImplicitMPM` when `max_active_cell_count` is positive, with optional `max_leaf_node_count`, `max_lower_node_count`, and `max_upper_node_count` hierarchy capacities.
 - Add opt-in isolated multi-world implicit MPM with capacity-bounded rebuildable sparse grids, selective world resets, outer graph capture, and asynchronous overflow reporting; legacy shared topology remains the default.
 - Add contact examples for Newton's cradle, a balance bird, and a domino spiral
