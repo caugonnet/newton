@@ -10,6 +10,7 @@
 #
 ###########################################################################
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -34,6 +35,9 @@ class Example:
         # constraints slightly less accurately than PADMM. Contact forces remain
         # zero until the shapes overlap.
         dvi_contact_margin = 5.0e-4 if self.dynamics_solver == "dvi" else 1e-6
+        self.nonlinear_iterations = getattr(args, "nonlinear_iterations", 1) if args else 1
+        self.max_iterations = getattr(args, "max_iterations", 25) if args else 25
+        self.projection_iterations = getattr(args, "projection_iterations", 3) if args else 3
         self.viewer = viewer
         self.device = wp.get_device()
 
@@ -106,6 +110,13 @@ class Example:
             self.config.dvi.inequality_sweeps_per_iteration = 3
             self.config.dvi.bilateral_solve_interval = 1
             self.config.dvi.contact_warmstart_method = "key_and_position_with_net_force_backup"
+        if self.dynamics_solver == "lox":
+            # The light articulated links need stronger structural enforcement once their feet make contact.
+            self.config.lox.joint_penalty_scale = 100.0
+            self.config.lox.nonlinear_iterations = self.nonlinear_iterations
+            self.config.lox.max_iterations = self.max_iterations
+            self.config.lox.projection_iterations = self.projection_iterations
+            self.config.lox.joint_solve_direct = getattr(args, "direct_structural", False) if args else False
         self.solver = newton.solvers.SolverKamino(self.model, config=self.config)
 
         # Set joint armature and viscous damping for better
@@ -150,8 +161,7 @@ class Example:
         self.solver.reset(state=self.state_0, config=reset_config)
         self.solver.reset(state=self.state_1, config=reset_config)
 
-        # Capture the simulation graph if running on CUDA
-        # NOTE: This only has an effect on GPU devices
+        # Capture with CUDA graphs on GPU or APIC graphs on CPU.
         self.graph = None
         self.capture()
 
@@ -165,7 +175,7 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if self.device.is_cuda and not wp.config.verify_cuda:
+        if not self.device.is_cuda or not wp.config.verify_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -196,8 +206,34 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_1)
         self.viewer.end_frame()
 
+    def _test_state_finite(self):
+        invalid = []
+        for name, array in (
+            ("body_q", self.state_0.body_q),
+            ("body_qd", self.state_0.body_qd),
+            ("joint_q", self.state_0.joint_q),
+            ("joint_qd", self.state_0.joint_qd),
+            ("contact_force", self.contacts.rigid_contact_force),
+        ):
+            values = array.numpy()
+            finite = np.isfinite(values)
+            if not finite.all():
+                finite_max = np.max(np.abs(values[finite])) if finite.any() else float("nan")
+                invalid.append(f"{name} ({np.count_nonzero(~finite)} invalid, finite max {finite_max:.6g})")
+        if self.dynamics_solver == "lox":
+            solver = self.solver._solver_kamino.solver_fd
+            if solver.world_failed.numpy().any():
+                invalid.append("LOX backend failure")
+            structural_residual = solver.adapter.structural_residual.numpy()
+            if np.isfinite(structural_residual).all() and np.max(np.abs(structural_residual), initial=0.0) > 0.25:
+                invalid.append("structural joint residual exceeds 0.25 m or rad")
+        assert not invalid, f"Invalid simulation state at t={self.sim_time:.6g} s: {', '.join(invalid)}"
+
+    def test_post_step(self):
+        self._test_state_finite()
+
     def test_final(self):
-        pass  # TODO: Add some assertions here once we have a more meaningful test scenario
+        self._test_state_finite()
 
     @staticmethod
     def create_parser():
@@ -206,9 +242,32 @@ class Example:
         newton.examples.add_kamino_contacts_arg(parser)
         parser.add_argument(
             "--dynamics-solver",
-            choices=("padmm", "dvi"),
+            choices=("padmm", "dvi", "lox"),
             default="padmm",
             help="Kamino dynamics solver to use.",
+        )
+        parser.add_argument(
+            "--nonlinear-iterations",
+            type=int,
+            default=1,
+            help="LOX smooth nonlinear iterations per time step.",
+        )
+        parser.add_argument(
+            "--max-iterations",
+            type=int,
+            default=25,
+            help="Maximum LOX splitting iterations per nonlinear iteration.",
+        )
+        parser.add_argument(
+            "--projection-iterations",
+            type=int,
+            default=3,
+            help="Sequential projection sweeps per LOX splitting iteration.",
+        )
+        parser.add_argument(
+            "--direct-structural",
+            action="store_true",
+            help="Use the direct Schur structural-joint solve with the LOX backend.",
         )
         parser.add_argument(
             "--linear-solver-type",
@@ -221,7 +280,7 @@ class Example:
             "--no-graph-conditionals",
             dest="use_graph_conditionals",
             action="store_false",
-            help="Disable CUDA graph conditional nodes in Kamino PADMM.",
+            help="Disable graph conditional loops in Kamino PADMM.",
         )
         parser.set_defaults(world_count=1)
         parser.set_defaults(use_kamino_contacts=True)

@@ -154,6 +154,8 @@ class SimulatorFromNewton:
             self._newton_state,
             self._newton_contacts,
             self._contacts,
+            cull_speculative_contacts=self._config.solver.dynamics_solver != "lox",
+            skip_fully_prescribed_contacts=self._config.solver.dynamics_solver == "lox",
         )
 
     def step(self):
@@ -164,6 +166,7 @@ class SimulatorFromNewton:
         only for rendering via :meth:`RigidBodySim.render`.
         """
         self._state_p.copy_from(self._state_n)
+        dt = self._config.dt if isinstance(self._config.dt, float) else None
 
         if self._use_newton_collisions:
             self._run_newton_collision(self._state_p)
@@ -173,6 +176,7 @@ class SimulatorFromNewton:
                 control=self._control,
                 contacts=self._contacts,
                 detector=None,
+                dt=dt,
             )
         else:
             self._solver.step(
@@ -181,6 +185,7 @@ class SimulatorFromNewton:
                 control=self._control,
                 contacts=self._contacts,
                 detector=self._collision_detector,
+                dt=dt,
             )
 
     def reset(self, **kwargs):
@@ -203,7 +208,7 @@ class RigidBodySim:
         * Zero-copy PyTorch views of state, control and contact arrays
         * Automatic extraction of actuated joint metadata
         * Selective per-world reset infrastructure (world mask + deferred buffers)
-        * Optional CUDA graph capture for step and reset
+        * Optional CUDA or CPU APIC graph capture for step and reset
         * Optional Newton ViewerGL
 
     Args:
@@ -218,8 +223,8 @@ class RigidBodySim:
         add_ground: Add a ground-plane to each world.
         enable_gravity: Enable gravity in every world.
         settings: Simulator settings.  ``None`` uses ``default_settings(sim_dt)``.
-        use_cuda_graph: Capture CUDA graphs for step and reset (requires
-            CUDA device with memory pool enabled).
+        use_cuda_graph: Capture graphs for step and reset. Uses CUDA graphs on
+            CUDA devices and APIC graphs on CPU devices.
         render_config: Viewer appearance settings.  ``None`` uses defaults.
         terrain_fn: Optional callable ``fn(builder)`` that adds terrain
             shapes to the multi-world :class:`~newton.ModelBuilder`.
@@ -543,18 +548,18 @@ class RigidBodySim:
             self._joint_limits.append([lower, upper])
 
     # ------------------------------------------------------------------
-    # CUDA graph capture
+    # Graph capture
     # ------------------------------------------------------------------
 
     def _capture_graphs(self):
-        """Capture CUDA graphs for step and reset if requested and available."""
+        """Capture graphs for step and reset if requested and available."""
         if not self._use_cuda_graph:
             return
-        if not (self._device.is_cuda and wp.is_mempool_enabled(self._device)):
-            msg.warning("CUDA graphs requested but not available (need CUDA device with mempool). Using kernels.")
+        if self._device.is_cuda and not wp.is_mempool_enabled(self._device):
+            msg.warning("CUDA graphs requested but the device memory pool is disabled. Using kernels.")
             return
 
-        msg.notif("Capturing CUDA graphs ...")
+        msg.notif("Capturing graphs ...")
         with wp.ScopedCapture(device=self._device) as reset_capture:
             self._reset_worlds()
         self._reset_graph = reset_capture.graph

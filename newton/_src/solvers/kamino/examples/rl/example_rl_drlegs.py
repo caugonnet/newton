@@ -112,6 +112,8 @@ class Example:
         policy=None,
         headless: bool = False,
         max_steps: int = 10000,
+        dynamics_solver: str = "padmm",
+        direct_structural: bool = False,
     ):
         self.cfg = config
 
@@ -126,6 +128,12 @@ class Example:
         asset_path = newton.utils.download_asset("disneyresearch")
         usd_model_path = str(asset_path / config["usd_model"])
 
+        settings = RigidBodySim.default_settings(self.sim_dt)
+        settings.solver.dynamics_solver = dynamics_solver
+        if dynamics_solver == "lox":
+            settings.solver.integrator = "euler"
+            settings.solver.lox.joint_solve_direct = direct_structural
+
         # Create generic articulated body simulator
         self.sim_wrapper = RigidBodySim(
             usd_model_path=usd_model_path,
@@ -134,6 +142,7 @@ class Example:
             device=device,
             headless=headless,
             body_pose_offset=(0.0, 0.0, config["body_pose_offset_z"], 0.0, 0.0, 0.0, 1.0),
+            settings=settings,
             use_cuda_graph=True,
             render_config=ViewerConfig(
                 diffuse_scale=1.0,
@@ -483,6 +492,17 @@ if __name__ == "__main__":
         "--policy", type=str, default=None, help="Path to an rsl_rl checkpoint .pt file (overrides asset default)"
     )
     parser.add_argument(
+        "--dynamics-solver",
+        choices=("padmm", "lox"),
+        default="padmm",
+        help="Kamino rigid-body dynamics backend.",
+    )
+    parser.add_argument(
+        "--direct-structural",
+        action="store_true",
+        help="Use the direct Schur structural-joint solve with the LOX backend.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["sync", "async"],
         default="sync",
@@ -539,6 +559,8 @@ if __name__ == "__main__":
         policy=policy,
         headless=args.headless,
         max_steps=args.num_steps,
+        dynamics_solver=args.dynamics_solver,
+        direct_structural=args.direct_structural,
     )
 
     try:
