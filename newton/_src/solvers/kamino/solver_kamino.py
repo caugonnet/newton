@@ -139,6 +139,7 @@ class SolverKamino(SolverBase, CouplingInterface):
           nonsmooth dynamics using the alternating direction method of multipliers.
           International Journal for Numerical Methods in Engineering, 122(16), 4093-4113.
           https://onlinelibrary.wiley.com/doi/full/10.1002/nme.6693
+
     After constructing :class:`ModelKamino`, :class:`StateKamino`, :class:`ControlKamino` and :class:`ContactsKamino`
     objects, this physics solver may be used to advance the simulation state forward in time.
 
@@ -750,15 +751,16 @@ class SolverKamino(SolverBase, CouplingInterface):
         # as class variables if not already done
         self._import_kamino()
 
-        # Validate that the model does not contain unsupported components
-        self._validate_model_compatibility(model)
-
         # Cache configurations; either from the user-provided config or from the model's custom attributes
         # NOTE: `Config.from_model` will default-initialize if no relevant custom attributes were
         # found on the model, so `self._config` will always be fully initialized after this step.
         if config is None:
             config = self.Config.from_model(model)
         self._config = config
+        self._config.validate()
+
+        # Validate solver-specific model compatibility after resolving the selected backend.
+        self._validate_model_compatibility(model, self._config)
 
         # Create a Kamino model from the Newton model
         self._model_kamino = self._kamino.ModelKamino.from_newton(model)
@@ -787,8 +789,6 @@ class SolverKamino(SolverBase, CouplingInterface):
         )
         # Scratch scalar for material update validation
         self._material_update_conflict = wp.empty(1, dtype=wp.int32, device=model.device)
-        self._built_friction_active = self.model.joint_friction.numpy() > 0.0
-
         # Create a collision detector if enabled in the config, otherwise
         # set to `None` to disable internal collision detection in Kamino
         self._collision_detector_kamino = None
@@ -839,10 +839,29 @@ class SolverKamino(SolverBase, CouplingInterface):
             contacts=self._contacts_kamino,
             config=self._config,
         )
+        self._lox_problem = None
+        self._cull_speculative_contacts = True
+        self._skip_fully_prescribed_contacts = False
+        if self._config.dynamics_solver == "lox":
+            self._lox_problem = self._solver_kamino.problem_fd
+            self._lox_problem.attach_newton_model(
+                self.model,
+                self._config.constraints,
+                self._config.lox,
+                use_fk_solver=self._config.use_fk_solver,
+            )
+            self._cull_speculative_contacts, self._skip_fully_prescribed_contacts = (
+                self._lox_problem.contact_conversion_policy
+            )
 
         # Initialize the internal Kamino control wrapper
         self._control_kamino = self._kamino.ControlKamino()
         self._control_kamino.finalize(self._model_kamino)
+        self._empty_state_in_kamino = None
+        self._empty_state_out_kamino = None
+        if self._model_kamino.size.sum_of_num_bodies == 0:
+            self._empty_state_in_kamino = self._model_kamino.state()
+            self._empty_state_out_kamino = self._model_kamino.state()
 
     @property
     def metrics(self) -> Any | None:
@@ -936,11 +955,16 @@ class SolverKamino(SolverBase, CouplingInterface):
         # Process None arguments
         state_flags = int(StateFlags.ALL if flags is None else flags)
         config = SolverKamino.ResetConfig.to_default() if config is None else config
+        if self._lox_problem is not None:
+            self._lox_problem.reset_newton_state(state, state_flags, local_world_mask)
 
         # Convert/alias the input state as a StateKamino object
-        state_kamino = self._kamino.StateKamino.from_newton(
-            self._model_kamino.size, self.model, state, convert_to_com_frame=False
-        )
+        if self._empty_state_in_kamino is None:
+            state_kamino = self._kamino.StateKamino.from_newton(
+                self._model_kamino.size, self.model, state, convert_to_com_frame=False
+            )
+        else:
+            state_kamino = self._empty_state_in_kamino
 
         # Convert Newton origin-frame body poses to Kamino CoM frame before reset.
         has_callbacks = self._solver_kamino._pre_reset_cb is not None or self._solver_kamino._post_reset_cb is not None
@@ -1028,8 +1052,12 @@ class SolverKamino(SolverBase, CouplingInterface):
         # Interface the input state containers to Kamino's equivalents
         # NOTE: These should produce zero-copy views/references
         # to the arrays of the source Newton containers.
-        state_in_kamino = self._kamino.StateKamino.from_newton(self._model_kamino.size, self.model, state_in)
-        state_out_kamino = self._kamino.StateKamino.from_newton(self._model_kamino.size, self.model, state_out)
+        if self._empty_state_in_kamino is None:
+            state_in_kamino = self._kamino.StateKamino.from_newton(self._model_kamino.size, self.model, state_in)
+            state_out_kamino = self._kamino.StateKamino.from_newton(self._model_kamino.size, self.model, state_out)
+        else:
+            state_in_kamino = self._empty_state_in_kamino
+            state_out_kamino = self._empty_state_out_kamino
 
         # Handle the control input, defaulting to the model's
         # internal control arrays if None is provided.
@@ -1040,18 +1068,28 @@ class SolverKamino(SolverBase, CouplingInterface):
         # If contacts are provided, use them directly, bypassing Kamino's collision detector
         if contacts is not None:
             self._detector = None
-            self._kamino.convert_contacts_newton_to_kamino(
-                model=self.model,
-                state=state_in,
-                contacts_in=contacts,
-                contacts_out=self._contacts_kamino,
-                convert_forces=False,
-                friction_mix_mode=self._config.materials.friction_mix_mode,
-                restitution_mix_mode=self._config.materials.restitution_mix_mode,
-            )
+            if self.model.body_count > 0:
+                self._kamino.convert_contacts_newton_to_kamino(
+                    model=self.model,
+                    state=state_in,
+                    contacts_in=contacts,
+                    contacts_out=self._contacts_kamino,
+                    convert_forces=False,
+                    friction_mix_mode=self._config.materials.friction_mix_mode,
+                    restitution_mix_mode=self._config.materials.restitution_mix_mode,
+                    cull_speculative_contacts=self._cull_speculative_contacts,
+                    skip_fully_prescribed_contacts=self._skip_fully_prescribed_contacts,
+                )
+            else:
+                # Pure deformables consume Newton soft contacts directly and have no
+                # rigid-body state from which Kamino contacts could be built.
+                self._contacts_kamino.clear()
         # Otherwise, use Kamino's internal collision detector to generate contacts
         else:
             self._detector = self._collision_detector_kamino
+
+        if self._lox_problem is not None:
+            self._lox_problem.prepare_newton_step(state_in, state_out, contacts)
 
         # Convert Newton body-frame poses to Kamino CoM-frame poses
         self._kamino.convert_body_origin_to_com(
@@ -1145,6 +1183,12 @@ class SolverKamino(SolverBase, CouplingInterface):
                 unsupported,
             )
 
+    def get_max_contact_count(self) -> int:
+        """Return the maximum number of rigid contacts that Kamino can generate."""
+        if self._contacts_kamino is None:
+            return 0
+        return self._contacts_kamino.model_max_contacts_host
+
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """
@@ -1236,6 +1280,24 @@ class SolverKamino(SolverBase, CouplingInterface):
                 default=0.0,
             )
         )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="body_lox_dual_impulse",
+                assignment=Model.AttributeAssignment.STATE,
+                frequency=Model.AttributeFrequency.BODY,
+                dtype=wp.spatial_vectorf,
+                default=wp.spatial_vectorf(0.0),
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="particle_lox_dual_impulse",
+                assignment=Model.AttributeAssignment.STATE,
+                frequency=Model.AttributeFrequency.PARTICLE,
+                dtype=wp.vec3f,
+                default=wp.vec3f(0.0),
+            )
+        )
 
         # Register FK custom actuation types
         builder.add_custom_attribute(
@@ -1274,7 +1336,7 @@ class SolverKamino(SolverBase, CouplingInterface):
                 raise ImportError("Kamino backend not found.") from e
 
     @staticmethod
-    def _validate_model_compatibility(model: Model):
+    def _validate_model_compatibility(model: Model, config: SolverKamino.Config):
         """
         Validates that the model does not contain components unsupported by SolverKamino:
         - particles
@@ -1291,15 +1353,25 @@ class SolverKamino(SolverBase, CouplingInterface):
         """
 
         unsupported_features = []
-        if model.particle_count > 0:
+        has_deformables = model.particle_count > 0
+        use_lox = config.dynamics_solver == "lox"
+        if use_lox:
+            from ._src.solvers.lox import validate_cable_model  # noqa: PLC0415
+
+            validate_cable_model(model, use_fk_solver=config.use_fk_solver)
+        if has_deformables and use_lox:
+            from ._src.solvers.lox import validate_deformable_model  # noqa: PLC0415
+
+            validate_deformable_model(model)
+        elif has_deformables:
             unsupported_features.append(f"particles (found {model.particle_count})")
         if model.spring_count > 0:
             unsupported_features.append(f"springs (found {model.spring_count})")
-        if model.tri_count > 0:
+        if model.tri_count > 0 and not (has_deformables and config.dynamics_solver == "lox"):
             unsupported_features.append(f"triangle elements (found {model.tri_count})")
-        if model.edge_count > 0:
+        if model.edge_count > 0 and not (has_deformables and config.dynamics_solver == "lox"):
             unsupported_features.append(f"edge elements (found {model.edge_count})")
-        if model.tet_count > 0:
+        if model.tet_count > 0 and not (has_deformables and config.dynamics_solver == "lox"):
             unsupported_features.append(f"tetrahedral elements (found {model.tet_count})")
         if model.muscle_count > 0:
             unsupported_features.append(f"muscles (found {model.muscle_count})")
@@ -1307,6 +1379,10 @@ class SolverKamino(SolverBase, CouplingInterface):
         # Check for unsupported joint types
         if model.joint_count > 0:
             joint_type_np = model.joint_type.numpy()
+            if not use_lox and np.any(joint_type_np == int(JointType.CABLE)):
+                raise ValueError(
+                    "SolverKamino supports JointType.CABLE only with SolverKamino.Config(dynamics_solver='lox')."
+                )
 
             unsupported_joint_types = {}
 
@@ -1316,8 +1392,6 @@ class SolverKamino(SolverBase, CouplingInterface):
                 # Check for explicitly unsupported joint types
                 if joint_type == JointType.DISTANCE:
                     unsupported_joint_types["DISTANCE"] = unsupported_joint_types.get("DISTANCE", 0) + 1
-                elif joint_type == JointType.CABLE:
-                    unsupported_joint_types["CABLE"] = unsupported_joint_types.get("CABLE", 0) + 1
             if len(unsupported_joint_types) > 0:
                 joint_desc = [f"{name} ({count} instances)" for name, count in unsupported_joint_types.items()]
                 unsupported_features.append("joint types: " + ", ".join(joint_desc))
@@ -1345,8 +1419,8 @@ class SolverKamino(SolverBase, CouplingInterface):
         if not check_dof and not check_actuation and not check_axes:
             return
 
-        if check_dof and self._config.dynamics_solver == "lox":
-            self._check_joint_friction_topology()
+        if self._lox_problem is not None:
+            self._lox_problem.validate_newton_model_changed(check_dof=check_dof)
 
         sentinel = self._kamino.validate_model_joint_updates(
             self.model,
@@ -1406,20 +1480,6 @@ class SolverKamino(SolverBase, CouplingInterface):
                 f"Invalid joint configuration for SolverKamino:\n"
                 f"  - joint {joint} ({self.model.joint_label[joint]!r}): "
                 "gimbal axes must preserve the solver's original handedness"
-            )
-
-    def _check_joint_friction_topology(self) -> None:
-        """Check that the allocated scalar joint-friction rows remain valid."""
-        values = self.model.joint_friction.numpy()
-        if not np.isfinite(values).all() or np.any(values < 0.0):
-            raise ValueError("Joint friction values must be finite and nonnegative.")
-        current_active = values > 0.0
-        changed = np.flatnonzero(current_active != self._built_friction_active)
-        if changed.size > 0:
-            dof = int(changed[0])
-            raise RuntimeError(
-                f"Changing joint-friction constraint topology for DOF {dof} is not supported; "
-                "recreate SolverKamino to apply a zero-to-positive or positive-to-zero friction change."
             )
 
     def _update_actuation_types(self) -> None:

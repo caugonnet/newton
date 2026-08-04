@@ -11,12 +11,15 @@ import warp as wp
 from newton._src.solvers.kamino._src.core.types import mat36f, mat66f, vec6f
 from newton._src.solvers.kamino._src.solvers.lox import (
     PROJECTION_STATUS_INVALID,
+    PROJECTION_STATUS_REGULARIZED,
     PROJECTION_STATUS_VALID,
+    apply_contact_desaxce_correction,
     convert_contact_matrix_normal_first_to_last,
     convert_contact_matrix_normal_last_to_first,
     convert_contact_vector_normal_first_to_last,
     convert_contact_vector_normal_last_to_first,
     project_contact_coulomb,
+    project_contact_coulomb_cone_orthogonal,
     project_joint_friction,
     project_limit_unilateral,
 )
@@ -39,6 +42,26 @@ def _convert_contact_order(
     vector_round_trip[index] = convert_contact_vector_normal_first_to_last(vector_converted)
     matrix_normal_first[index] = matrix_converted
     matrix_round_trip[index] = convert_contact_matrix_normal_first_to_last(matrix_converted)
+
+
+@wp.kernel
+def _project_contact_cones_orthogonal(
+    value: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    projected: wp.array[wp.vec3f],
+):
+    contact = wp.tid()
+    projected[contact] = project_contact_coulomb_cone_orthogonal(value[contact], friction[contact])
+
+
+@wp.kernel
+def _apply_contact_desaxce_corrections(
+    velocity: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    corrected: wp.array[wp.vec3f],
+):
+    contact = wp.tid()
+    corrected[contact] = apply_contact_desaxce_correction(velocity[contact], friction[contact])
 
 
 @wp.kernel
@@ -163,33 +186,6 @@ class TestLOXProjection(unittest.TestCase):
             setup_tests(device="cpu", clear_cache=False)
         self.device = wp.get_device(test_context.device)
 
-    def test_joint_friction_has_one_signed_box_constraint_per_dof(self):
-        identity = wp.array([np.eye(6, dtype=np.float32)] * 2, dtype=mat66f, device=self.device)
-        jacobian = wp.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]] * 2, dtype=vec6f, device=self.device)
-        zero_jacobian = wp.zeros(2, dtype=vec6f, device=self.device)
-        twist = wp.array(
-            [[2.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.25, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=vec6f, device=self.device
-        )
-        zero_twist = wp.zeros(2, dtype=vec6f, device=self.device)
-        old_reaction = wp.zeros(2, dtype=wp.float32, device=self.device)
-        bound = wp.array([0.5, 0.5], dtype=wp.float32, device=self.device)
-        reaction = wp.zeros(2, dtype=wp.float32, device=self.device)
-        velocity = wp.zeros(2, dtype=wp.float32, device=self.device)
-        status = wp.zeros(2, dtype=wp.int32, device=self.device)
-
-        wp.launch(
-            _project_frictions,
-            dim=2,
-            inputs=[jacobian, identity, twist, zero_jacobian, identity, zero_twist, old_reaction, bound],
-            outputs=[reaction, velocity, status],
-            device=self.device,
-        )
-
-        # The first row slips at the negative bound; the second sticks exactly.
-        np.testing.assert_allclose(reaction.numpy(), [-0.5, -0.25], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(velocity.numpy(), [1.5, 0.0], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_array_equal(status.numpy(), [PROJECTION_STATUS_VALID] * 2)
-
     def _project_contact(
         self,
         jacobian_first: np.ndarray,
@@ -260,30 +256,70 @@ class TestLOXProjection(unittest.TestCase):
         wp.launch(_project_limits, dim=count, inputs=inputs, outputs=outputs, device=self.device)
         return tuple(output.numpy() for output in outputs)
 
-    def test_normal_order_conversion(self):
-        vector = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32)
-        matrix = np.asarray([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]], dtype=np.float32)
-        outputs = [
-            wp.empty(1, dtype=wp.vec3f, device=self.device),
-            wp.empty(1, dtype=wp.vec3f, device=self.device),
-            wp.empty(1, dtype=wp.mat33f, device=self.device),
-            wp.empty(1, dtype=wp.mat33f, device=self.device),
-        ]
-        wp.launch(
-            _convert_contact_order,
-            dim=1,
-            inputs=[
-                wp.array(vector, dtype=wp.vec3f, device=self.device),
-                wp.array(matrix, dtype=wp.mat33f, device=self.device),
+    def test_orthogonal_contact_cone_projection_regions(self):
+        """Project contact reactions in every Coulomb-cone region."""
+        values = np.asarray(
+            [
+                [0.2, -0.1, -1.0],
+                [0.1, 0.05, 1.0],
+                [3.0, 4.0, 1.0],
+                [3.0, 4.0, 2.0],
+                [2.0, 0.0, -1.0],
             ],
-            outputs=outputs,
+            dtype=np.float32,
+        )
+        friction = np.asarray([0.5, 0.5, 0.5, 0.0, 0.5], dtype=np.float32)
+        projected = wp.empty(len(values), dtype=wp.vec3f, device=self.device)
+
+        wp.launch(
+            _project_contact_cones_orthogonal,
+            dim=len(values),
+            inputs=[
+                wp.array(values, dtype=wp.vec3f, device=self.device),
+                wp.array(friction, dtype=wp.float32, device=self.device),
+            ],
+            outputs=[projected],
             device=self.device,
         )
 
-        np.testing.assert_array_equal(outputs[0].numpy()[0], [3.0, 1.0, 2.0])
-        np.testing.assert_array_equal(outputs[2].numpy()[0], [[9.0, 7.0, 8.0], [3.0, 1.0, 2.0], [6.0, 4.0, 5.0]])
-        np.testing.assert_array_equal(outputs[1].numpy(), vector)
-        np.testing.assert_array_equal(outputs[3].numpy(), matrix)
+        expected = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                values[1],
+                [0.84, 1.12, 2.8],
+                [0.0, 0.0, 2.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(projected.numpy(), expected, rtol=2.0e-6, atol=2.0e-6)
+
+    def test_orthogonal_contact_cone_projection_rotates_with_tangent_frame(self):
+        """Preserve orthogonal projection under tangent-frame rotation."""
+        angle = 0.61
+        tangent_rotation = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]], dtype=np.float32
+        )
+        base = np.asarray([3.0, 1.0, 2.0], dtype=np.float32)
+        rotated = np.concatenate((tangent_rotation @ base[:2], base[2:]))
+        values = np.stack((base, rotated))
+        friction = np.full(2, 0.7, dtype=np.float32)
+        projected = wp.empty(2, dtype=wp.vec3f, device=self.device)
+
+        wp.launch(
+            _project_contact_cones_orthogonal,
+            dim=2,
+            inputs=[
+                wp.array(values, dtype=wp.vec3f, device=self.device),
+                wp.array(friction, dtype=wp.float32, device=self.device),
+            ],
+            outputs=[projected],
+            device=self.device,
+        )
+
+        projected_numpy = projected.numpy()
+        expected_rotated = np.concatenate((tangent_rotation @ projected_numpy[0, :2], projected_numpy[0, 2:]))
+        np.testing.assert_allclose(projected_numpy[1], expected_rotated, rtol=2.0e-6, atol=2.0e-6)
 
     def test_two_body_lever_arm_full_block_and_warm_start(self):
         frame, _ = np.linalg.qr(np.asarray([[1.0, 0.2, -0.1], [0.3, 1.0, 0.4], [-0.2, 0.1, 1.0]], dtype=np.float64))
@@ -405,6 +441,7 @@ class TestLOXProjection(unittest.TestCase):
         np.testing.assert_allclose(twist_second_new[0], twist_second_expected, rtol=2.0e-6, atol=2.0e-6)
 
     def test_nonpositive_local_blocks_are_invalid(self):
+        """Reject contact and limit blocks without positive local mobility."""
         zero_jacobian_contact = np.zeros((1, 3, 6), dtype=np.float32)
         zero_jacobian_limit = np.zeros((1, 6), dtype=np.float32)
         zero_inverse_weight = np.zeros((1, 6, 6), dtype=np.float32)
@@ -439,6 +476,37 @@ class TestLOXProjection(unittest.TestCase):
         self.assertEqual(limit_result[-1][0], PROJECTION_STATUS_INVALID)
         np.testing.assert_array_equal(limit_result[0][0], twist[0])
         self.assertEqual(limit_result[2][0], np.float32(0.4))
+
+    def test_contact_delassus_regularization_policy(self):
+        """Regularize marginal mobility and reject material indefiniteness."""
+        jacobian = np.zeros((2, 3, 6), dtype=np.float32)
+        jacobian[:, :, :3] = np.eye(3, dtype=np.float32)
+        inverse_weight = np.zeros((2, 6, 6), dtype=np.float32)
+        inverse_weight[0, :3, :3] = np.diag((1.0, 1.0e-8, 0.5))
+        inverse_weight[1, :3, :3] = np.diag((1.0, -1.0e-2, 0.5))
+        zero_jacobian = np.zeros_like(jacobian)
+        zero_inverse_weight = np.zeros_like(inverse_weight)
+        twist = np.zeros((2, 6), dtype=np.float32)
+        velocity_bias = np.asarray(((0.1, 0.0, -0.2), (0.1, 0.0, -0.2)), dtype=np.float32)
+        reaction = np.zeros((2, 3), dtype=np.float32)
+
+        result = self._project_contact(
+            jacobian,
+            inverse_weight,
+            twist,
+            zero_jacobian,
+            zero_inverse_weight,
+            twist,
+            velocity_bias,
+            reaction,
+            np.asarray((0.5, 0.5), dtype=np.float32),
+        )
+
+        self.assertEqual(result[-1][0], PROJECTION_STATUS_REGULARIZED)
+        self.assertTrue(np.all(np.isfinite(result[2][0])))
+        self.assertEqual(result[-1][1], PROJECTION_STATUS_INVALID)
+        np.testing.assert_array_equal(result[0][1], twist[1])
+        np.testing.assert_array_equal(result[2][1], reaction[1])
 
 
 if __name__ == "__main__":

@@ -18,12 +18,46 @@ from __future__ import annotations
 import warp as wp
 
 __all__ = [
+    "CoulombSolveStatistics",
     "compute_contact_scaled_alart_curnier_residual",
     "project_contact_coulomb_cone",
     "solve_contact_coulomb_newton",
 ]
 
 wp.set_module_options({"enable_backward": False})
+
+
+class CoulombSolveStatistics:
+    """Aggregate debug statistics for LOX local Coulomb solves."""
+
+    SOURCE_RIGID = 0
+    SOURCE_RIGID_DEFORMABLE = 1
+    SOURCE_NAMES = ("rigid", "rigid_deformable")
+    BRANCH_NAMES = ("separating", "frictionless", "sticking", "sliding")
+
+    def __init__(self, device: wp.DeviceLike):
+        self.device = wp.get_device(device)
+        self.branch_histogram = wp.zeros((2, 4), dtype=wp.int64, device=self.device)
+        self.expansion_histogram = wp.zeros((2, 65), dtype=wp.int64, device=self.device)
+        self.root_histogram = wp.zeros((2, 13), dtype=wp.int64, device=self.device)
+        self.failure_counts = wp.zeros((2, 2), dtype=wp.int64, device=self.device)
+
+    def reset(self) -> None:
+        """Clear all accumulated statistics."""
+        self.branch_histogram.zero_()
+        self.expansion_histogram.zero_()
+        self.root_histogram.zero_()
+        self.failure_counts.zero_()
+
+
+@wp.struct
+class _CoulombSolveResult:
+    reaction: wp.vec3f
+    branch: wp.int32
+    expansion_iterations: wp.int32
+    root_iterations: wp.int32
+    bracketed: wp.int32
+    converged: wp.int32
 
 
 @wp.func
@@ -152,7 +186,7 @@ def solve_contact_coulomb_newton(
         upper = upper * 2.0
 
     alpha = 0.5 * (lower + upper)
-    for _ in range(50):
+    for _ in range(12):
         root_data = _compute_sliding_root_data(
             tangent00,
             tangent01,
@@ -192,6 +226,146 @@ def solve_contact_coulomb_newton(
     tangent_reaction = -last_s
     normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
     return wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
+
+
+@wp.func
+def _solve_contact_coulomb_newton_instrumented(
+    delassus: wp.mat33f,
+    free_velocity: wp.vec3f,
+    friction: wp.float32,
+) -> _CoulombSolveResult:
+    result = _CoulombSolveResult()
+    result.reaction = wp.vec3f(0.0)
+    result.branch = wp.int32(0)
+    result.expansion_iterations = wp.int32(0)
+    result.root_iterations = wp.int32(0)
+    result.bracketed = wp.int32(1)
+    result.converged = wp.int32(1)
+
+    normal_delassus = delassus[0, 0]
+    normal_rhs = free_velocity[0]
+    if normal_rhs >= 0.0:
+        return result
+    if friction <= 0.0:
+        result.branch = wp.int32(1)
+        result.reaction = wp.vec3f(-normal_rhs / normal_delassus, 0.0, 0.0)
+        return result
+
+    normal_tangent = wp.vec2f(delassus[1, 0], delassus[2, 0])
+    tangent00 = delassus[1, 1] - normal_tangent[0] * normal_tangent[0] / normal_delassus
+    tangent01 = delassus[1, 2] - normal_tangent[0] * normal_tangent[1] / normal_delassus
+    tangent10 = delassus[2, 1] - normal_tangent[1] * normal_tangent[0] / normal_delassus
+    tangent11 = delassus[2, 2] - normal_tangent[1] * normal_tangent[1] / normal_delassus
+    tangent_rhs = wp.vec2f(free_velocity[1], free_velocity[2]) - (normal_rhs / normal_delassus) * normal_tangent
+
+    unshifted = _solve_mat22(
+        tangent00,
+        tangent01,
+        tangent10,
+        tangent11,
+        tangent_rhs[0],
+        tangent_rhs[1],
+    )
+    value_at_zero = wp.length(unshifted) - friction * (wp.dot(normal_tangent, unshifted) - normal_rhs) / normal_delassus
+    if value_at_zero <= 1.0e-7:
+        tangent_reaction = -unshifted
+        normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
+        result.branch = wp.int32(2)
+        result.reaction = wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
+        return result
+
+    result.branch = wp.int32(3)
+    result.bracketed = wp.int32(0)
+    result.converged = wp.int32(0)
+    alpha_scale = wp.max(wp.abs(tangent00), wp.abs(tangent01))
+    alpha_scale = wp.max(alpha_scale, wp.abs(tangent10))
+    alpha_scale = wp.max(alpha_scale, wp.abs(tangent11))
+    alpha_scale = wp.max(alpha_scale, 1.0e-20)
+
+    lower = wp.float32(0.0)
+    upper = wp.float32(1.0)
+    last_s = unshifted
+    for _ in range(64):
+        result.expansion_iterations += 1
+        upper_data = _compute_sliding_root_data(
+            tangent00,
+            tangent01,
+            tangent10,
+            tangent11,
+            tangent_rhs,
+            normal_tangent,
+            normal_rhs,
+            normal_delassus,
+            friction,
+            upper * alpha_scale,
+        )
+        if upper_data[0] <= 0.0:
+            result.bracketed = wp.int32(1)
+            break
+        upper = upper * 2.0
+
+    alpha = 0.5 * (lower + upper)
+    for _ in range(12):
+        result.root_iterations += 1
+        root_data = _compute_sliding_root_data(
+            tangent00,
+            tangent01,
+            tangent10,
+            tangent11,
+            tangent_rhs,
+            normal_tangent,
+            normal_rhs,
+            normal_delassus,
+            friction,
+            alpha * alpha_scale,
+        )
+        value = root_data[0]
+        derivative = root_data[1] * alpha_scale
+        last_s = wp.vec2f(root_data[2], root_data[3])
+
+        if wp.abs(value) <= 1.0e-7 or wp.abs(upper - lower) <= 1.0e-7 * (1.0 + upper):
+            result.converged = wp.int32(1)
+            break
+
+        if value > 0.0:
+            lower = alpha
+        else:
+            upper = alpha
+
+        width = upper - lower
+        next_alpha = 0.5 * (lower + upper)
+        if derivative != 0.0 and wp.isfinite(derivative):
+            newton_alpha = alpha - value / derivative
+            if (
+                newton_alpha > lower
+                and newton_alpha < upper
+                and wp.abs(newton_alpha - alpha) > 1.0e-7 * wp.max(1.0, width)
+            ):
+                next_alpha = newton_alpha
+        alpha = next_alpha
+
+    tangent_reaction = -last_s
+    normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
+    result.reaction = wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
+    return result
+
+
+@wp.func
+def _record_coulomb_solve_statistics(
+    result: _CoulombSolveResult,
+    source: wp.int32,
+    branch_histogram: wp.array2d[wp.int64],
+    expansion_histogram: wp.array2d[wp.int64],
+    root_histogram: wp.array2d[wp.int64],
+    failure_counts: wp.array2d[wp.int64],
+):
+    wp.atomic_add(branch_histogram, source, result.branch, wp.int64(1))
+    wp.atomic_add(expansion_histogram, source, result.expansion_iterations, wp.int64(1))
+    wp.atomic_add(root_histogram, source, result.root_iterations, wp.int64(1))
+    if result.bracketed == 0:
+        wp.atomic_add(failure_counts, source, 0, wp.int64(1))
+    if result.converged == 0:
+        wp.atomic_add(failure_counts, source, 1, wp.int64(1))
 
 
 @wp.func

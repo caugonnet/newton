@@ -8,7 +8,13 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
-from .contact import compute_contact_scaled_alart_curnier_residual, solve_contact_coulomb_newton
+from .contact import (
+    CoulombSolveStatistics,
+    _record_coulomb_solve_statistics,
+    _solve_contact_coulomb_newton_instrumented,
+    compute_contact_scaled_alart_curnier_residual,
+    solve_contact_coulomb_newton,
+)
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
@@ -30,6 +36,8 @@ __all__ = [
     "prepare_jacobi_projection_data",
     "project_constraints_jacobi",
     "project_constraints_sequential",
+    "sweep_constraints_sequential",
+    "warm_start_constraints_sequential",
 ]
 
 wp.set_module_options({"enable_backward": False})
@@ -60,6 +68,10 @@ def _prepare_contact_projection_data(
     inverse_weight_second = mat66f(0.0)
     first = contact_body_first[contact]
     second = contact_body_second[contact]
+    if first < 0 and second < 0:
+        delassus[contact] = wp.mat33f(0.0)
+        delassus_normal_first[contact] = wp.mat33f(0.0)
+        return
     if first >= 0:
         inverse_weight_first = inverse_weight[first]
     if second >= 0:
@@ -74,7 +86,7 @@ def _prepare_contact_projection_data(
     )
     delassus[contact] = data.delassus
     delassus_normal_first[contact] = data.delassus_normal_first
-    if data.status != PROJECTION_STATUS_VALID:
+    if data.status == PROJECTION_STATUS_INVALID:
         world_status[world] = data.status
 
 
@@ -119,6 +131,10 @@ def _prepare_contacts_jacobi(
     inverse_weight_second = mat66f(0.0)
     first = contact_body_first[contact]
     second = contact_body_second[contact]
+    if first < 0 and second < 0:
+        delassus[contact] = wp.mat33f(0.0)
+        delassus_normal_first[contact] = wp.mat33f(0.0)
+        return
     if first >= 0:
         multiplicity = wp.max(1, body_constraint_count[first] - static_body_constraint_count[first])
         inverse_weight_first = wp.float32(multiplicity) * inverse_weight[first]
@@ -135,7 +151,7 @@ def _prepare_contacts_jacobi(
     )
     delassus[contact] = data.delassus
     delassus_normal_first[contact] = data.delassus_normal_first
-    if data.status != PROJECTION_STATUS_VALID:
+    if data.status == PROJECTION_STATUS_INVALID:
         world_status[world] = data.status
 
 
@@ -163,6 +179,9 @@ def _prepare_limits_jacobi(
     inverse_weight_second = mat66f(0.0)
     first = limit_body_first[limit]
     second = limit_body_second[limit]
+    if first < 0 and second < 0:
+        delassus[limit] = 0.0
+        return
     if first >= 0:
         multiplicity = wp.max(1, body_constraint_count[first] - static_body_constraint_count[first])
         inverse_weight_first = wp.float32(multiplicity) * inverse_weight[first]
@@ -366,6 +385,9 @@ def _project_contacts_jacobi(
 
     first = contact_body_first[contact]
     second = contact_body_second[contact]
+    if first < 0 and second < 0:
+        reaction[contact] = wp.vec3f(0.0)
+        return
     twist_first = vec6f(0.0)
     twist_second = vec6f(0.0)
     inverse_weight_first = mat66f(0.0)
@@ -391,6 +413,104 @@ def _project_contacts_jacobi(
         contact_friction[contact],
     )
     reaction_new = convert_contact_vector_normal_first_to_last(reaction_new_normal_first)
+    reaction_delta = reaction_new - reaction_old
+    if (
+        not wp.isfinite(reaction_new[0])
+        or not wp.isfinite(reaction_new[1])
+        or not wp.isfinite(reaction_new[2])
+        or not wp.isfinite(reaction_delta[0])
+        or not wp.isfinite(reaction_delta[1])
+        or not wp.isfinite(reaction_delta[2])
+    ):
+        world_status[world] = PROJECTION_STATUS_INVALID
+        return
+
+    correction_first = vec6f(0.0)
+    correction_second = vec6f(0.0)
+    if first >= 0:
+        correction_first = inverse_weight_first @ (wp.transpose(contact_jacobian_first[contact]) @ reaction_delta)
+    if second >= 0:
+        correction_second = inverse_weight_second @ (wp.transpose(contact_jacobian_second[contact]) @ reaction_delta)
+    if not _is_finite_twist(correction_first) or not _is_finite_twist(correction_second):
+        world_status[world] = PROJECTION_STATUS_INVALID
+        return
+
+    reaction[contact] = reaction_new
+    _atomic_add_twist(twist_delta, first, correction_first)
+    _atomic_add_twist(twist_delta, second, correction_second)
+
+
+@wp.kernel
+def _project_contacts_jacobi_instrumented(
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_delassus: wp.array[wp.mat33f],
+    contact_delassus_normal_first: wp.array[wp.mat33f],
+    contact_bias: wp.array[wp.vec3f],
+    contact_friction: wp.array[wp.float32],
+    inverse_weight: wp.array[mat66f],
+    projected_twist: wp.array[vec6f],
+    reaction: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+    world_status: wp.array[wp.int32],
+    branch_histogram: wp.array2d[wp.int64],
+    expansion_histogram: wp.array2d[wp.int64],
+    root_histogram: wp.array2d[wp.int64],
+    failure_counts: wp.array2d[wp.int64],
+):
+    contact = wp.tid()
+    world = contact_world[contact]
+    if (
+        contact_local[contact] >= world_contact_count[world]
+        or not world_active[world]
+        or world_status[world] != PROJECTION_STATUS_VALID
+    ):
+        return
+
+    first = contact_body_first[contact]
+    second = contact_body_second[contact]
+    if first < 0 and second < 0:
+        reaction[contact] = wp.vec3f(0.0)
+        return
+    twist_first = vec6f(0.0)
+    twist_second = vec6f(0.0)
+    inverse_weight_first = mat66f(0.0)
+    inverse_weight_second = mat66f(0.0)
+    if first >= 0:
+        twist_first = projected_twist[first]
+        inverse_weight_first = inverse_weight[first]
+    if second >= 0:
+        twist_second = projected_twist[second]
+        inverse_weight_second = inverse_weight[second]
+    reaction_old = reaction[contact]
+    current_velocity = (
+        contact_jacobian_first[contact] @ twist_first
+        + contact_jacobian_second[contact] @ twist_second
+        + contact_bias[contact]
+    )
+    free_velocity_normal_first = convert_contact_vector_normal_last_to_first(
+        current_velocity - contact_delassus[contact] @ reaction_old
+    )
+    solve_result = _solve_contact_coulomb_newton_instrumented(
+        contact_delassus_normal_first[contact],
+        free_velocity_normal_first,
+        contact_friction[contact],
+    )
+    _record_coulomb_solve_statistics(
+        solve_result,
+        wp.int32(0),
+        branch_histogram,
+        expansion_histogram,
+        root_histogram,
+        failure_counts,
+    )
+    reaction_new = convert_contact_vector_normal_first_to_last(solve_result.reaction)
     reaction_delta = reaction_new - reaction_old
     if (
         not wp.isfinite(reaction_new[0])
@@ -447,6 +567,9 @@ def _project_limits_jacobi(
 
     first = limit_body_first[limit]
     second = limit_body_second[limit]
+    if first < 0 and second < 0:
+        reaction[limit] = 0.0
+        return
     current_velocity = limit_bias[limit]
     if first >= 0:
         current_velocity += wp.dot(limit_jacobian_first[limit], projected_twist[first])
@@ -547,6 +670,7 @@ def _apply_jacobi_twist_delta(
     world = body_world[body]
     if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
         projected_twist[body] += twist_delta[body]
+    twist_delta[body] = vec6f(0.0)
 
 
 @wp.kernel
@@ -599,11 +723,11 @@ def _project_constraints_sequential(
     for friction in range(friction_start, friction_end):
         first = friction_body_first[friction]
         second = friction_body_second[friction]
-        impulse = friction_reaction[friction]
+        friction_impulse = friction_reaction[friction]
         if first >= 0:
-            projected_twist[first] += inverse_weight[first] @ (impulse * friction_jacobian_first[friction])
+            projected_twist[first] += inverse_weight[first] @ (friction_impulse * friction_jacobian_first[friction])
         if second >= 0:
-            projected_twist[second] += inverse_weight[second] @ (impulse * friction_jacobian_second[friction])
+            projected_twist[second] += inverse_weight[second] @ (friction_impulse * friction_jacobian_second[friction])
     for limit in range(limit_start, limit_end):
         first = limit_body_first[limit]
         second = limit_body_second[limit]
@@ -662,6 +786,10 @@ def _project_constraints_sequential(
         for limit in range(limit_start, limit_end):
             first = limit_body_first[limit]
             second = limit_body_second[limit]
+            if first < 0 and second < 0:
+                limit_reaction[limit] = 0.0
+                limit_velocity[limit] = 0.0
+                continue
             twist_first = vec6f(0.0)
             twist_second = vec6f(0.0)
             inverse_weight_first = mat66f(0.0)
@@ -696,6 +824,10 @@ def _project_constraints_sequential(
         for contact in range(contact_start, contact_end):
             first = contact_body_first[contact]
             second = contact_body_second[contact]
+            if first < 0 and second < 0:
+                contact_reaction[contact] = wp.vec3f(0.0)
+                contact_velocity[contact] = wp.vec3f(0.0)
+                continue
             twist_first = vec6f(0.0)
             twist_second = vec6f(0.0)
             inverse_weight_first = mat66f(0.0)
@@ -718,7 +850,7 @@ def _project_constraints_sequential(
                 contact_reaction[contact],
                 contact_friction[contact],
             )
-            if result_contact.status != PROJECTION_STATUS_VALID:
+            if result_contact.status == PROJECTION_STATUS_INVALID:
                 world_status[world] = result_contact.status
                 return
             if first >= 0:
@@ -848,6 +980,10 @@ def _project_constraints_sequential_prepared(
         for limit in range(limit_start, limit_end):
             first = limit_body_first[limit]
             second = limit_body_second[limit]
+            if first < 0 and second < 0:
+                limit_reaction[limit] = 0.0
+                limit_velocity[limit] = 0.0
+                continue
             twist_first = vec6f(0.0)
             twist_second = vec6f(0.0)
             inverse_weight_first = mat66f(0.0)
@@ -882,6 +1018,10 @@ def _project_constraints_sequential_prepared(
         for contact in range(contact_start, contact_end):
             first = contact_body_first[contact]
             second = contact_body_second[contact]
+            if first < 0 and second < 0:
+                contact_reaction[contact] = wp.vec3f(0.0)
+                contact_velocity[contact] = wp.vec3f(0.0)
+                continue
             twist_first = vec6f(0.0)
             twist_second = vec6f(0.0)
             inverse_weight_first = mat66f(0.0)
@@ -906,7 +1046,7 @@ def _project_constraints_sequential_prepared(
                 contact_delassus[contact],
                 contact_delassus_normal_first[contact],
             )
-            if result_contact.status != PROJECTION_STATUS_VALID:
+            if result_contact.status == PROJECTION_STATUS_INVALID:
                 world_status[world] = result_contact.status
                 return
             if first >= 0:
@@ -915,6 +1055,238 @@ def _project_constraints_sequential_prepared(
                 projected_twist[second] = result_contact.twist_second
             contact_reaction[contact] = result_contact.reaction
             contact_velocity[contact] = result_contact.velocity - contact_bias[contact]
+
+
+@wp.kernel
+def _warm_start_constraints_sequential(
+    world_active: wp.array[wp.bool],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    inverse_weight: wp.array[mat66f],
+    projected_twist: wp.array[vec6f],
+    friction_reaction: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    prepared_status: wp.array[wp.int32],
+    world_status: wp.array[wp.int32],
+):
+    world = wp.tid()
+    if not world_active[world]:
+        return
+    world_status[world] = prepared_status[world]
+    if prepared_status[world] != PROJECTION_STATUS_VALID:
+        return
+
+    friction_start = world_friction_offset[world]
+    friction_end = friction_start + world_friction_count[world]
+    for friction in range(friction_start, friction_end):
+        first = friction_body_first[friction]
+        second = friction_body_second[friction]
+        impulse = friction_reaction[friction]
+        if first >= 0:
+            projected_twist[first] += inverse_weight[first] @ (impulse * friction_jacobian_first[friction])
+        if second >= 0:
+            projected_twist[second] += inverse_weight[second] @ (impulse * friction_jacobian_second[friction])
+
+    limit_start = world_limit_offset[world]
+    limit_end = limit_start + world_limit_count[world]
+    for limit in range(limit_start, limit_end):
+        first = limit_body_first[limit]
+        second = limit_body_second[limit]
+        limit_impulse = limit_reaction[limit]
+        if first >= 0:
+            projected_twist[first] += inverse_weight[first] @ (limit_impulse * limit_jacobian_first[limit])
+        if second >= 0:
+            projected_twist[second] += inverse_weight[second] @ (limit_impulse * limit_jacobian_second[limit])
+
+    contact_start = world_contact_offset[world]
+    contact_end = contact_start + world_contact_count[world]
+    for contact in range(contact_start, contact_end):
+        first = contact_body_first[contact]
+        second = contact_body_second[contact]
+        contact_impulse = contact_reaction[contact]
+        if first >= 0:
+            projected_twist[first] += inverse_weight[first] @ (
+                wp.transpose(contact_jacobian_first[contact]) @ contact_impulse
+            )
+        if second >= 0:
+            projected_twist[second] += inverse_weight[second] @ (
+                wp.transpose(contact_jacobian_second[contact]) @ contact_impulse
+            )
+
+
+@wp.kernel
+def _sweep_constraints_sequential_prepared(
+    world_active: wp.array[wp.bool],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    friction_impulse_bound: wp.array[wp.float32],
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_delassus: wp.array[wp.mat33f],
+    contact_delassus_normal_first: wp.array[wp.mat33f],
+    contact_bias: wp.array[wp.vec3f],
+    contact_friction: wp.array[wp.float32],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    limit_bias: wp.array[wp.float32],
+    inverse_weight: wp.array[mat66f],
+    projected_twist: wp.array[vec6f],
+    friction_reaction: wp.array[wp.float32],
+    friction_velocity: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_velocity: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_velocity: wp.array[wp.float32],
+    world_status: wp.array[wp.int32],
+):
+    world = wp.tid()
+    if not world_active[world] or world_status[world] != PROJECTION_STATUS_VALID:
+        return
+
+    friction_start = world_friction_offset[world]
+    friction_end = friction_start + world_friction_count[world]
+    for friction in range(friction_start, friction_end):
+        first = friction_body_first[friction]
+        second = friction_body_second[friction]
+        twist_first = vec6f(0.0)
+        twist_second = vec6f(0.0)
+        inverse_weight_first = mat66f(0.0)
+        inverse_weight_second = mat66f(0.0)
+        if first >= 0:
+            twist_first = projected_twist[first]
+            inverse_weight_first = inverse_weight[first]
+        if second >= 0:
+            twist_second = projected_twist[second]
+            inverse_weight_second = inverse_weight[second]
+        result_friction = project_joint_friction(
+            friction_jacobian_first[friction],
+            inverse_weight_first,
+            twist_first,
+            friction_jacobian_second[friction],
+            inverse_weight_second,
+            twist_second,
+            friction_reaction[friction],
+            friction_impulse_bound[friction],
+        )
+        if result_friction.status != PROJECTION_STATUS_VALID:
+            world_status[world] = result_friction.status
+            return
+        if first >= 0:
+            projected_twist[first] = result_friction.twist_first
+        if second >= 0:
+            projected_twist[second] = result_friction.twist_second
+        friction_reaction[friction] = result_friction.reaction
+        friction_velocity[friction] = result_friction.velocity
+
+    limit_start = world_limit_offset[world]
+    limit_end = limit_start + world_limit_count[world]
+    for limit in range(limit_start, limit_end):
+        first = limit_body_first[limit]
+        second = limit_body_second[limit]
+        if first < 0 and second < 0:
+            limit_reaction[limit] = 0.0
+            limit_velocity[limit] = 0.0
+            continue
+        twist_first = vec6f(0.0)
+        twist_second = vec6f(0.0)
+        inverse_weight_first = mat66f(0.0)
+        inverse_weight_second = mat66f(0.0)
+        if first >= 0:
+            twist_first = projected_twist[first]
+            inverse_weight_first = inverse_weight[first]
+        if second >= 0:
+            twist_second = projected_twist[second]
+            inverse_weight_second = inverse_weight[second]
+        result_limit = project_limit_unilateral(
+            limit_jacobian_first[limit],
+            inverse_weight_first,
+            twist_first,
+            limit_jacobian_second[limit],
+            inverse_weight_second,
+            twist_second,
+            limit_bias[limit],
+            limit_reaction[limit],
+        )
+        if result_limit.status != PROJECTION_STATUS_VALID:
+            world_status[world] = result_limit.status
+            return
+        if first >= 0:
+            projected_twist[first] = result_limit.twist_first
+        if second >= 0:
+            projected_twist[second] = result_limit.twist_second
+        limit_reaction[limit] = result_limit.reaction
+        limit_velocity[limit] = result_limit.velocity - limit_bias[limit]
+
+    contact_start = world_contact_offset[world]
+    contact_end = contact_start + world_contact_count[world]
+    for contact in range(contact_start, contact_end):
+        first = contact_body_first[contact]
+        second = contact_body_second[contact]
+        if first < 0 and second < 0:
+            contact_reaction[contact] = wp.vec3f(0.0)
+            contact_velocity[contact] = wp.vec3f(0.0)
+            continue
+        twist_first = vec6f(0.0)
+        twist_second = vec6f(0.0)
+        inverse_weight_first = mat66f(0.0)
+        inverse_weight_second = mat66f(0.0)
+        if first >= 0:
+            twist_first = projected_twist[first]
+            inverse_weight_first = inverse_weight[first]
+        if second >= 0:
+            twist_second = projected_twist[second]
+            inverse_weight_second = inverse_weight[second]
+        result_contact = project_contact_coulomb_prepared(
+            contact_jacobian_first[contact],
+            inverse_weight_first,
+            twist_first,
+            contact_jacobian_second[contact],
+            inverse_weight_second,
+            twist_second,
+            contact_bias[contact],
+            contact_reaction[contact],
+            contact_friction[contact],
+            contact_delassus[contact],
+            contact_delassus_normal_first[contact],
+        )
+        if result_contact.status == PROJECTION_STATUS_INVALID:
+            world_status[world] = result_contact.status
+            return
+        if first >= 0:
+            projected_twist[first] = result_contact.twist_first
+        if second >= 0:
+            projected_twist[second] = result_contact.twist_second
+        contact_reaction[contact] = result_contact.reaction
+        contact_velocity[contact] = result_contact.velocity - contact_bias[contact]
 
 
 @wp.kernel
@@ -1019,6 +1391,10 @@ def _compute_contact_projection_residuals(
     inverse_weight_second = mat66f(0.0)
     first = contact_body_first[contact]
     second = contact_body_second[contact]
+    if first < 0 and second < 0:
+        contact_velocity[contact] = wp.vec3f(0.0)
+        contact_residual[contact] = 0.0
+        return
     if first >= 0:
         inverse_weight_first = inverse_weight[first]
     if second >= 0:
@@ -1079,6 +1455,10 @@ def _compute_limit_projection_residuals(
     inverse_weight_second = mat66f(0.0)
     first = limit_body_first[limit]
     second = limit_body_second[limit]
+    if first < 0 and second < 0:
+        limit_velocity[limit] = 0.0
+        limit_residual[limit] = 0.0
+        return
     if first >= 0:
         inverse_weight_first = inverse_weight[first]
     if second >= 0:
@@ -1433,8 +1813,16 @@ def project_constraints_jacobi(
     friction_reaction: wp.array[wp.float32],
     prepared_status: wp.array[wp.int32],
     world_status: wp.array[wp.int32],
+    deformable_contacts=None,
+    deformable_projected_velocity: wp.array[wp.vec3] | None = None,
+    warm_start: bool = True,
+    coulomb_statistics: CoulombSolveStatistics | None = None,
 ) -> None:
-    """Run mass-split Jacobi sweeps over all body-space unilaterals."""
+    """Run mass-split Jacobi sweeps over all body-space unilaterals.
+
+    Set ``warm_start`` to false when the projected state already contains the
+    current reactions, such as for a final smoothing sweep after Gauss--Seidel.
+    """
     if (
         not isinstance(projection_iterations, int)
         or isinstance(projection_iterations, bool)
@@ -1446,16 +1834,23 @@ def project_constraints_jacobi(
         raise ValueError("Active, prepared-status, and status world arrays must have identical lengths.")
     if body_world.shape[0] != projected_twist.shape[0] or twist_delta.shape[0] != projected_twist.shape[0]:
         raise ValueError("Body world, projected twist, and Jacobi delta arrays must have identical lengths.")
+    if (deformable_contacts is None) != (deformable_projected_velocity is None):
+        raise ValueError("Deformable contacts and projected velocity must be supplied together.")
+    if not isinstance(warm_start, bool):
+        raise ValueError("warm_start must be a boolean.")
 
-    wp.launch(
-        _initialize_jacobi_projection_status,
-        dim=world_count,
-        inputs=[world_active, prepared_status],
-        outputs=[world_status],
-        device=projected_twist.device,
-    )
+    if warm_start:
+        wp.launch(
+            _initialize_jacobi_projection_status,
+            dim=world_count,
+            inputs=[world_active, prepared_status],
+            outputs=[world_status],
+            device=projected_twist.device,
+        )
     twist_delta.zero_()
-    if friction_world.shape[0] > 0:
+    if warm_start and deformable_contacts is not None:
+        deformable_contacts.begin_rigid_jacobi_accumulation()
+    if warm_start and friction_world.shape[0] > 0:
         wp.launch(
             _warmstart_frictions_jacobi,
             dim=friction_world.shape[0],
@@ -1475,7 +1870,7 @@ def project_constraints_jacobi(
             outputs=[twist_delta],
             device=projected_twist.device,
         )
-    if contact_world.shape[0] > 0:
+    if warm_start and contact_world.shape[0] > 0:
         wp.launch(
             _warmstart_contacts_jacobi,
             dim=contact_world.shape[0],
@@ -1495,7 +1890,7 @@ def project_constraints_jacobi(
             outputs=[twist_delta],
             device=projected_twist.device,
         )
-    if limit_world.shape[0] > 0:
+    if warm_start and limit_world.shape[0] > 0:
         wp.launch(
             _warmstart_limits_jacobi,
             dim=limit_world.shape[0],
@@ -1515,16 +1910,36 @@ def project_constraints_jacobi(
             outputs=[twist_delta],
             device=projected_twist.device,
         )
-    wp.launch(
-        _apply_jacobi_twist_delta,
-        dim=projected_twist.shape[0],
-        inputs=[body_world, world_active, world_status, twist_delta],
-        outputs=[projected_twist],
-        device=projected_twist.device,
-    )
+    if warm_start and deformable_contacts is not None:
+        deformable_contacts.accumulate_rigid_reaction_warm_start(
+            world_active,
+            prepared_status,
+            deformable_contacts.cloth_system.inverse_weight,
+            inverse_weight,
+            deformable_projected_velocity,
+            projected_twist,
+            twist_delta,
+            world_status,
+        )
+    if warm_start:
+        wp.launch(
+            _apply_jacobi_twist_delta,
+            dim=projected_twist.shape[0],
+            inputs=[body_world, world_active, world_status, twist_delta],
+            outputs=[projected_twist],
+            device=projected_twist.device,
+        )
+    if warm_start and deformable_contacts is not None:
+        deformable_contacts.apply_rigid_particle_delta(
+            world_active,
+            world_status,
+            deformable_projected_velocity,
+        )
 
     for _sweep in range(projection_iterations):
         twist_delta.zero_()
+        if deformable_contacts is not None:
+            deformable_contacts.begin_rigid_jacobi_accumulation()
         if friction_world.shape[0] > 0:
             wp.launch(
                 _project_frictions_jacobi,
@@ -1547,28 +1962,46 @@ def project_constraints_jacobi(
                 device=projected_twist.device,
             )
         if contact_world.shape[0] > 0:
-            wp.launch(
-                _project_contacts_jacobi,
-                dim=contact_world.shape[0],
-                inputs=[
-                    contact_world,
-                    contact_local,
-                    world_active,
-                    world_contact_count,
-                    contact_body_first,
-                    contact_body_second,
-                    contact_jacobian_first,
-                    contact_jacobian_second,
-                    contact_delassus,
-                    contact_delassus_normal_first,
-                    contact_bias,
-                    contact_friction,
-                    inverse_weight,
-                    projected_twist,
-                ],
-                outputs=[contact_reaction, twist_delta, world_status],
-                device=projected_twist.device,
-            )
+            contact_inputs = [
+                contact_world,
+                contact_local,
+                world_active,
+                world_contact_count,
+                contact_body_first,
+                contact_body_second,
+                contact_jacobian_first,
+                contact_jacobian_second,
+                contact_delassus,
+                contact_delassus_normal_first,
+                contact_bias,
+                contact_friction,
+                inverse_weight,
+                projected_twist,
+            ]
+            if coulomb_statistics is None:
+                wp.launch(
+                    _project_contacts_jacobi,
+                    dim=contact_world.shape[0],
+                    inputs=contact_inputs,
+                    outputs=[contact_reaction, twist_delta, world_status],
+                    device=projected_twist.device,
+                )
+            else:
+                wp.launch(
+                    _project_contacts_jacobi_instrumented,
+                    dim=contact_world.shape[0],
+                    inputs=contact_inputs,
+                    outputs=[
+                        contact_reaction,
+                        twist_delta,
+                        world_status,
+                        coulomb_statistics.branch_histogram,
+                        coulomb_statistics.expansion_histogram,
+                        coulomb_statistics.root_histogram,
+                        coulomb_statistics.failure_counts,
+                    ],
+                    device=projected_twist.device,
+                )
         if limit_world.shape[0] > 0:
             wp.launch(
                 _project_limits_jacobi,
@@ -1590,6 +2023,17 @@ def project_constraints_jacobi(
                 outputs=[limit_reaction, twist_delta, world_status],
                 device=projected_twist.device,
             )
+        if deformable_contacts is not None:
+            deformable_contacts.project_rigid_jacobi(
+                world_active,
+                deformable_contacts.cloth_system.inverse_weight,
+                inverse_weight,
+                deformable_projected_velocity,
+                projected_twist,
+                twist_delta,
+                world_status,
+                coulomb_statistics=coulomb_statistics,
+            )
         wp.launch(
             _apply_jacobi_twist_delta,
             dim=projected_twist.shape[0],
@@ -1597,6 +2041,12 @@ def project_constraints_jacobi(
             outputs=[projected_twist],
             device=projected_twist.device,
         )
+        if deformable_contacts is not None:
+            deformable_contacts.apply_rigid_particle_delta(
+                world_active,
+                world_status,
+                deformable_projected_velocity,
+            )
 
 
 def project_constraints_sequential(
@@ -1705,6 +2155,155 @@ def project_constraints_sequential(
         kernel,
         dim=world_count,
         inputs=inputs,
+        outputs=[
+            friction_reaction,
+            friction_velocity,
+            contact_reaction,
+            contact_velocity,
+            limit_reaction,
+            limit_velocity,
+            world_status,
+        ],
+        device=projected_twist.device,
+    )
+
+
+def warm_start_constraints_sequential(
+    world_active: wp.array[wp.bool],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    inverse_weight: wp.array[mat66f],
+    projected_twist: wp.array[vec6f],
+    friction_reaction: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    prepared_status: wp.array[wp.int32],
+    world_status: wp.array[wp.int32],
+) -> None:
+    """Apply sequential rigid reaction warm starts once per projection call."""
+    world_count = world_active.shape[0]
+    if prepared_status.shape[0] != world_count or world_status.shape[0] != world_count:
+        raise ValueError("Active, prepared-status, and status world arrays must have identical lengths.")
+    wp.launch(
+        _warm_start_constraints_sequential,
+        dim=world_count,
+        inputs=[
+            world_active,
+            world_friction_offset,
+            world_friction_count,
+            friction_body_first,
+            friction_body_second,
+            friction_jacobian_first,
+            friction_jacobian_second,
+            world_contact_offset,
+            world_contact_count,
+            contact_body_first,
+            contact_body_second,
+            contact_jacobian_first,
+            contact_jacobian_second,
+            world_limit_offset,
+            world_limit_count,
+            limit_body_first,
+            limit_body_second,
+            limit_jacobian_first,
+            limit_jacobian_second,
+            inverse_weight,
+            projected_twist,
+            friction_reaction,
+            contact_reaction,
+            limit_reaction,
+            prepared_status,
+        ],
+        outputs=[world_status],
+        device=projected_twist.device,
+    )
+
+
+def sweep_constraints_sequential(
+    world_active: wp.array[wp.bool],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    friction_impulse_bound: wp.array[wp.float32],
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_delassus: wp.array[wp.mat33f],
+    contact_delassus_normal_first: wp.array[wp.mat33f],
+    contact_bias: wp.array[wp.vec3f],
+    contact_friction: wp.array[wp.float32],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    limit_bias: wp.array[wp.float32],
+    inverse_weight: wp.array[mat66f],
+    projected_twist: wp.array[vec6f],
+    friction_reaction: wp.array[wp.float32],
+    friction_velocity: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_velocity: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_velocity: wp.array[wp.float32],
+    world_status: wp.array[wp.int32],
+) -> None:
+    """Run one prepared sequential rigid sweep without reapplying warm starts."""
+    wp.launch(
+        _sweep_constraints_sequential_prepared,
+        dim=world_active.shape[0],
+        inputs=[
+            world_active,
+            world_friction_offset,
+            world_friction_count,
+            friction_body_first,
+            friction_body_second,
+            friction_jacobian_first,
+            friction_jacobian_second,
+            friction_impulse_bound,
+            world_contact_offset,
+            world_contact_count,
+            contact_body_first,
+            contact_body_second,
+            contact_jacobian_first,
+            contact_jacobian_second,
+            contact_delassus,
+            contact_delassus_normal_first,
+            contact_bias,
+            contact_friction,
+            world_limit_offset,
+            world_limit_count,
+            limit_body_first,
+            limit_body_second,
+            limit_jacobian_first,
+            limit_jacobian_second,
+            limit_bias,
+            inverse_weight,
+            projected_twist,
+        ],
         outputs=[
             friction_reaction,
             friction_velocity,

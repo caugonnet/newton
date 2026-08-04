@@ -16,6 +16,7 @@ from collections.abc import Sequence
 
 import warp as wp
 
+from ......sim import BodyFlags, JointType
 from ...core.data import DataKamino
 from ...core.joints import JointActuationType
 from ...core.model import ModelKamino
@@ -24,6 +25,7 @@ from ...geometry.contacts import ContactMode, ContactsKamino
 from ...kinematics.jacobians import DenseSystemJacobians, SparseSystemJacobians, SystemJacobiansType
 from ...kinematics.limits import LimitsKamino
 from .bias import compute_contact_velocity_target, compute_limit_velocity_target
+from .cable import CableMaterialSystem
 from .iteration import SplittingState
 from .metric import (
     METRIC_STATUS_VALID,
@@ -32,6 +34,7 @@ from .metric import (
 from .problem import compute_body_explicit_wrench
 from .projection import PROJECTION_STATUS_VALID
 from .system import BatchedPrimalBodySystem
+from .time import validate_world_time_step, validate_world_time_steps
 
 __all__ = ["LOXKaminoAdapter"]
 
@@ -116,6 +119,71 @@ def _capture_dynamic_joint_velocity(
 
 
 @wp.kernel
+def _evaluate_lagged_scalar_velocity_consistency(
+    row_world: wp.array[wp.int32],
+    body_first: wp.array[wp.int32],
+    body_second: wp.array[wp.int32],
+    jacobian_first: wp.array[vec6f],
+    jacobian_second: wp.array[vec6f],
+    world_active: wp.array[wp.bool],
+    global_twist: wp.array[vec6f],
+    projected_twist_previous: wp.array[vec6f],
+    inverse_velocity_tolerance: wp.float32,
+    world_required: wp.array[wp.int32],
+    world_residual: wp.array[wp.float32],
+):
+    row = wp.tid()
+    world = row_world[row]
+    if not world_active[world]:
+        return
+
+    first = body_first[row]
+    second = body_second[row]
+    if first < 0 and second < 0:
+        return
+    value = wp.float32(0.0)
+    if first >= 0:
+        value += wp.dot(jacobian_first[row], global_twist[first] - projected_twist_previous[first])
+    if second >= 0:
+        value += wp.dot(jacobian_second[row], global_twist[second] - projected_twist_previous[second])
+    wp.atomic_max(world_required, world, 1)
+    wp.atomic_max(world_residual, world, wp.abs(value) * inverse_velocity_tolerance)
+
+
+@wp.kernel
+def _evaluate_lagged_contact_velocity_consistency(
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    body_first: wp.array[wp.int32],
+    body_second: wp.array[wp.int32],
+    jacobian_first: wp.array[mat36f],
+    jacobian_second: wp.array[mat36f],
+    world_active: wp.array[wp.bool],
+    global_twist: wp.array[vec6f],
+    projected_twist_previous: wp.array[vec6f],
+    inverse_velocity_tolerance: wp.float32,
+    world_required: wp.array[wp.int32],
+    world_residual: wp.array[wp.float32],
+):
+    contact = wp.tid()
+    world = contact_world[contact]
+    if not world_active[world] or contact_local[contact] >= world_contact_count[world]:
+        return
+
+    first = body_first[contact]
+    second = body_second[contact]
+    value = wp.vec3f(0.0)
+    if first >= 0:
+        value += jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
+    if second >= 0:
+        value += jacobian_second[contact] @ (global_twist[second] - projected_twist_previous[second])
+    residual = wp.max(wp.abs(value)) * inverse_velocity_tolerance
+    wp.atomic_max(world_required, world, 1)
+    wp.atomic_max(world_residual, world, residual)
+
+
+@wp.kernel
 def _gather_body_explicit_wrenches(
     body_world: wp.array[wp.int32],
     mass: wp.array[wp.float32],
@@ -166,7 +234,7 @@ def _gather_dynamic_rows(
     joint_velocity: wp.array[wp.float32],
     joint_velocity_begin: wp.array[wp.float32],
     linearization_twist: wp.array[vec6f],
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     jacobian_first: wp.array[vec6f],
     jacobian_second: wp.array[vec6f],
     effective_inertia: wp.array[wp.float32],
@@ -174,6 +242,7 @@ def _gather_dynamic_rows(
 ):
     row = wp.tid()
     world = row_world[row]
+    dt = time_step[world]
     if sparse_jacobian:
         jacobian_first[row] = _load_sparse_jacobian_row(sparse_first_index[row], sparse_jacobian_data)
         jacobian_second[row] = _load_sparse_jacobian_row(sparse_second_index[row], sparse_jacobian_data)
@@ -206,8 +275,134 @@ def _gather_dynamic_rows(
                 linearization_velocity += wp.dot(jacobian_first[row], linearization_twist[first])
             if second >= 0:
                 linearization_velocity += wp.dot(jacobian_second[row], linearization_twist[second])
-            velocity += time_step * time_step * joint_position_stiffness[dof] * linearization_velocity / inertia
+            velocity += dt * dt * joint_position_stiffness[dof] * linearization_velocity / inertia
     free_velocity[row] = velocity
+
+
+@wp.kernel
+def _gather_effort_rows(
+    effort_world: wp.array[wp.int32],
+    effort_joint: wp.array[wp.int32],
+    effort_dof: wp.array[wp.int32],
+    effort_dynamic_row: wp.array[wp.int32],
+    actuation_type: wp.array[wp.int32],
+    dynamic_effective_inertia: wp.array[wp.float32],
+    dynamic_free_velocity: wp.array[wp.float32],
+    joint_armature: wp.array[wp.float32],
+    joint_velocity_begin: wp.array[wp.float32],
+    external_effort: wp.array[wp.float32],
+    position_stiffness: wp.array[wp.float32],
+    velocity_stiffness: wp.array[wp.float32],
+    effort_limit: wp.array[wp.float32],
+    time_step: wp.array[wp.float32],
+    intercept: wp.array[wp.float32],
+    slope: wp.array[wp.float32],
+    impulse_bound: wp.array[wp.float32],
+):
+    effort = wp.tid()
+    dt = time_step[effort_world[effort]]
+    joint = effort_joint[effort]
+    dof = effort_dof[effort]
+    dynamic_row = effort_dynamic_row[effort]
+    mode = actuation_type[joint]
+    kp = position_stiffness[dof]
+    kd = velocity_stiffness[dof]
+    gradient = wp.float32(0.0)
+    if mode == JointActuationType.VELOCITY:
+        gradient = kd
+    if (
+        mode == JointActuationType.POSITION
+        or mode == JointActuationType.POSITION_VELOCITY
+        or mode == JointActuationType.POSITION_VELOCITY_FORCE
+    ):
+        gradient = kd + dt * kp
+
+    beta = dynamic_effective_inertia[dynamic_row] * dynamic_free_velocity[dynamic_row]
+    intercept[effort] = (beta - joint_armature[dof] * joint_velocity_begin[dynamic_row]) / dt - external_effort[dof]
+    slope[effort] = gradient
+    impulse_bound[effort] = dt * effort_limit[dof]
+
+
+@wp.kernel
+def _promote_effort_counters(
+    effort_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    counter_next: wp.array[wp.float32],
+    counter_applied: wp.array[wp.float32],
+):
+    effort = wp.tid()
+    if world_active[effort_world[effort]]:
+        counter_applied[effort] = counter_next[effort]
+
+
+@wp.kernel
+def _clear_active_effort_residuals(
+    world_active: wp.array[wp.bool],
+    residual_scaled: wp.array[wp.float32],
+    residual_unscaled: wp.array[wp.float32],
+):
+    world = wp.tid()
+    if world_active[world]:
+        residual_scaled[world] = 0.0
+        residual_unscaled[world] = 0.0
+
+
+@wp.kernel
+def _update_effort_counters(
+    effort_world: wp.array[wp.int32],
+    effort_dynamic_row: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    body_first: wp.array[wp.int32],
+    body_second: wp.array[wp.int32],
+    jacobian_first: wp.array[vec6f],
+    jacobian_second: wp.array[vec6f],
+    effective_inertia: wp.array[wp.float32],
+    projected_twist: wp.array[vec6f],
+    intercept: wp.array[wp.float32],
+    slope: wp.array[wp.float32],
+    impulse_bound: wp.array[wp.float32],
+    counter_applied: wp.array[wp.float32],
+    time_step: wp.array[wp.float32],
+    velocity_tolerance: wp.float32,
+    counter_next: wp.array[wp.float32],
+    raw_impulse: wp.array[wp.float32],
+    net_applied: wp.array[wp.float32],
+    net_target: wp.array[wp.float32],
+    velocity: wp.array[wp.float32],
+    residual: wp.array[wp.float32],
+    world_residual_scaled: wp.array[wp.float32],
+    world_residual_unscaled: wp.array[wp.float32],
+):
+    effort = wp.tid()
+    world = effort_world[effort]
+    if not world_active[world]:
+        return
+
+    dynamic_row = effort_dynamic_row[effort]
+    current_velocity = wp.float32(0.0)
+    first = body_first[dynamic_row]
+    second = body_second[dynamic_row]
+    if first >= 0:
+        current_velocity += wp.dot(jacobian_first[dynamic_row], projected_twist[first])
+    if second >= 0:
+        current_velocity += wp.dot(jacobian_second[dynamic_row], projected_twist[second])
+
+    raw = time_step[world] * (intercept[effort] - slope[effort] * current_velocity)
+    bound = impulse_bound[effort]
+    target = wp.clamp(raw, -bound, bound)
+    next_counter = target - raw
+    applied_counter = counter_applied[effort]
+    defect = wp.abs(next_counter - applied_counter)
+    scaled_defect = defect / (wp.max(1.0e-6, effective_inertia[dynamic_row]) * velocity_tolerance)
+
+    counter_next[effort] = next_counter
+    raw_impulse[effort] = raw
+    net_applied[effort] = raw + applied_counter
+    net_target[effort] = target
+    velocity[effort] = current_velocity
+    residual[effort] = defect
+    wp.atomic_max(world_residual_scaled, world, scaled_defect)
+    wp.atomic_max(world_residual_unscaled, world, defect)
 
 
 @wp.kernel
@@ -228,7 +423,7 @@ def _gather_joint_frictions(
     sparse_jacobian_data: wp.array[vec6f],
     friction_force: wp.array[wp.float32],
     body_velocity_begin: wp.array[vec6f],
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     initialize: wp.bool,
     jacobian_first: wp.array[vec6f],
     jacobian_second: wp.array[vec6f],
@@ -249,7 +444,7 @@ def _gather_joint_frictions(
         second_jacobian = _load_dense_jacobian_row(
             world, dense_row, body_second_local[row], body_dofs, jacobian_offsets, jacobian_data
         )
-    bound = time_step * friction_force[dof_index[row]]
+    bound = time_step[world] * friction_force[dof_index[row]]
     jacobian_first[row] = first_jacobian
     jacobian_second[row] = second_jacobian
     impulse_bound[row] = bound
@@ -350,7 +545,7 @@ def _compute_structural_metrics(
     jacobian_second: wp.array[vec6f],
     inverse_mass: wp.array[wp.float32],
     inverse_inertia_world: wp.array[wp.mat33f],
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     penalty_scale: wp.array[wp.float32],
     block_body_first_multiplicity: wp.array[wp.int32],
     block_body_second_multiplicity: wp.array[wp.int32],
@@ -402,7 +597,8 @@ def _compute_structural_metrics(
                         + wp.float32(second_multiplicity) * second_contribution
                     )
 
-    result = compute_mass_split_metric(split_delassus, count, 1, penalty_scale[world] / (time_step * time_step))
+    dt = time_step[world]
+    result = compute_mass_split_metric(split_delassus, count, 1, penalty_scale[world] / (dt * dt))
     physical_delassus[block] = 0.5 * (delassus + wp.transpose(delassus))
     inverse_metric[block] = result.inverse
     penalty_metric[block] = result.penalty
@@ -507,6 +703,7 @@ def _gather_limits(
     world_capacity: wp.array[wp.int32],
     world_offset: wp.array[wp.int32],
     body_offset: wp.array[wp.int32],
+    body_vector_index: wp.array[wp.int32],
     body_dofs: wp.array[wp.int32],
     constraint_group_offset: wp.array[wp.int32],
     jacobian_offsets: wp.array[wp.int32],
@@ -514,7 +711,7 @@ def _gather_limits(
     sparse_jacobian: wp.bool,
     sparse_jacobian_offsets: wp.array[wp.int32],
     sparse_jacobian_data: wp.array[vec6f],
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     stabilization_fraction: wp.float32,
     import_reactions: wp.bool,
     body_first: wp.array[wp.int32],
@@ -537,6 +734,17 @@ def _gather_limits(
     bodies = source_bodies[source]
     first_global = bodies[0]
     second_global = bodies[1]
+    first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
+    second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
+    if not first_dynamic and not second_dynamic:
+        body_first[destination] = -1
+        body_second[destination] = -1
+        jacobian_first[destination] = vec6f(0.0)
+        jacobian_second[destination] = vec6f(0.0)
+        bias[destination] = 0.0
+        reaction[destination] = 0.0
+        velocity[destination] = 0.0
+        return
     first_local = first_global - body_offset[world] if first_global >= 0 else -1
     second_local = second_global - body_offset[world] if second_global >= 0 else -1
     if sparse_jacobian:
@@ -561,10 +769,11 @@ def _gather_limits(
         velocity_previous += wp.dot(first_jacobian, body_velocity_begin[first_global])
     if second_global >= 0:
         velocity_previous += wp.dot(second_jacobian, body_velocity_begin[second_global])
-    target = compute_limit_velocity_target(source_violation[source], time_step, stabilization_fraction)
+    dt = time_step[world]
+    target = compute_limit_velocity_target(source_violation[source], dt, stabilization_fraction)
     bias[destination] = -target
     if import_reactions:
-        reaction[destination] = time_step * source_reaction[source]
+        reaction[destination] = dt * source_reaction[source]
         velocity[destination] = velocity_previous
 
 
@@ -582,6 +791,7 @@ def _gather_contacts(
     world_capacity: wp.array[wp.int32],
     world_offset: wp.array[wp.int32],
     body_offset: wp.array[wp.int32],
+    body_vector_index: wp.array[wp.int32],
     body_dofs: wp.array[wp.int32],
     constraint_group_offset: wp.array[wp.int32],
     jacobian_offsets: wp.array[wp.int32],
@@ -589,10 +799,11 @@ def _gather_contacts(
     sparse_jacobian: wp.bool,
     sparse_jacobian_offsets: wp.array[wp.int32],
     sparse_jacobian_data: wp.array[vec6f],
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     stabilization_fraction: wp.float32,
     dead_zone: wp.float32,
     impact_velocity_threshold: wp.float32,
+    recoverable_response: wp.bool,
     import_reactions: wp.bool,
     body_first: wp.array[wp.int32],
     body_second: wp.array[wp.int32],
@@ -615,6 +826,20 @@ def _gather_contacts(
     bodies = source_bodies[source]
     first_global = bodies[0]
     second_global = bodies[1]
+    first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
+    second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
+    if not first_dynamic and not second_dynamic:
+        # Contacts between two prescribed bodies cannot change the state. Keep
+        # the slot stable for reaction export, but mark it as a projection no-op.
+        body_first[destination] = -1
+        body_second[destination] = -1
+        jacobian_first[destination] = mat36f(0.0)
+        jacobian_second[destination] = mat36f(0.0)
+        bias[destination] = wp.vec3f(0.0)
+        friction[destination] = 0.0
+        reaction[destination] = wp.vec3f(0.0)
+        velocity[destination] = wp.vec3f(0.0)
+        return
     first_local = first_global - body_offset[world] if first_global >= 0 else -1
     second_local = second_global - body_offset[world] if second_global >= 0 else -1
     first_jacobian = mat36f(0.0)
@@ -650,14 +875,16 @@ def _gather_contacts(
         velocity_previous += second_jacobian @ body_velocity_begin[second_global]
     gap = source_gap[source]
     material = source_material[source]
+    dt = time_step[world]
     target = compute_contact_velocity_target(
         gap[3],
         velocity_previous[2],
         material[1],
-        time_step,
+        dt,
         stabilization_fraction,
         dead_zone,
         impact_velocity_threshold,
+        recoverable_response,
     )
 
     body_first[destination] = first_global
@@ -667,7 +894,7 @@ def _gather_contacts(
     bias[destination] = wp.vec3f(0.0, 0.0, -target)
     friction[destination] = material[0]
     if import_reactions:
-        reaction[destination] = time_step * source_reaction[source]
+        reaction[destination] = dt * source_reaction[source]
         velocity[destination] = velocity_previous
 
 
@@ -675,13 +902,15 @@ def _gather_contacts(
 def _unpack_body_vector(
     body_vector_index: wp.array[wp.int32],
     source: wp.array[wp.float32],
+    prescribed_twist: wp.array[vec6f],
     destination: wp.array[vec6f],
 ):
     body = wp.tid()
     source_offset = body_vector_index[body]
-    value = vec6f(0.0)
-    for index in range(6):
-        value[index] = source[source_offset + index]
+    value = prescribed_twist[body]
+    if source_offset >= 0:
+        for index in range(6):
+            value[index] = source[source_offset + index]
     destination[body] = value
 
 
@@ -703,6 +932,72 @@ def _write_structural_multipliers(
 ):
     row = wp.tid()
     destination[multiplier_index[row]] = -source[row]
+
+
+@wp.kernel
+def _reset_structural_multipliers_masked(
+    row_world: wp.array[wp.int32],
+    world_mask: wp.array[wp.bool],
+    multiplier_index: wp.array[wp.int32],
+    multiplier: wp.array[wp.float32],
+    destination: wp.array[wp.float32],
+):
+    row = wp.tid()
+    if world_mask[row_world[row]]:
+        multiplier[row] = 0.0
+        destination[multiplier_index[row]] = 0.0
+
+
+@wp.kernel
+def _reset_effort_rows_masked(
+    effort_world: wp.array[wp.int32],
+    world_mask: wp.array[wp.bool],
+    effort_intercept: wp.array[wp.float32],
+    effort_slope: wp.array[wp.float32],
+    effort_impulse_bound: wp.array[wp.float32],
+    effort_raw_impulse: wp.array[wp.float32],
+    effort_counter_applied: wp.array[wp.float32],
+    effort_counter_next: wp.array[wp.float32],
+    effort_net_applied: wp.array[wp.float32],
+    effort_net_target: wp.array[wp.float32],
+    effort_velocity: wp.array[wp.float32],
+    effort_residual: wp.array[wp.float32],
+):
+    effort = wp.tid()
+    if world_mask[effort_world[effort]]:
+        effort_intercept[effort] = 0.0
+        effort_slope[effort] = 0.0
+        effort_impulse_bound[effort] = 0.0
+        effort_raw_impulse[effort] = 0.0
+        effort_counter_applied[effort] = 0.0
+        effort_counter_next[effort] = 0.0
+        effort_net_applied[effort] = 0.0
+        effort_net_target[effort] = 0.0
+        effort_velocity[effort] = 0.0
+        effort_residual[effort] = 0.0
+
+
+@wp.kernel
+def _reset_effort_worlds_masked(
+    world_mask: wp.array[wp.bool],
+    world_effort_residual_max: wp.array[wp.float32],
+    world_effort_defect_max: wp.array[wp.float32],
+):
+    world = wp.tid()
+    if world_mask[world]:
+        world_effort_residual_max[world] = 0.0
+        world_effort_defect_max[world] = 0.0
+
+
+@wp.kernel
+def _reset_friction_reactions_masked(
+    friction_world: wp.array[wp.int32],
+    world_mask: wp.array[wp.bool],
+    friction_reaction: wp.array[wp.float32],
+):
+    friction = wp.tid()
+    if world_mask[friction_world[friction]]:
+        friction_reaction[friction] = 0.0
 
 
 @wp.kernel
@@ -730,7 +1025,8 @@ def _gather_structural_residuals(
 
 @wp.kernel
 def _write_dynamic_multipliers(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
+    row_world: wp.array[wp.int32],
     multiplier_index: wp.array[wp.int32],
     body_first: wp.array[wp.int32],
     body_second: wp.array[wp.int32],
@@ -749,7 +1045,41 @@ def _write_dynamic_multipliers(
         velocity += wp.dot(jacobian_first[row], body_velocity[first])
     if second >= 0:
         velocity += wp.dot(jacobian_second[row], body_velocity[second])
-    destination[multiplier_index[row]] = inverse_time_step * effective_inertia[row] * (free_velocity[row] - velocity)
+    destination[multiplier_index[row]] = (
+        inverse_time_step[row_world[row]] * effective_inertia[row] * (free_velocity[row] - velocity)
+    )
+
+
+@wp.kernel
+def _write_dynamic_multipliers_with_effort(
+    inverse_time_step: wp.array[wp.float32],
+    row_world: wp.array[wp.int32],
+    multiplier_index: wp.array[wp.int32],
+    effort_index: wp.array[wp.int32],
+    body_first: wp.array[wp.int32],
+    body_second: wp.array[wp.int32],
+    jacobian_first: wp.array[vec6f],
+    jacobian_second: wp.array[vec6f],
+    effective_inertia: wp.array[wp.float32],
+    free_velocity: wp.array[wp.float32],
+    effort_counter_applied: wp.array[wp.float32],
+    body_velocity: wp.array[vec6f],
+    destination: wp.array[wp.float32],
+):
+    row = wp.tid()
+    velocity = wp.float32(0.0)
+    first = body_first[row]
+    second = body_second[row]
+    if first >= 0:
+        velocity += wp.dot(jacobian_first[row], body_velocity[first])
+    if second >= 0:
+        velocity += wp.dot(jacobian_second[row], body_velocity[second])
+    inv_dt = inverse_time_step[row_world[row]]
+    multiplier = inv_dt * effective_inertia[row] * (free_velocity[row] - velocity)
+    bounded = effort_index[row]
+    if bounded >= 0:
+        multiplier += inv_dt * effort_counter_applied[bounded]
+    destination[multiplier_index[row]] = multiplier
 
 
 @wp.kernel
@@ -774,7 +1104,8 @@ def _accumulate_joint_wrenches(
 
 @wp.kernel
 def _accumulate_joint_friction_wrenches(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
+    friction_world: wp.array[wp.int32],
     body_first: wp.array[wp.int32],
     body_second: wp.array[wp.int32],
     jacobian_first: wp.array[vec6f],
@@ -783,7 +1114,7 @@ def _accumulate_joint_friction_wrenches(
     destination: wp.array[wp.spatial_vectorf],
 ):
     row = wp.tid()
-    force = inverse_time_step * reaction[row]
+    force = inverse_time_step[friction_world[row]] * reaction[row]
     first = body_first[row]
     second = body_second[row]
     if first >= 0:
@@ -794,7 +1125,7 @@ def _accumulate_joint_friction_wrenches(
 
 @wp.kernel
 def _accumulate_limit_wrenches(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
     limit_world: wp.array[wp.int32],
     limit_local: wp.array[wp.int32],
     world_count: wp.array[wp.int32],
@@ -809,7 +1140,7 @@ def _accumulate_limit_wrenches(
     world = limit_world[limit]
     if limit_local[limit] >= world_count[world]:
         return
-    limit_force = inverse_time_step * limit_reaction[limit]
+    limit_force = inverse_time_step[world] * limit_reaction[limit]
     first = limit_body_first[limit]
     second = limit_body_second[limit]
     if first >= 0:
@@ -820,7 +1151,7 @@ def _accumulate_limit_wrenches(
 
 @wp.kernel
 def _accumulate_contact_wrenches(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
     contact_world: wp.array[wp.int32],
     contact_local: wp.array[wp.int32],
     world_count: wp.array[wp.int32],
@@ -835,7 +1166,7 @@ def _accumulate_contact_wrenches(
     world = contact_world[contact]
     if contact_local[contact] >= world_count[world]:
         return
-    contact_force = inverse_time_step * contact_reaction[contact]
+    contact_force = inverse_time_step[world] * contact_reaction[contact]
     first = contact_body_first[contact]
     second = contact_body_second[contact]
     if first >= 0:
@@ -854,7 +1185,7 @@ def _accumulate_contact_wrenches(
 
 @wp.kernel
 def _update_structural_multipliers_from_twist_rows(
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     structural_tolerance: wp.float32,
     row_world: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
@@ -879,11 +1210,19 @@ def _update_structural_multipliers_from_twist_rows(
 ):
     row = wp.tid()
     world = row_world[row]
+    dt = time_step[world]
     if not world_active[world] or projection_status[world] != PROJECTION_STATUS_VALID:
         return
 
     first_global = body_first_global[row]
     second_global = body_second_global[row]
+    first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
+    second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
+    if not first_dynamic and not second_dynamic:
+        candidate_residual[row] = 0.0
+        multiplier[row] = 0.0
+        destination[multiplier_index[row]] = 0.0
+        return
     global_velocity = wp.float32(0.0)
     projected_velocity = wp.float32(0.0)
     linearization_velocity = wp.float32(0.0)
@@ -898,36 +1237,36 @@ def _update_structural_multipliers_from_twist_rows(
             projected_velocity += wp.dot(jacobian_second[row], projected_twist[second_global])
         linearization_velocity += wp.dot(jacobian_second[row], linearization_twist[second_global])
 
-    global_residual = residual[row] + time_step * (global_velocity - linearization_velocity)
+    global_residual = residual[row] + dt * (global_velocity - linearization_velocity)
     candidate_residual[row] = global_residual
     wp.atomic_max(world_residual, world, wp.abs(global_residual) / structural_tolerance)
 
     update_residual = global_residual
     if projected_fraction > 0.0:
-        update_residual += projected_fraction * time_step * (projected_velocity - global_velocity)
+        update_residual += projected_fraction * dt * (projected_velocity - global_velocity)
     multiplier_delta = penalty[row] * update_residual
     updated = multiplier[row] + multiplier_delta
     multiplier[row] = updated
     destination[multiplier_index[row]] = -updated
 
     for axis in range(6):
-        if first_global >= 0:
+        if first_global >= 0 and body_vector_index[first_global] >= 0:
             wp.atomic_add(
                 right_hand_side,
                 body_vector_index[first_global] + axis,
-                -time_step * multiplier_delta * jacobian_first[row][axis],
+                -dt * multiplier_delta * jacobian_first[row][axis],
             )
-        if second_global >= 0:
+        if second_global >= 0 and body_vector_index[second_global] >= 0:
             wp.atomic_add(
                 right_hand_side,
                 body_vector_index[second_global] + axis,
-                -time_step * multiplier_delta * jacobian_second[row][axis],
+                -dt * multiplier_delta * jacobian_second[row][axis],
             )
 
 
 @wp.kernel
 def _update_structural_multipliers_from_twist(
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     structural_tolerance: wp.float32,
     block_world: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
@@ -957,17 +1296,26 @@ def _update_structural_multipliers_from_twist(
 ):
     block = wp.tid()
     world = block_world[block]
-    if (
-        not world_active[world]
-        or projection_status[world] != PROJECTION_STATUS_VALID
-        or metric_status[block] != METRIC_STATUS_VALID
-    ):
+    dt = time_step[world]
+    if not world_active[world] or projection_status[world] != PROJECTION_STATUS_VALID:
         return
 
     offset = block_row_offset[block]
     count = block_row_count[block]
     first_global = block_body_first_global[block]
     second_global = block_body_second_global[block]
+    first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
+    second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
+    if not first_dynamic and not second_dynamic:
+        for row in range(6):
+            if row < count:
+                multiplier[offset + row] = 0.0
+                destination[multiplier_index[offset + row]] = 0.0
+                candidate_residual[offset + row] = 0.0
+                projected_residual[offset + row] = 0.0
+        return
+    if metric_status[block] != METRIC_STATUS_VALID:
+        return
     global_block_residual = vec6f(0.0)
     projected_block_residual = vec6f(0.0)
     for row in range(6):
@@ -983,8 +1331,8 @@ def _update_structural_multipliers_from_twist(
                 global_velocity += wp.dot(jacobian_second[offset + row], global_twist[second_global])
                 projected_velocity += wp.dot(jacobian_second[offset + row], projected_twist[second_global])
                 linearization_velocity += wp.dot(jacobian_second[offset + row], linearization_twist[second_global])
-            global_value = residual[offset + row] + time_step * (global_velocity - linearization_velocity)
-            projected_value = residual[offset + row] + time_step * (projected_velocity - linearization_velocity)
+            global_value = residual[offset + row] + dt * (global_velocity - linearization_velocity)
+            projected_value = residual[offset + row] + dt * (projected_velocity - linearization_velocity)
             global_block_residual[row] = global_value
             projected_block_residual[row] = projected_value
             candidate_residual[offset + row] = global_value
@@ -1000,23 +1348,23 @@ def _update_structural_multipliers_from_twist(
             multiplier[offset + row] = updated
             destination[multiplier_index[offset + row]] = -updated
             for axis in range(6):
-                if first_global >= 0:
+                if first_global >= 0 and body_vector_index[first_global] >= 0:
                     wp.atomic_add(
                         right_hand_side,
                         body_vector_index[first_global] + axis,
-                        -time_step * multiplier_delta[row] * jacobian_first[offset + row][axis],
+                        -dt * multiplier_delta[row] * jacobian_first[offset + row][axis],
                     )
-                if second_global >= 0:
+                if second_global >= 0 and body_vector_index[second_global] >= 0:
                     wp.atomic_add(
                         right_hand_side,
                         body_vector_index[second_global] + axis,
-                        -time_step * multiplier_delta[row] * jacobian_second[offset + row][axis],
+                        -dt * multiplier_delta[row] * jacobian_second[offset + row][axis],
                     )
 
 
 @wp.kernel
 def _evaluate_structural_residual_from_twist(
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
     structural_tolerance: wp.float32,
     row_world: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
@@ -1028,11 +1376,13 @@ def _evaluate_structural_residual_from_twist(
     residual: wp.array[wp.float32],
     linearization_twist: wp.array[vec6f],
     twist: wp.array[vec6f],
+    body_vector_index: wp.array[wp.int32],
     candidate_residual: wp.array[wp.float32],
     world_residual: wp.array[wp.float32],
 ):
     row = wp.tid()
     world = row_world[row]
+    dt = time_step[world]
     if not world_active[world] or projection_status[world] != PROJECTION_STATUS_VALID:
         return
 
@@ -1040,6 +1390,11 @@ def _evaluate_structural_residual_from_twist(
     linearization_velocity = wp.float32(0.0)
     first = body_first_global[row]
     second = body_second_global[row]
+    first_dynamic = first >= 0 and body_vector_index[first] >= 0
+    second_dynamic = second >= 0 and body_vector_index[second] >= 0
+    if not first_dynamic and not second_dynamic:
+        candidate_residual[row] = 0.0
+        return
     if first >= 0:
         candidate_velocity += wp.dot(jacobian_first[row], twist[first])
         linearization_velocity += wp.dot(jacobian_first[row], linearization_twist[first])
@@ -1047,7 +1402,7 @@ def _evaluate_structural_residual_from_twist(
         candidate_velocity += wp.dot(jacobian_second[row], twist[second])
         linearization_velocity += wp.dot(jacobian_second[row], linearization_twist[second])
 
-    row_residual = residual[row] + time_step * (candidate_velocity - linearization_velocity)
+    row_residual = residual[row] + dt * (candidate_velocity - linearization_velocity)
     candidate_residual[row] = row_residual
     wp.atomic_max(world_residual, world, wp.abs(row_residual) / structural_tolerance)
 
@@ -1060,7 +1415,7 @@ def _write_limit_outputs(
     source_local: wp.array[wp.int32],
     world_capacity: wp.array[wp.int32],
     world_offset: wp.array[wp.int32],
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
     reaction: wp.array[wp.float32],
     velocity: wp.array[wp.float32],
     destination_reaction: wp.array[wp.float32],
@@ -1074,7 +1429,7 @@ def _write_limit_outputs(
     if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
         return
     internal = world_offset[world] + local
-    destination_reaction[source] = inverse_time_step * reaction[internal]
+    destination_reaction[source] = inverse_time_step[world] * reaction[internal]
     destination_velocity[source] = velocity[internal]
 
 
@@ -1086,7 +1441,7 @@ def _write_contact_outputs(
     source_local: wp.array[wp.int32],
     world_capacity: wp.array[wp.int32],
     world_offset: wp.array[wp.int32],
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
     reaction: wp.array[wp.vec3f],
     velocity: wp.array[wp.vec3f],
     destination_reaction: wp.array[wp.vec3f],
@@ -1101,7 +1456,7 @@ def _write_contact_outputs(
     if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
         return
     internal = world_offset[world] + local
-    destination_reaction[source] = inverse_time_step * reaction[internal]
+    destination_reaction[source] = inverse_time_step[world] * reaction[internal]
     destination_velocity[source] = velocity[internal]
     destination_mode[source] = wp.static(ContactMode.make_compute_mode_func())(velocity[internal])
 
@@ -1116,6 +1471,7 @@ class LOXKaminoAdapter:
         jacobians: SystemJacobiansType,
         limits: LimitsKamino | None = None,
         contacts: ContactsKamino | None = None,
+        eliminate_fixed_world_islands: bool = True,
     ):
         if not isinstance(model, ModelKamino):
             raise TypeError("model must be a ModelKamino instance.")
@@ -1138,6 +1494,7 @@ class LOXKaminoAdapter:
         self.device = wp.get_device(model.device)
         self.num_worlds = model.info.num_worlds
         self.sparse_jacobian = isinstance(jacobians, SparseSystemJacobians)
+        self.eliminate_fixed_world_islands = eliminate_fixed_world_islands
 
         empty_int = wp.empty(0, dtype=wp.int32, device=self.device)
         empty_float = wp.empty(0, dtype=wp.float32, device=self.device)
@@ -1164,10 +1521,14 @@ class LOXKaminoAdapter:
             self._sparse_contact_offsets = jacobians._J_cts_contact_nzb_offsets
 
         body_counts = tuple(int(value) for value in model.info.num_bodies.numpy().tolist())
-        body_components = self._build_body_components()
+        dynamic_bodies = self._classify_dynamic_bodies()
+        body_mass = model.bodies.m_i.numpy()
+        self.has_massless_dynamic_body = any(body_mass[body] <= 0.0 for body in dynamic_bodies)
+        body_components = self._build_body_components(dynamic_bodies)
         self.system = BatchedPrimalBodySystem(
             body_counts,
             body_components=body_components,
+            dynamic_bodies=dynamic_bodies,
             device=self.device,
         )
         self.splitting = SplittingState(body_counts, device=self.device)
@@ -1181,21 +1542,27 @@ class LOXKaminoAdapter:
         self._contact_stabilization_fraction = 0.01
         self._contact_dead_zone = 1.0e-6
         self._impact_velocity_threshold = 1.0e-3
+        self._contact_recoverable_response = False
         self._block_joint_metrics = True
         self._uniform_joint_penalty_scale = wp.ones(self.num_worlds, dtype=wp.float32, device=self.device)
 
+        self.cables = CableMaterialSystem(model, data)
         self._allocate_joint_rows()
+        self._allocate_effort_rows()
         self._allocate_joint_frictions()
         self._allocate_unilaterals()
+        self.world_lagged_velocity_residual = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+        self.world_lagged_velocity_required = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
 
     @staticmethod
     def _device_array(values: Sequence[int], device: wp.DeviceLike) -> wp.array[wp.int32]:
         return wp.array(values, dtype=wp.int32, device=device)
 
-    def _build_body_components(self) -> tuple[tuple[int, ...], ...]:
-        """Return joint-connected body components without contact edges."""
+    def _build_body_components(self, dynamic_bodies: Sequence[int]) -> tuple[tuple[int, ...], ...]:
+        """Return joint-connected dynamic-body components without contact edges."""
         body_count = self.model.size.sum_of_num_bodies
         parent = list(range(body_count))
+        dynamic_body_set = set(dynamic_bodies)
 
         def find(body: int) -> int:
             root = body
@@ -1216,13 +1583,74 @@ class LOXKaminoAdapter:
         joint_first = self.model.joints.bid_B.numpy().astype(int).tolist()
         joint_second = self.model.joints.bid_F.numpy().astype(int).tolist()
         for first, second in zip(joint_first, joint_second, strict=True):
-            if first >= 0 and second >= 0:
+            if first in dynamic_body_set and second in dynamic_body_set:
                 union(first, second)
 
         components: dict[int, list[int]] = {}
-        for body in range(body_count):
+        for body in dynamic_bodies:
             components.setdefault(find(body), []).append(body)
         return tuple(tuple(component) for component in components.values())
+
+    def _classify_dynamic_bodies(self) -> tuple[int, ...]:
+        """Return dynamic bodies using state flags and fixed-tree world islands."""
+        source_model = self.model._model
+        body_count = self.model.size.sum_of_num_bodies
+        if source_model is None:
+            inverse_mass = self.model.bodies.inv_m_i.numpy()
+            return tuple(body for body in range(body_count) if inverse_mass[body] > 0.0)
+
+        body_flags = source_model.body_flags.numpy().astype(int).tolist()
+        if len(body_flags) != body_count:
+            raise ValueError("Newton body flags must contain one entry per packed Kamino body.")
+        if not self.eliminate_fixed_world_islands:
+            return tuple(body for body, flags in enumerate(body_flags) if not flags & int(BodyFlags.KINEMATIC))
+
+        parent = list(range(body_count))
+
+        def find(body: int) -> int:
+            root = body
+            while parent[root] != root:
+                root = parent[root]
+            while parent[body] != body:
+                next_body = parent[body]
+                parent[body] = root
+                body = next_body
+            return root
+
+        def union(first: int, second: int) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        joint_type = source_model.joint_type.numpy().astype(int).tolist()
+        joint_parent = source_model.joint_parent.numpy().astype(int).tolist()
+        joint_child = source_model.joint_child.numpy().astype(int).tolist()
+        tree_joint = [False] * len(joint_type)
+        articulation_start = source_model.articulation_start.numpy().astype(int).tolist()
+        articulation_end = source_model.articulation_end.numpy().astype(int).tolist()
+        for start, end in zip(articulation_start[:-1], articulation_end, strict=True):
+            for joint in range(start, end):
+                tree_joint[joint] = True
+
+        fixed_to_world: set[int] = set()
+        for joint, (kind, first, second) in enumerate(zip(joint_type, joint_parent, joint_child, strict=True)):
+            if not tree_joint[joint] or kind != int(JointType.FIXED) or second < 0:
+                continue
+            if first < 0:
+                fixed_to_world.add(second)
+            else:
+                union(first, second)
+
+        prescribed_islands = {find(body) for body in fixed_to_world}
+        prescribed_islands.update(
+            find(body) for body, flags in enumerate(body_flags) if flags & int(BodyFlags.KINEMATIC)
+        )
+        return tuple(body for body in range(body_count) if find(body) not in prescribed_islands)
+
+    def dynamic_body_topology_changed(self) -> bool:
+        """Return whether current body flags require a different primal topology."""
+        return self._classify_dynamic_bodies() != self.system.dynamic_bodies
 
     def _allocate_joint_rows(self) -> None:
         model = self.model
@@ -1430,6 +1858,115 @@ class LOXKaminoAdapter:
         self.static_body_constraint_count = wp.array(static_constraint_count, dtype=wp.int32, device=self.device)
         self.body_constraint_count = wp.zeros(model.size.sum_of_num_bodies, dtype=wp.int32, device=self.device)
 
+    def _allocate_effort_rows(self) -> None:
+        """Allocate finite actuator corrections without changing projection incidence."""
+        model = self.model
+        effort_limits = model.joints.tau_j_max.numpy().astype(float).tolist()
+        if len(effort_limits) != model.size.sum_of_num_joint_dofs:
+            raise ValueError("Joint effort limits must contain one value per joint DOF.")
+        if any(math.isnan(value) or value < 0.0 for value in effort_limits):
+            raise ValueError("Joint effort limits must be nonnegative or positive infinity.")
+
+        joint_actuation = model.joints.act_type.numpy().astype(int).tolist()
+        joint_coord_offset = model.joints.coords_offset.numpy().astype(int).tolist()
+        joint_dof_offset = model.joints.dofs_offset.numpy().astype(int).tolist()
+        dynamic_world = self.dynamic_row_world.numpy().astype(int).tolist()
+        dynamic_joint = self.dynamic_row_joint.numpy().astype(int).tolist()
+        dynamic_dof = self.dynamic_dof_index.numpy().astype(int).tolist()
+        dynamic_first = self.dynamic_body_first_global.numpy().astype(int).tolist()
+        dynamic_second = self.dynamic_body_second_global.numpy().astype(int).tolist()
+
+        effort_world: list[int] = []
+        effort_joint: list[int] = []
+        effort_dof: list[int] = []
+        effort_coord: list[int] = []
+        effort_dynamic_row: list[int] = []
+        dynamic_effort_index = [-1] * self.dynamic_row_count
+        driven_dof_mask = [False] * model.size.sum_of_num_joint_dofs
+        bounded_dof_mask = [False] * model.size.sum_of_num_joint_dofs
+        for dynamic_row, (world, joint, dof) in enumerate(zip(dynamic_world, dynamic_joint, dynamic_dof, strict=True)):
+            if joint_actuation[joint] <= int(JointActuationType.PASSIVE):
+                continue
+            driven_dof_mask[dof] = True
+            if math.isinf(effort_limits[dof]):
+                continue
+            bounded = len(effort_world)
+            dynamic_effort_index[dynamic_row] = bounded
+            bounded_dof_mask[dof] = True
+            effort_world.append(world)
+            effort_joint.append(joint)
+            effort_dof.append(dof)
+            effort_coord.append(joint_coord_offset[joint] + dof - joint_dof_offset[joint])
+            effort_dynamic_row.append(dynamic_row)
+
+        self.effort_capacity = len(effort_world)
+        self.has_bounded_effort = self.effort_capacity > 0
+        self.effort_driven_dof_mask = tuple(driven_dof_mask)
+        self.effort_bounded_dof_mask = tuple(bounded_dof_mask)
+        if not self.has_bounded_effort:
+            self.dynamic_effort_index = None
+            self.effort_world = None
+            self.effort_joint_index = None
+            self.effort_dof_index = None
+            self.effort_coord_index = None
+            self.effort_dynamic_row_index = None
+            self.body_effort_offset = None
+            self.body_effort_index = None
+            self.body_effort_side = None
+            self.effort_intercept = None
+            self.effort_slope = None
+            self.effort_impulse_bound = None
+            self.effort_raw_impulse = None
+            self.effort_counter_applied = None
+            self.effort_counter_next = None
+            self.effort_net_applied = None
+            self.effort_net_target = None
+            self.effort_velocity = None
+            self.effort_residual = None
+            self.world_effort_residual_max = None
+            self.world_effort_defect_max = None
+            return
+
+        world_counts = [0] * self.num_worlds
+        for world in effort_world:
+            world_counts[world] += 1
+        world_offsets = _capacity_offsets(world_counts)
+
+        body_rows: list[list[tuple[int, int]]] = [[] for _ in range(model.size.sum_of_num_bodies)]
+        for effort, dynamic_row in enumerate(effort_dynamic_row):
+            first = dynamic_first[dynamic_row]
+            second = dynamic_second[dynamic_row]
+            if first >= 0:
+                body_rows[first].append((effort, 0))
+            if second >= 0:
+                body_rows[second].append((effort, 1))
+        body_offsets = _capacity_offsets([len(rows) for rows in body_rows])
+        body_incidence = [item for rows in body_rows for item in rows]
+
+        self.dynamic_effort_index = self._device_array(dynamic_effort_index, self.device)
+        self.effort_world = self._device_array(effort_world, self.device)
+        self.effort_joint_index = self._device_array(effort_joint, self.device)
+        self.effort_dof_index = self._device_array(effort_dof, self.device)
+        self.effort_coord_index = self._device_array(effort_coord, self.device)
+        self.effort_dynamic_row_index = self._device_array(effort_dynamic_row, self.device)
+        self.world_effort_offset = self._device_array(world_offsets[:-1], self.device)
+        self.world_effort_count = self._device_array(world_counts, self.device)
+        self.body_effort_offset = self._device_array(body_offsets, self.device)
+        self.body_effort_index = self._device_array([item[0] for item in body_incidence], self.device)
+        self.body_effort_side = self._device_array([item[1] for item in body_incidence], self.device)
+        self.effort_intercept = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_slope = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_impulse_bound = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_raw_impulse = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_counter_applied = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_counter_next = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_net_applied = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_net_target = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_velocity = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.effort_residual = wp.zeros(self.effort_capacity, dtype=wp.float32, device=self.device)
+        self.world_effort_residual_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+        self.world_effort_defect_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+
     def _allocate_joint_frictions(self) -> None:
         """Allocate one bounded scalar constraint for each frictional joint DOF."""
         source_model = self.model._model
@@ -1456,6 +1993,7 @@ class LOXKaminoAdapter:
             sparse_offsets = self.jacobians._J_dofs_joint_nzb_offsets.numpy().astype(int).tolist()
 
         rows_by_world: list[list[tuple[int, ...]]] = [[] for _ in range(self.num_worlds)]
+        body_vector_index = self.system.body_vector_index_host
         for joint in range(self.model.size.sum_of_num_joints):
             world = joint_worlds[joint]
             first_global = joint_first[joint]
@@ -1465,6 +2003,10 @@ class LOXKaminoAdapter:
             dof_offset = joint_dof_offsets[joint]
             dof_count = joint_dof_counts[joint]
             sparse_start = sparse_offsets[joint] if sparse_offsets is not None else -1
+            first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
+            second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
+            if not first_dynamic and not second_dynamic:
+                continue
             for local_dof in range(dof_count):
                 dof = dof_offset + local_dof
                 if friction_values[dof] <= 0.0:
@@ -1510,6 +2052,8 @@ class LOXKaminoAdapter:
         self.friction_velocity = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)
         self.friction_residual = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)
         self.friction_projection_delassus = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)
+        self.friction_apgd_trial = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)
+        self.friction_apgd_next = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)
         self.world_friction_residual_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
 
     def _allocate_unilaterals(self) -> None:
@@ -1560,6 +2104,8 @@ class LOXKaminoAdapter:
         self.limit_velocity = wp.zeros(self.limit_capacity, dtype=wp.float32, device=self.device)
         self.limit_residual = wp.zeros(self.limit_capacity, dtype=wp.float32, device=self.device)
         self.limit_projection_delassus = wp.zeros(self.limit_capacity, dtype=wp.float32, device=self.device)
+        self.limit_apgd_trial = wp.zeros(self.limit_capacity, dtype=wp.float32, device=self.device)
+        self.limit_apgd_next = wp.zeros(self.limit_capacity, dtype=wp.float32, device=self.device)
         self.world_limit_residual_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
 
         self.contact_body_first = wp.full(self.contact_capacity, -1, dtype=wp.int32, device=self.device)
@@ -1575,35 +2121,78 @@ class LOXKaminoAdapter:
         self.contact_projection_delassus_normal_first = wp.zeros(
             self.contact_capacity, dtype=wp.mat33f, device=self.device
         )
+        self.contact_apgd_trial = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
+        self.contact_apgd_next = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
+        self.friction_avbd_penalty = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)
+        self.contact_avbd_inverse_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
+        self.contact_avbd_augmented_reaction = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
+        self.limit_avbd_penalty = wp.zeros(self.limit_capacity, dtype=wp.float32, device=self.device)
         self.world_contact_projection_status = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
         self.world_jacobi_projection_status = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
+        self.world_avbd_projection_status = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
         self.projection_twist_delta = wp.zeros(self.model.size.sum_of_num_bodies, dtype=vec6f, device=self.device)
+        self.avbd_body_force = wp.zeros(self.model.size.sum_of_num_bodies, dtype=vec6f, device=self.device)
+        self.avbd_body_hessian = wp.zeros(self.model.size.sum_of_num_bodies, dtype=mat66f, device=self.device)
+        self.avbd_body_stationarity = wp.zeros(self.model.size.sum_of_num_bodies, dtype=vec6f, device=self.device)
+        self.world_avbd_stationarity_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+        self.world_avbd_update_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         self.world_contact_residual_max = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         self.projection_status = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
         self.world_has_unilateral = wp.zeros(self.num_worlds, dtype=wp.bool, device=self.device)
         self.body_has_unilateral = wp.zeros(self.model.size.sum_of_num_bodies, dtype=wp.int32, device=self.device)
 
+        body_count = self.model.size.sum_of_num_bodies
+        dynamic = {body for body, index in enumerate(self.system.body_vector_index_host) if index >= 0}
+        color_groups: list[list[int]] = []
+        assigned: set[int] = set()
+        source_model = self.model._model
+        if source_model is not None:
+            for source_group in source_model.body_color_groups:
+                group = [
+                    int(body)
+                    for body in source_group.numpy().tolist()
+                    if int(body) in dynamic and int(body) not in assigned
+                ]
+                if group:
+                    color_groups.append(group)
+                    assigned.update(group)
+        unassigned = sorted(dynamic - assigned)
+        if unassigned:
+            color_groups.append(unassigned)
+        body_color = [-1] * body_count
+        for color, group in enumerate(color_groups):
+            for body in group:
+                body_color[body] = color
+        self.avbd_body_color = self._device_array(body_color, self.device)
+        self.avbd_body_color_groups = tuple(self._device_array(group, self.device) for group in color_groups)
+
     def begin_time_step(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
         limit_stabilization_fraction: float = 0.01,
         contact_stabilization_fraction: float = 0.01,
         contact_dead_zone: float = 1.0e-6,
         impact_velocity_threshold: float = 1.0e-3,
+        contact_recoverable_response: bool = False,
     ) -> None:
         """Cache begin-step velocities and import unilateral reaction impulses once."""
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
+        self._time_step = time_step
+        self._inverse_time_step = inverse_time_step
         if not 0.0 <= limit_stabilization_fraction <= 1.0:
             raise ValueError("limit_stabilization_fraction must be in [0, 1].")
         if not 0.0 <= contact_stabilization_fraction <= 1.0:
             raise ValueError("contact_stabilization_fraction must be in [0, 1].")
         if contact_dead_zone < 0.0 or impact_velocity_threshold < 0.0:
             raise ValueError("Contact dead zone and impact velocity threshold must be nonnegative.")
+        if not isinstance(contact_recoverable_response, bool):
+            raise ValueError("contact_recoverable_response must be a boolean.")
         self._limit_stabilization_fraction = limit_stabilization_fraction
         self._contact_stabilization_fraction = contact_stabilization_fraction
         self._contact_dead_zone = contact_dead_zone
         self._impact_velocity_threshold = impact_velocity_threshold
+        self._contact_recoverable_response = contact_recoverable_response
         wp.launch(
             _capture_body_velocity,
             dim=self.model.size.sum_of_num_bodies,
@@ -1611,6 +2200,7 @@ class LOXKaminoAdapter:
             outputs=[self.body_velocity_begin],
             device=self.device,
         )
+        self.cables.begin_time_step()
         if self.dynamic_row_count > 0:
             wp.launch(
                 _capture_dynamic_joint_velocity,
@@ -1625,6 +2215,7 @@ class LOXKaminoAdapter:
             contact_stabilization_fraction,
             contact_dead_zone,
             impact_velocity_threshold,
+            contact_recoverable_response,
         )
         self._freeze_constraint_multiplicities()
 
@@ -1666,7 +2257,7 @@ class LOXKaminoAdapter:
 
     def update(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
         joint_penalty_scale: float | wp.array[wp.float32] = 10.0,
         linearization_twist: wp.array[vec6f] | None = None,
         block_joint_metrics: bool = True,
@@ -1685,8 +2276,7 @@ class LOXKaminoAdapter:
         twist. Pass a packed zero twist for the first linearly implicit
         assembly about the begin-step pose.
         """
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_step(time_step, self.num_worlds, self.device)
         if isinstance(joint_penalty_scale, wp.array):
             if joint_penalty_scale.ndim != 1 or joint_penalty_scale.dtype != wp.float32:
                 raise ValueError("joint_penalty_scale must be a one-dimensional float32 array.")
@@ -1742,6 +2332,7 @@ class LOXKaminoAdapter:
             self._contact_stabilization_fraction,
             self._contact_dead_zone,
             self._impact_velocity_threshold,
+            self._contact_recoverable_response,
             import_reactions=False,
             update_counts=False,
         )
@@ -1793,7 +2384,31 @@ class LOXKaminoAdapter:
                 self.dynamic_jacobian_second,
                 self.dynamic_effective_inertia,
                 self.dynamic_free_velocity,
+                prescribed_twist=self.body_velocity_begin,
             )
+            if self.has_bounded_effort:
+                wp.launch(
+                    _gather_effort_rows,
+                    dim=self.effort_capacity,
+                    inputs=[
+                        self.effort_world,
+                        self.effort_joint_index,
+                        self.effort_dof_index,
+                        self.effort_dynamic_row_index,
+                        self.model.joints.act_type,
+                        self.dynamic_effective_inertia,
+                        self.dynamic_free_velocity,
+                        self.model.joints.a_j,
+                        self.dynamic_velocity_begin,
+                        data.joints.tau_j,
+                        self.model.joints.k_p_j,
+                        self.model.joints.k_d_j,
+                        self.model.joints.tau_j_max,
+                        time_step,
+                    ],
+                    outputs=[self.effort_intercept, self.effort_slope, self.effort_impulse_bound],
+                    device=self.device,
+                )
 
         if self.structural_row_count > 0:
             wp.launch(
@@ -1876,6 +2491,7 @@ class LOXKaminoAdapter:
                         self.structural_metric_status,
                         linearization_twist,
                         time_step,
+                        prescribed_twist=self.body_velocity_begin,
                     )
             else:
                 if assemble_structural_penalty:
@@ -1892,15 +2508,23 @@ class LOXKaminoAdapter:
                         time_step,
                         world_joint_penalty_scale,
                         self.structural_penalty,
+                        prescribed_twist=self.body_velocity_begin,
                     )
+        self.cables.assemble(
+            self.system,
+            linearization_twist,
+            time_step,
+            prescribed_twist=self.body_velocity_begin,
+        )
 
     def _update_unilaterals(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
         limit_stabilization_fraction: float,
         contact_stabilization_fraction: float,
         contact_dead_zone: float,
         impact_velocity_threshold: float,
+        contact_recoverable_response: bool,
         import_reactions: bool = True,
         update_counts: bool = True,
     ) -> None:
@@ -1962,6 +2586,7 @@ class LOXKaminoAdapter:
                     self.world_limit_capacity,
                     self.world_limit_offset,
                     self.model.info.bodies_offset,
+                    self.system.body_vector_index,
                     self.model.info.num_body_dofs,
                     self.data.info.limit_cts_group_offset,
                     self._dense_jacobian_offsets,
@@ -2012,6 +2637,7 @@ class LOXKaminoAdapter:
                     self.world_contact_capacity,
                     self.world_contact_offset,
                     self.model.info.bodies_offset,
+                    self.system.body_vector_index,
                     self.model.info.num_body_dofs,
                     self.data.info.contact_cts_group_offset,
                     self._dense_jacobian_offsets,
@@ -2023,6 +2649,7 @@ class LOXKaminoAdapter:
                     contact_stabilization_fraction,
                     contact_dead_zone,
                     impact_velocity_threshold,
+                    contact_recoverable_response,
                     import_reactions,
                 ],
                 outputs=[
@@ -2085,14 +2712,14 @@ class LOXKaminoAdapter:
         wp.launch(
             _unpack_body_vector,
             dim=self.model.size.sum_of_num_bodies,
-            inputs=[self.system.body_vector_index, solution],
+            inputs=[self.system.body_vector_index, solution, self.body_velocity_begin],
             outputs=[self.system_solution_twist],
             device=self.device,
         )
 
     def update_structural_multipliers_from_twist(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
         structural_tolerance: float,
         linearization_twist: wp.array[vec6f],
         global_twist: wp.array[vec6f],
@@ -2101,8 +2728,9 @@ class LOXKaminoAdapter:
         projected_fraction: float = 0.0,
     ) -> None:
         """Update the zero structural split and evaluate both body-twist copies."""
-        if not time_step > 0.0 or not structural_tolerance > 0.0:
-            raise ValueError("Time step and structural tolerance must be positive.")
+        validate_world_time_step(time_step, self.num_worlds, self.device)
+        if not structural_tolerance > 0.0:
+            raise ValueError("Structural tolerance must be positive.")
         if linearization_twist.shape[0] != self.model.size.sum_of_num_bodies:
             raise ValueError("linearization_twist must contain one entry per body.")
         if global_twist.shape[0] != self.model.size.sum_of_num_bodies:
@@ -2202,6 +2830,7 @@ class LOXKaminoAdapter:
                     self.structural_residual,
                     linearization_twist,
                     projected_twist,
+                    self.system.body_vector_index,
                 ],
                 outputs=[self.structural_projected_residual, self.world_projected_structural_residual],
                 device=self.device,
@@ -2209,7 +2838,7 @@ class LOXKaminoAdapter:
 
     def evaluate_structural_residuals_from_twists(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
         structural_tolerance: float,
         linearization_twist: wp.array[vec6f],
         global_twist: wp.array[vec6f],
@@ -2217,8 +2846,9 @@ class LOXKaminoAdapter:
         world_active: wp.array[wp.bool],
     ) -> None:
         """Evaluate structural residuals without changing joint multipliers."""
-        if not time_step > 0.0 or not structural_tolerance > 0.0:
-            raise ValueError("Time step and structural tolerance must be positive.")
+        validate_world_time_step(time_step, self.num_worlds, self.device)
+        if not structural_tolerance > 0.0:
+            raise ValueError("Structural tolerance must be positive.")
         if any(
             twist.shape[0] != self.model.size.sum_of_num_bodies
             for twist in (linearization_twist, global_twist, projected_twist)
@@ -2246,6 +2876,7 @@ class LOXKaminoAdapter:
                 self.structural_residual,
                 linearization_twist,
                 global_twist,
+                self.system.body_vector_index,
             ],
             outputs=[self.structural_candidate_residual, self.world_structural_residual],
             device=self.device,
@@ -2266,21 +2897,254 @@ class LOXKaminoAdapter:
                 self.structural_residual,
                 linearization_twist,
                 projected_twist,
+                self.system.body_vector_index,
             ],
             outputs=[self.structural_projected_residual, self.world_projected_structural_residual],
             device=self.device,
         )
 
-    def reset_structural_multipliers(self) -> None:
+    def evaluate_lagged_velocity_consistency(
+        self,
+        velocity_tolerance: float,
+        global_twist: wp.array[vec6f],
+        projected_twist_previous: wp.array[vec6f],
+        world_active: wp.array[wp.bool],
+    ) -> None:
+        """Evaluate prior projected constraint velocities using the current global solve."""
+        if velocity_tolerance <= 0.0:
+            raise ValueError("Velocity tolerance must be positive.")
+        body_count = self.model.size.sum_of_num_bodies
+        if global_twist.shape[0] != body_count or projected_twist_previous.shape[0] != body_count:
+            raise ValueError("Twist arrays must contain one entry per packed body.")
+        if world_active.shape[0] != self.num_worlds:
+            raise ValueError("world_active must contain one entry per world.")
+
+        self.world_lagged_velocity_residual.zero_()
+        self.world_lagged_velocity_required.zero_()
+        inverse_tolerance = 1.0 / velocity_tolerance
+
+        scalar_rows = (
+            (
+                self.dynamic_row_count,
+                self.dynamic_row_world,
+                self.dynamic_body_first_global,
+                self.dynamic_body_second_global,
+                self.dynamic_jacobian_first,
+                self.dynamic_jacobian_second,
+            ),
+            (
+                self.structural_row_count,
+                self.structural_row_world,
+                self.structural_body_first_global,
+                self.structural_body_second_global,
+                self.structural_jacobian_first,
+                self.structural_jacobian_second,
+            ),
+            (
+                self.friction_capacity,
+                self.friction_world,
+                self.friction_body_first,
+                self.friction_body_second,
+                self.friction_jacobian_first,
+                self.friction_jacobian_second,
+            ),
+            (
+                self.limit_capacity,
+                self.limit_world,
+                self.limit_body_first,
+                self.limit_body_second,
+                self.limit_jacobian_first,
+                self.limit_jacobian_second,
+            ),
+        )
+        for row_count, row_world, body_first, body_second, jacobian_first, jacobian_second in scalar_rows:
+            if row_count > 0:
+                wp.launch(
+                    _evaluate_lagged_scalar_velocity_consistency,
+                    dim=row_count,
+                    inputs=[
+                        row_world,
+                        body_first,
+                        body_second,
+                        jacobian_first,
+                        jacobian_second,
+                        world_active,
+                        global_twist,
+                        projected_twist_previous,
+                        inverse_tolerance,
+                    ],
+                    outputs=[self.world_lagged_velocity_required, self.world_lagged_velocity_residual],
+                    device=self.device,
+                )
+        if self.contact_capacity > 0:
+            wp.launch(
+                _evaluate_lagged_contact_velocity_consistency,
+                dim=self.contact_capacity,
+                inputs=[
+                    self.contact_world,
+                    self.contact_local,
+                    self.world_contact_count,
+                    self.contact_body_first,
+                    self.contact_body_second,
+                    self.contact_jacobian_first,
+                    self.contact_jacobian_second,
+                    world_active,
+                    global_twist,
+                    projected_twist_previous,
+                    inverse_tolerance,
+                ],
+                outputs=[self.world_lagged_velocity_required, self.world_lagged_velocity_residual],
+                device=self.device,
+            )
+
+    def reset_structural_multipliers(self, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Clear persistent structural multiplier warm starts."""
         if self.structural_row_count == 0:
             return
-        self.structural_multiplier.zero_()
+        if world_mask is None:
+            self.structural_multiplier.zero_()
+            wp.launch(
+                _write_structural_multipliers,
+                dim=self.structural_row_count,
+                inputs=[self.structural_multiplier_index, self.structural_multiplier],
+                outputs=[self.data.joints.lambda_j],
+                device=self.device,
+            )
+        else:
+            wp.launch(
+                _reset_structural_multipliers_masked,
+                dim=self.structural_row_count,
+                inputs=[
+                    self.structural_row_world,
+                    world_mask,
+                    self.structural_multiplier_index,
+                ],
+                outputs=[self.structural_multiplier, self.data.joints.lambda_j],
+                device=self.device,
+            )
+
+    def reset_effort_counters(self, world_mask: wp.array[wp.bool] | None = None) -> None:
+        """Clear finite actuator correction warm starts and diagnostics."""
+        if not self.has_bounded_effort:
+            return
+        if world_mask is None:
+            self.effort_intercept.zero_()
+            self.effort_slope.zero_()
+            self.effort_impulse_bound.zero_()
+            self.effort_raw_impulse.zero_()
+            self.effort_counter_applied.zero_()
+            self.effort_counter_next.zero_()
+            self.effort_net_applied.zero_()
+            self.effort_net_target.zero_()
+            self.effort_velocity.zero_()
+            self.effort_residual.zero_()
+            self.world_effort_residual_max.zero_()
+            self.world_effort_defect_max.zero_()
+            return
+
         wp.launch(
-            _write_structural_multipliers,
-            dim=self.structural_row_count,
-            inputs=[self.structural_multiplier_index, self.structural_multiplier],
-            outputs=[self.data.joints.lambda_j],
+            _reset_effort_rows_masked,
+            dim=self.effort_capacity,
+            inputs=[self.effort_world, world_mask],
+            outputs=[
+                self.effort_intercept,
+                self.effort_slope,
+                self.effort_impulse_bound,
+                self.effort_raw_impulse,
+                self.effort_counter_applied,
+                self.effort_counter_next,
+                self.effort_net_applied,
+                self.effort_net_target,
+                self.effort_velocity,
+                self.effort_residual,
+            ],
+            device=self.device,
+        )
+        wp.launch(
+            _reset_effort_worlds_masked,
+            dim=self.num_worlds,
+            inputs=[world_mask],
+            outputs=[self.world_effort_residual_max, self.world_effort_defect_max],
+            device=self.device,
+        )
+
+    def reset_friction_reactions(self, world_mask: wp.array[wp.bool] | None = None) -> None:
+        """Clear persistent joint-friction impulse warm starts."""
+        if self.friction_capacity == 0:
+            return
+        if world_mask is None:
+            self.friction_reaction.zero_()
+            return
+        wp.launch(
+            _reset_friction_reactions_masked,
+            dim=self.friction_capacity,
+            inputs=[self.friction_world, world_mask],
+            outputs=[self.friction_reaction],
+            device=self.device,
+        )
+
+    def promote_effort_counters(self, world_active: wp.array[wp.bool]) -> None:
+        """Promote the pending correction before solving its candidate system."""
+        if not self.has_bounded_effort:
+            return
+        wp.launch(
+            _promote_effort_counters,
+            dim=self.effort_capacity,
+            inputs=[self.effort_world, world_active, self.effort_counter_next],
+            outputs=[self.effort_counter_applied],
+            device=self.device,
+        )
+
+    def update_effort_counters(
+        self,
+        time_step: wp.array[wp.float32],
+        velocity_tolerance: float,
+        projected_twist: wp.array[vec6f],
+        world_active: wp.array[wp.bool],
+    ) -> None:
+        """Evaluate finite actuator defects without applying the next correction."""
+        if not self.has_bounded_effort:
+            return
+        validate_world_time_step(time_step, self.num_worlds, self.device)
+        if velocity_tolerance <= 0.0:
+            raise ValueError("Velocity tolerance must be positive.")
+        wp.launch(
+            _clear_active_effort_residuals,
+            dim=self.num_worlds,
+            inputs=[world_active],
+            outputs=[self.world_effort_residual_max, self.world_effort_defect_max],
+            device=self.device,
+        )
+        wp.launch(
+            _update_effort_counters,
+            dim=self.effort_capacity,
+            inputs=[
+                self.effort_world,
+                self.effort_dynamic_row_index,
+                world_active,
+                self.dynamic_body_first_global,
+                self.dynamic_body_second_global,
+                self.dynamic_jacobian_first,
+                self.dynamic_jacobian_second,
+                self.dynamic_effective_inertia,
+                projected_twist,
+                self.effort_intercept,
+                self.effort_slope,
+                self.effort_impulse_bound,
+                self.effort_counter_applied,
+                time_step,
+                velocity_tolerance,
+            ],
+            outputs=[
+                self.effort_counter_next,
+                self.effort_raw_impulse,
+                self.effort_net_applied,
+                self.effort_net_target,
+                self.effort_velocity,
+                self.effort_residual,
+                self.world_effort_residual_max,
+                self.world_effort_defect_max,
+            ],
             device=self.device,
         )
 
@@ -2310,15 +3174,18 @@ class LOXKaminoAdapter:
             )
         return self.structural_residual
 
-    def write_outputs(self, time_step: float, body_velocity: wp.array[vec6f] | None = None) -> None:
+    def write_outputs(
+        self,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
+        body_velocity: wp.array[vec6f] | None = None,
+    ) -> None:
         """Write body velocities and force-valued reactions to Kamino containers."""
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
         if body_velocity is None:
             body_velocity = self.projected_twist
         if body_velocity.shape[0] != self.model.size.sum_of_num_bodies:
             raise ValueError("body_velocity must contain one entry per model body.")
-        inverse_time_step = 1.0 / time_step
         wp.launch(
             _write_body_velocity,
             dim=self.model.size.sum_of_num_bodies,
@@ -2327,23 +3194,46 @@ class LOXKaminoAdapter:
             device=self.device,
         )
         if self.dynamic_row_count > 0:
-            wp.launch(
-                _write_dynamic_multipliers,
-                dim=self.dynamic_row_count,
-                inputs=[
-                    inverse_time_step,
-                    self.dynamic_multiplier_index,
-                    self.dynamic_body_first_global,
-                    self.dynamic_body_second_global,
-                    self.dynamic_jacobian_first,
-                    self.dynamic_jacobian_second,
-                    self.dynamic_effective_inertia,
-                    self.dynamic_free_velocity,
-                    body_velocity,
-                ],
-                outputs=[self.data.joints.lambda_j],
-                device=self.device,
-            )
+            if self.has_bounded_effort:
+                wp.launch(
+                    _write_dynamic_multipliers_with_effort,
+                    dim=self.dynamic_row_count,
+                    inputs=[
+                        inverse_time_step,
+                        self.dynamic_row_world,
+                        self.dynamic_multiplier_index,
+                        self.dynamic_effort_index,
+                        self.dynamic_body_first_global,
+                        self.dynamic_body_second_global,
+                        self.dynamic_jacobian_first,
+                        self.dynamic_jacobian_second,
+                        self.dynamic_effective_inertia,
+                        self.dynamic_free_velocity,
+                        self.effort_counter_applied,
+                        body_velocity,
+                    ],
+                    outputs=[self.data.joints.lambda_j],
+                    device=self.device,
+                )
+            else:
+                wp.launch(
+                    _write_dynamic_multipliers,
+                    dim=self.dynamic_row_count,
+                    inputs=[
+                        inverse_time_step,
+                        self.dynamic_row_world,
+                        self.dynamic_multiplier_index,
+                        self.dynamic_body_first_global,
+                        self.dynamic_body_second_global,
+                        self.dynamic_jacobian_first,
+                        self.dynamic_jacobian_second,
+                        self.dynamic_effective_inertia,
+                        self.dynamic_free_velocity,
+                        body_velocity,
+                    ],
+                    outputs=[self.data.joints.lambda_j],
+                    device=self.device,
+                )
         if self.structural_row_count > 0:
             wp.launch(
                 _write_structural_multipliers,
@@ -2389,12 +3279,15 @@ class LOXKaminoAdapter:
                 device=self.device,
             )
 
-        self.write_constraint_wrenches(time_step)
+        self.write_constraint_wrenches(time_step, inverse_time_step)
 
-    def write_constraint_wrenches(self, time_step: float) -> None:
+    def write_constraint_wrenches(
+        self,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
+    ) -> None:
         """Write joint, limit, and contact reaction wrenches to body data."""
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
         data = self.data.bodies
         data.w_j_i.zero_()
         data.w_l_i.zero_()
@@ -2434,7 +3327,8 @@ class LOXKaminoAdapter:
                 _accumulate_joint_friction_wrenches,
                 dim=self.friction_capacity,
                 inputs=[
-                    1.0 / time_step,
+                    inverse_time_step,
+                    self.friction_world,
                     self.friction_body_first,
                     self.friction_body_second,
                     self.friction_jacobian_first,
@@ -2444,12 +3338,13 @@ class LOXKaminoAdapter:
                 outputs=[data.w_j_i],
                 device=self.device,
             )
+        self.cables.accumulate_wrenches(data.w_j_i, time_step)
         if self.limit_capacity > 0:
             wp.launch(
                 _accumulate_limit_wrenches,
                 dim=self.limit_capacity,
                 inputs=[
-                    1.0 / time_step,
+                    inverse_time_step,
                     self.limit_world,
                     self.limit_local,
                     self.world_limit_count,
@@ -2462,12 +3357,13 @@ class LOXKaminoAdapter:
                 outputs=[data.w_l_i],
                 device=self.device,
             )
+
         if self.contact_capacity > 0:
             wp.launch(
                 _accumulate_contact_wrenches,
                 dim=self.contact_capacity,
                 inputs=[
-                    1.0 / time_step,
+                    inverse_time_step,
                     self.contact_world,
                     self.contact_local,
                     self.world_contact_count,
@@ -2480,3 +3376,7 @@ class LOXKaminoAdapter:
                 outputs=[data.w_c_i],
                 device=self.device,
             )
+
+    def notify_model_changed(self) -> None:
+        """Refresh cable rest geometry after body or joint frame edits."""
+        self.cables.refresh_rest_state()

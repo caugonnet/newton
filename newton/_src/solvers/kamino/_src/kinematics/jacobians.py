@@ -256,7 +256,10 @@ def store_joint_cts_jacobian_dense(
     Stores the constraints Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.CABLE:
+        pass  # Cable material Jacobians are assembled by the LOX cable path.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_dense_func(JointDoFType.REVOLUTE.cts_axes))(
             J_row_offset, num_body_dofs, bid_offset, bid_B, bid_F, JT_B, JT_F, J_data
         )
@@ -317,7 +320,10 @@ def store_joint_dofs_jacobian_dense(
     Stores the DoFs Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.CABLE:
+        pass  # Cable storage slots have no ordinary DoF Jacobian rows.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_dense_func(JointDoFType.REVOLUTE.dofs_axes))(
             J_row_offset, num_body_dofs, bid_offset, bid_B, bid_F, JT_B, JT_F, J_data
         )
@@ -375,7 +381,10 @@ def store_joint_cts_jacobian_sparse(
     Stores the constraints Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.CABLE:
+        pass  # Cable material Jacobians are assembled by the LOX cable path.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_sparse_func(JointDoFType.REVOLUTE.cts_axes))(
             is_binary, JT_B_j, JT_F_j, J_nzb_offset, J_nzb_values
         )
@@ -433,7 +442,10 @@ def store_joint_dofs_jacobian_sparse(
     Stores the DoFs Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.CABLE:
+        pass  # Cable storage slots have no ordinary DoF Jacobian rows.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_sparse_func(JointDoFType.REVOLUTE.dofs_axes))(
             is_binary, JT_B_j, JT_F_j, J_nzb_offset, J_nzb_values
         )
@@ -654,7 +666,6 @@ def _build_joint_jacobians_sparse(
 
     # Retrieve the joint model data
     dof_type = model_joints_dof_type[jid]
-    num_dofs = model_joints_num_dofs[jid]
     num_dyn_cts = model_joints_num_dynamic_cts[jid]
     bid_B = model_joints_bid_B[jid]
     bid_F = model_joints_bid_F[jid]
@@ -686,7 +697,8 @@ def _build_joint_jacobians_sparse(
         )
 
     # Store the constraint Jacobian block
-    kinematic_nzb_offset = 0 if num_dyn_cts == 0 else (2 * num_dofs if bid_B > -1 else num_dofs)
+    num_adjacent_bodies = 2 if bid_B > -1 else 1
+    kinematic_nzb_offset = num_adjacent_bodies * num_dyn_cts
     store_joint_cts_jacobian_sparse(
         dof_type,
         bid_B > -1,

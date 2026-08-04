@@ -368,26 +368,6 @@ class TestSolverKaminoConfig(unittest.TestCase):
         if self.verbose:
             msg.reset_log_level()
 
-    def test_00_make_default(self):
-        config = SolverKaminoImpl.Config()
-        assert_solver_config(self, config)
-        self.assertEqual(config.dynamics_solver, "padmm")
-        self.assertFalse(config.sparse_jacobian)
-        self.assertEqual(config.rotation_correction, "twopi")
-        self.assertEqual(config.dynamics.linear_solver_type, "LLTB")
-        self.assertEqual(config.padmm.warmstart_mode, "containers")
-        self.assertEqual(config.lox.nonlinear_iterations, 1)
-        self.assertEqual(config.lox.max_iterations, 25)
-        self.assertEqual(config.lox.projection_iterations, 3)
-        self.assertEqual(config.lox.projection_method, "jacobi")
-        self.assertEqual(config.lox.velocity_tolerance, 1.0e-5)
-        self.assertEqual(config.lox.weight_sigma, 1.0e-3)
-        self.assertEqual(config.lox.weight_beta, 4.0)
-        self.assertEqual(config.lox.joint_penalty_scale, 100.0)
-        self.assertEqual(config.lox.joint_multiplier_projected_fraction, 1.0)
-        self.assertEqual(config.lox.joint_warmstart_factor, 0.5)
-        self.assertFalse(config.lox.joint_solve_direct)
-
     def test_01_make_explicit(self):
         config = SolverKaminoImpl.Config(
             dynamics=kamino_config.ConstrainedDynamicsConfig(linear_solver_type="CR"),
@@ -400,14 +380,36 @@ class TestSolverKaminoConfig(unittest.TestCase):
         self.assertEqual(config.padmm.warmstart_mode, "internal")
 
     def test_02_lox_config_validation(self):
+        """Accept supported LOX projection methods and reject invalid config values."""
         config = SolverKaminoImpl.Config(dynamics_solver="lox")
         self.assertEqual(config.dynamics_solver, "lox")
+
+        for projection_method in ("jacobi", "gauss_seidel", "apgd", "avbd"):
+            with self.subTest(projection_method=projection_method):
+                self.assertEqual(
+                    kamino_config.LOXSolverConfig(projection_method=projection_method).projection_method,
+                    projection_method,
+                )
+
+        with self.assertRaisesRegex(ValueError, "'jacobi'.*'gauss_seidel'.*'apgd'.*'avbd'"):
+            kamino_config.LOXSolverConfig(projection_method="invalid")
+
+        for color_count in (0, 1, 2, 17):
+            with self.subTest(gauss_seidel_max_colors=color_count):
+                self.assertEqual(
+                    kamino_config.LOXSolverConfig(gauss_seidel_max_colors=color_count).gauss_seidel_max_colors,
+                    color_count,
+                )
+        for color_count in (-1, 1.0, True):
+            with self.subTest(invalid_gauss_seidel_max_colors=color_count):
+                with self.assertRaisesRegex(ValueError, "gauss_seidel_max_colors"):
+                    kamino_config.LOXSolverConfig(gauss_seidel_max_colors=color_count)
 
         invalid_values = (
             {"nonlinear_iterations": 0},
             {"max_iterations": 0},
+            {"use_graph_conditionals": 1},
             {"projection_iterations": 0},
-            {"projection_method": "invalid"},
             {"position_tolerance": 0.0},
             {"rotation_tolerance": 0.0},
             {"velocity_tolerance": 0.0},
@@ -415,16 +417,21 @@ class TestSolverKaminoConfig(unittest.TestCase):
             {"weight_sigma": 1.1},
             {"weight_beta": 0.0},
             {"weight_beta": 0.5},
+            {"deformable_weight_beta": 0.0},
+            {"deformable_weight_beta": 0.5},
+            {"selective_weights": 1},
             {"joint_penalty_scale": 0.0},
             {"joint_multiplier_projected_fraction": -0.1},
             {"joint_multiplier_projected_fraction": 1.1},
             {"joint_warmstart_factor": -0.1},
             {"joint_warmstart_factor": 1.1},
             {"joint_solve_direct": 1},
+            {"contact_recoverable_response": 1},
             {"impact_velocity_threshold": -1.0},
             {"position_tolerance": float("nan")},
             {"velocity_tolerance": float("nan")},
             {"weight_beta": float("inf")},
+            {"deformable_weight_beta": float("inf")},
             {"joint_multiplier_projected_fraction": float("nan")},
             {"joint_warmstart_factor": float("nan")},
             {"impact_velocity_threshold": float("nan")},

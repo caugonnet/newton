@@ -25,13 +25,14 @@ class TestLOXLoop(unittest.TestCase):
 
     def test_one_body_hard_contact_returns_projected_velocity(self):
         system = BatchedPrimalBodySystem([1], device=self.device)
+        time_step = wp.full(1, 0.01, dtype=wp.float32, device=self.device)
         initial_twist = wp.array([[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=vec6f, device=self.device)
         system.assemble_bodies(
             wp.ones(1, dtype=wp.float32, device=self.device),
             wp.array([np.eye(3, dtype=np.float32)], dtype=wp.mat33f, device=self.device),
             initial_twist,
             wp.zeros(1, dtype=vec6f, device=self.device),
-            time_step=0.01,
+            time_step=time_step,
         )
         system.build_weighted_matrix()
         system.factorize()
@@ -98,9 +99,10 @@ class TestLOXLoop(unittest.TestCase):
             )
             state.finish_iteration(
                 projection_status,
-                time_step=0.01,
+                time_step=time_step,
                 position_tolerance=1.0e-3,
                 rotation_tolerance=1.0e-3,
+                velocity_tolerance=0.1,
             )
         state.mark_iteration_limit()
 

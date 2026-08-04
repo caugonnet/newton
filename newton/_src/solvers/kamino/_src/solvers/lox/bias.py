@@ -24,6 +24,7 @@ def compute_contact_velocity_target(
     stabilization_fraction: wp.float32,
     dead_zone: wp.float32,
     impact_velocity_threshold: wp.float32,
+    recoverable_response: wp.bool,
 ) -> wp.float32:
     """Compute the minimum end-of-step normal contact velocity.
 
@@ -35,6 +36,7 @@ def compute_contact_velocity_target(
         stabilization_fraction: Penetration recovery fraction.
         dead_zone: Symmetric distance dead zone [m].
         impact_velocity_threshold: Minimum approaching impact speed [m/s].
+        recoverable_response: Whether to permit restitution-recoverable overlap.
 
     Returns:
         Minimum feasible normal velocity [m/s].
@@ -43,6 +45,17 @@ def compute_contact_velocity_target(
     velocity_gap = (
         -(stabilization_fraction * wp.min(distance_effective, 0.0) + wp.max(distance_effective, 0.0)) / time_step
     )
+    # Permit the overlap whose next-step recovery matches the unreduced
+    # restitution response.
+    if (
+        recoverable_response
+        and distance_effective > 0.0
+        and previous_normal_velocity < velocity_gap
+        and previous_normal_velocity < -impact_velocity_threshold
+        and stabilization_fraction > 0.0
+    ):
+        recoverable_overlap = -time_step * restitution * previous_normal_velocity / stabilization_fraction
+        velocity_gap = -(distance_effective + recoverable_overlap) / time_step
 
     velocity_target = velocity_gap
     closed = distance <= dead_zone

@@ -9,11 +9,11 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.kamino._src.core.types import mat66f, vec6f
-from newton._src.solvers.kamino._src.linalg import LLTBlockedSolver
 from newton._src.solvers.kamino._src.solvers.lox import (
     BODY_WEIGHT_STATUS_VALID,
     BatchedPrimalBodySystem,
 )
+from newton._src.solvers.kamino._src.solvers.lox.linear import HybridLLTBlockedSolver
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
 
@@ -61,6 +61,11 @@ def _row_arrays(
     )
 
 
+def _world_dt(system: BatchedPrimalBodySystem, value: float, device: wp.DeviceLike) -> wp.array[wp.float32]:
+    """Construct an explicit uniform per-world time-step array."""
+    return wp.full(system.num_worlds, value, dtype=wp.float32, device=device)
+
+
 def _extract_world_matrices(system: BatchedPrimalBodySystem, values: wp.array) -> list[np.ndarray]:
     flat = values.numpy()
     matrices = []
@@ -98,7 +103,7 @@ class TestLOXSystem(unittest.TestCase):
         time_step = 0.02
         body_inputs = _body_arrays(mass, inertia, velocity, wrench, self.device)
 
-        system.assemble_bodies(*body_inputs, time_step=time_step)
+        system.assemble_bodies(*body_inputs, time_step=_world_dt(system, time_step, self.device))
         system.build_weighted_matrix()
         system.factorize_and_solve()
 
@@ -127,7 +132,8 @@ class TestLOXSystem(unittest.TestCase):
             system.solution.numpy(), np.linalg.solve(weighted, expected_candidate_rhs), rtol=2.0e-5, atol=2.0e-6
         )
 
-    def test_weight_skips_components_without_unilaterals(self):
+    def test_weight_skips_bodies_without_unilaterals(self):
+        """Penalize only bodies incident to unilateral constraints."""
         components = ((0,), (1, 2))
         masses = np.asarray([2.0, 3.0, 4.0], dtype=np.float32)
         inertias = np.asarray(
@@ -152,15 +158,16 @@ class TestLOXSystem(unittest.TestCase):
                 system = BatchedPrimalBodySystem([3], body_components=components, device=self.device)
                 system.assemble_bodies(
                     *_body_arrays(masses, inertias, velocities, wrenches, self.device),
-                    time_step=time_step,
+                    time_step=_world_dt(system, time_step, self.device),
                 )
+                system.selective_body_weights = True
                 build = system.build_anisotropic_weighted_matrix if anisotropic else system.build_weighted_matrix
                 build(body_has_unilateral=has_unilateral)
 
-                np.testing.assert_array_equal(system.block_has_unilateral.numpy(), [0, 1])
+                np.testing.assert_array_equal(system.body_weight_enabled.numpy(), [0, 1, 0])
                 np.testing.assert_array_equal(system.weight.numpy()[0], np.zeros((6, 6), dtype=np.float32))
                 self.assertGreater(float(np.linalg.norm(system.weight.numpy()[1])), 0.0)
-                self.assertGreater(float(np.linalg.norm(system.weight.numpy()[2])), 0.0)
+                np.testing.assert_array_equal(system.weight.numpy()[2], np.zeros((6, 6), dtype=np.float32))
                 np.testing.assert_array_equal(system.weighted_matrix.numpy()[:36], system.smooth_matrix.numpy()[:36])
 
                 system.factorize_and_solve()
@@ -174,6 +181,12 @@ class TestLOXSystem(unittest.TestCase):
                     rtol=2.0e-5,
                     atol=2.0e-6,
                 )
+
+                system.selective_body_weights = False
+                build(body_has_unilateral=has_unilateral)
+                np.testing.assert_array_equal(system.block_has_unilateral.numpy(), [0, 1])
+                np.testing.assert_array_equal(system.body_weight_enabled.numpy(), [0, 1, 1])
+                self.assertGreater(float(np.linalg.norm(system.weight.numpy()[2])), 0.0)
 
     def test_independent_components_factorize_separately(self):
         components = ((0, 2), (1,), (3,))
@@ -213,7 +226,7 @@ class TestLOXSystem(unittest.TestCase):
         for system in (component_system, world_system):
             system.assemble_bodies(
                 *_body_arrays(masses, inertias, velocities, wrenches, self.device),
-                time_step=0.01,
+                time_step=_world_dt(system, 0.01, self.device),
             )
             system.add_dynamic_rows(
                 *rows,
@@ -250,7 +263,7 @@ class TestLOXSystem(unittest.TestCase):
                 system = BatchedPrimalBodySystem([2], device=self.device)
                 system.assemble_bodies(
                     *_body_arrays(masses, inertias, velocities, wrenches, self.device),
-                    time_step=time_step,
+                    time_step=_world_dt(system, time_step, self.device),
                 )
                 smooth_worlds = _extract_world_matrices(system, system.smooth_matrix)
                 metric_matrix = wp.array(10.0 * system.smooth_matrix.numpy(), dtype=wp.float32, device=self.device)
@@ -282,7 +295,7 @@ class TestLOXSystem(unittest.TestCase):
         inertias = np.asarray([np.diag([0.4, 0.7, 1.0]), np.diag([0.6, 0.9, 1.3])], dtype=np.float32)
         body_inputs = _body_arrays(masses, inertias, device=self.device)
         time_step = 0.01
-        system.assemble_bodies(*body_inputs, time_step=time_step)
+        system.assemble_bodies(*body_inputs, time_step=_world_dt(system, time_step, self.device))
 
         jacobian_first = np.asarray([[0.4, -0.2, 0.1, 0.5, -0.3, 0.2]], dtype=np.float32)
         jacobian_second = np.asarray([[-0.1, 0.6, -0.4, 0.2, 0.3, -0.5]], dtype=np.float32)
@@ -314,11 +327,64 @@ class TestLOXSystem(unittest.TestCase):
         np.testing.assert_allclose(actual_matrix, actual_matrix.T, rtol=0.0, atol=2.0e-7)
         self.assertGreater(np.linalg.eigvalsh(actual_matrix)[0], 0.0)
 
+    def test_prescribed_body_is_eliminated_from_dynamic_row(self):
+        """Eliminate a prescribed endpoint and retain its known velocity in the row target."""
+        system = BatchedPrimalBodySystem(
+            [2],
+            body_components=((1,),),
+            dynamic_bodies=(1,),
+            device=self.device,
+        )
+        masses = np.asarray([0.0, 2.2], dtype=np.float32)
+        inertias = np.asarray([np.zeros((3, 3)), np.diag([0.6, 0.9, 1.3])], dtype=np.float32)
+        prescribed_twist = np.asarray(
+            [[0.3, -0.5, 0.2, 0.4, -0.1, 0.6], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        system.assemble_bodies(
+            *_body_arrays(masses, inertias, velocities=prescribed_twist, device=self.device),
+            time_step=_world_dt(system, 0.01, self.device),
+        )
+
+        jacobian_first = np.asarray([[0.4, -0.2, 0.1, 0.5, -0.3, 0.2]], dtype=np.float32)
+        jacobian_second = np.asarray([[-0.1, 0.6, -0.4, 0.2, 0.3, -0.5]], dtype=np.float32)
+        rows = _row_arrays(
+            np.asarray([0], dtype=np.int32),
+            np.asarray([0], dtype=np.int32),
+            np.asarray([1], dtype=np.int32),
+            jacobian_first,
+            jacobian_second,
+            self.device,
+        )
+        effective_inertia = 0.7
+        free_velocity = -1.25
+        system.add_dynamic_rows(
+            *rows,
+            wp.array([effective_inertia], dtype=wp.float32, device=self.device),
+            wp.array([free_velocity], dtype=wp.float32, device=self.device),
+            prescribed_twist=wp.array(prescribed_twist, dtype=vec6f, device=self.device),
+        )
+
+        dynamic_mass = _spatial_mass(float(masses[1]), inertias[1])
+        expected_matrix = dynamic_mass + effective_inertia * np.outer(jacobian_second[0], jacobian_second[0])
+        reduced_target = free_velocity - jacobian_first[0] @ prescribed_twist[0]
+        expected_rhs = effective_inertia * reduced_target * jacobian_second[0]
+        self.assertEqual(system.body_vector_index_host, (-1, 0))
+        self.assertEqual(system.info.total_vec_size, 6)
+        np.testing.assert_allclose(
+            system.smooth_matrix.numpy().reshape(6, 6), expected_matrix, rtol=2.0e-6, atol=2.0e-7
+        )
+        np.testing.assert_allclose(system.right_hand_side.numpy(), expected_rhs, rtol=2.0e-6, atol=2.0e-7)
+        self.assertGreater(np.linalg.eigvalsh(expected_matrix)[0], 0.0)
+
     def test_structural_row_penalty_and_assembly(self):
         system = BatchedPrimalBodySystem([2], device=self.device)
         masses = np.asarray([1.0, 1.8], dtype=np.float32)
         inertias = np.asarray([np.diag([0.3, 0.5, 0.9]), np.diag([0.4, 0.8, 1.1])], dtype=np.float32)
-        system.assemble_bodies(*_body_arrays(masses, inertias, device=self.device), time_step=0.02)
+        system.assemble_bodies(
+            *_body_arrays(masses, inertias, device=self.device),
+            time_step=_world_dt(system, 0.02, self.device),
+        )
 
         jacobian_first = np.asarray([[0.5, 0.1, -0.2, 0.3, -0.4, 0.6]], dtype=np.float32)
         jacobian_second = np.asarray([[-0.3, 0.4, 0.2, -0.5, 0.1, -0.2]], dtype=np.float32)
@@ -345,7 +411,7 @@ class TestLOXSystem(unittest.TestCase):
             wp.array([multiplier], dtype=wp.float32, device=self.device),
             wp.array([effective_mass], dtype=wp.float32, device=self.device),
             wp.array(linearization_twist, dtype=vec6f, device=self.device),
-            time_step,
+            _world_dt(system, time_step, self.device),
             wp.array([penalty_scale], dtype=wp.float32, device=self.device),
             penalty,
         )
@@ -372,7 +438,10 @@ class TestLOXSystem(unittest.TestCase):
         masses = np.asarray([1.2, 1.9], dtype=np.float32)
         inertias = np.asarray([np.diag([0.3, 0.6, 0.8]), np.diag([0.5, 0.9, 1.4])], dtype=np.float32)
         time_step = 0.03
-        system.assemble_bodies(*_body_arrays(masses, inertias, device=self.device), time_step=time_step)
+        system.assemble_bodies(
+            *_body_arrays(masses, inertias, device=self.device),
+            time_step=_world_dt(system, time_step, self.device),
+        )
 
         jacobian_first = np.asarray(
             [[0.6, -0.2, 0.1, 0.3, -0.5, 0.4], [-0.1, 0.7, 0.2, -0.4, 0.2, 0.6]],
@@ -404,7 +473,7 @@ class TestLOXSystem(unittest.TestCase):
             wp.array(penalty, dtype=mat66f, device=self.device),
             wp.array([1], dtype=wp.int32, device=self.device),
             wp.array(linearization_twist, dtype=vec6f, device=self.device),
-            time_step,
+            _world_dt(system, time_step, self.device),
         )
 
         combined_jacobian = np.concatenate((jacobian_first, jacobian_second), axis=1)
@@ -425,7 +494,10 @@ class TestLOXSystem(unittest.TestCase):
         system = BatchedPrimalBodySystem([1], device=self.device)
         mass = np.asarray([2.0], dtype=np.float32)
         inertia = np.asarray([np.diag([0.4, 0.7, 1.1])], dtype=np.float32)
-        system.assemble_bodies(*_body_arrays(mass, inertia, device=self.device), time_step=0.01)
+        system.assemble_bodies(
+            *_body_arrays(mass, inertia, device=self.device),
+            time_step=_world_dt(system, 0.01, self.device),
+        )
 
         jacobian = np.asarray([[0.5, -0.2, 0.1, 0.3, -0.4, 0.6]], dtype=np.float32)
         arguments = (
@@ -465,7 +537,9 @@ class TestLOXSystem(unittest.TestCase):
 
     def test_heterogeneous_multiple_worlds_and_llt(self):
         system = BatchedPrimalBodySystem([1, 2], device=self.device)
-        self.assertIsInstance(system.linear_solver, LLTBlockedSolver)
+        self.assertIsInstance(system.linear_solver, HybridLLTBlockedSolver)
+        self.assertEqual(system.linear_solver._sequential_num_blocks, 1)
+        self.assertEqual(system.linear_solver._tiled_num_blocks, 1)
         masses = np.asarray([1.2, 1.5, 2.0], dtype=np.float32)
         inertias = np.asarray(
             [np.diag([0.2, 0.3, 0.5]), np.diag([0.4, 0.6, 0.8]), np.diag([0.5, 0.9, 1.4])],
@@ -480,7 +554,10 @@ class TestLOXSystem(unittest.TestCase):
             dtype=np.float32,
         )
         time_step = 0.015
-        system.assemble_bodies(*_body_arrays(masses, inertias, velocities, wrenches, self.device), time_step=time_step)
+        system.assemble_bodies(
+            *_body_arrays(masses, inertias, velocities, wrenches, self.device),
+            time_step=_world_dt(system, time_step, self.device),
+        )
 
         jacobian_first = np.asarray([[0.3, -0.4, 0.2, 0.1, 0.5, -0.2]], dtype=np.float32)
         jacobian_second = np.asarray([[-0.5, 0.1, 0.4, -0.3, 0.2, 0.6]], dtype=np.float32)

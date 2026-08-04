@@ -24,6 +24,7 @@ def _compute_targets(
     stabilization_fraction: wp.float32,
     dead_zone: wp.float32,
     impact_velocity_threshold: wp.float32,
+    recoverable_response: wp.bool,
     limit_violation: wp.array[wp.float32],
     contact_target: wp.array[wp.float32],
     limit_target: wp.array[wp.float32],
@@ -37,6 +38,7 @@ def _compute_targets(
         stabilization_fraction,
         dead_zone,
         impact_velocity_threshold,
+        recoverable_response,
     )
     limit_target[index] = compute_limit_velocity_target(limit_violation[index], time_step, stabilization_fraction)
 
@@ -48,10 +50,17 @@ class TestLOXBias(unittest.TestCase):
         self.device = wp.get_device(test_context.device)
 
     def test_contact_and_limit_velocity_targets(self):
-        distance = np.asarray([-0.011, 0.011, 0.0005, -0.011, 0.011, 0.0], dtype=np.float32)
-        previous_velocity = np.asarray([0.0, 0.0, -2.0, -0.2, -2.0, -0.0005], dtype=np.float32)
-        restitution = np.asarray([0.5] * 6, dtype=np.float32)
-        limit_violation = np.asarray([-0.01, 0.01, 0.0, -0.02, 0.02, -0.005], dtype=np.float32)
+        """Verify unilateral velocity targets across gap and impact regimes."""
+        distance = np.asarray(
+            [-0.011, 0.011, 0.0005, -0.011, 0.011, 0.011, 0.011, 0.0],
+            dtype=np.float32,
+        )
+        previous_velocity = np.asarray(
+            [0.0, 0.0, -2.0, -0.2, -2.0, -2.0, -2.0, -0.0005],
+            dtype=np.float32,
+        )
+        restitution = np.asarray([0.5, 0.5, 0.5, 0.5, 0.05, 0.5, 0.0, 0.5], dtype=np.float32)
+        limit_violation = np.asarray([-0.01, 0.01, 0.0, -0.02, 0.02, 0.02, 0.02, -0.005], dtype=np.float32)
         contact_target = wp.empty(len(distance), dtype=wp.float32, device=self.device)
         limit_target = wp.empty(len(distance), dtype=wp.float32, device=self.device)
 
@@ -66,6 +75,7 @@ class TestLOXBias(unittest.TestCase):
                 0.2,
                 0.001,
                 0.001,
+                True,
                 wp.array(limit_violation, dtype=wp.float32, device=self.device),
             ],
             outputs=[contact_target, limit_target],
@@ -73,11 +83,61 @@ class TestLOXBias(unittest.TestCase):
         )
 
         # Penetration recovery, speculative approach, restitution, max(recovery, bounce),
-        # no speculative restitution, and impact-threshold suppression.
-        expected_contact = np.asarray([0.2, -1.0, 1.0, 0.2, -1.0, 0.0], dtype=np.float32)
-        expected_limit = np.asarray([0.2, 0.0, 0.0, 0.4, 0.0, 0.1], dtype=np.float32)
+        # active and inactive recoverable overlap, zero restitution, and threshold suppression.
+        expected_contact = np.asarray([0.2, -1.0, 1.0, 0.2, -1.5, -6.0, -1.0, 0.0], dtype=np.float32)
+        expected_limit = np.asarray([0.2, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0, 0.1], dtype=np.float32)
         np.testing.assert_allclose(contact_target.numpy(), expected_contact, rtol=0.0, atol=2.0e-6)
         np.testing.assert_allclose(limit_target.numpy(), expected_limit, rtol=0.0, atol=2.0e-6)
+
+    def test_zero_stabilization_keeps_hard_speculative_target(self):
+        """Keep hard no-crossing when penetration recovery is disabled."""
+        contact_target = wp.empty(1, dtype=wp.float32, device=self.device)
+        limit_target = wp.empty(1, dtype=wp.float32, device=self.device)
+
+        wp.launch(
+            _compute_targets,
+            dim=1,
+            inputs=[
+                wp.array([0.011], dtype=wp.float32, device=self.device),
+                wp.array([-2.0], dtype=wp.float32, device=self.device),
+                wp.array([0.5], dtype=wp.float32, device=self.device),
+                0.01,
+                0.0,
+                0.001,
+                0.001,
+                True,
+                wp.array([0.0], dtype=wp.float32, device=self.device),
+            ],
+            outputs=[contact_target, limit_target],
+            device=self.device,
+        )
+
+        np.testing.assert_allclose(contact_target.numpy(), [-1.0], rtol=0.0, atol=2.0e-6)
+
+    def test_recoverable_response_is_opt_in(self):
+        """Keep hard speculative no-crossing when the option is disabled."""
+        contact_target = wp.empty(1, dtype=wp.float32, device=self.device)
+        limit_target = wp.empty(1, dtype=wp.float32, device=self.device)
+
+        wp.launch(
+            _compute_targets,
+            dim=1,
+            inputs=[
+                wp.array([0.011], dtype=wp.float32, device=self.device),
+                wp.array([-2.0], dtype=wp.float32, device=self.device),
+                wp.array([0.05], dtype=wp.float32, device=self.device),
+                0.01,
+                0.2,
+                0.001,
+                0.001,
+                False,
+                wp.array([0.0], dtype=wp.float32, device=self.device),
+            ],
+            outputs=[contact_target, limit_target],
+            device=self.device,
+        )
+
+        np.testing.assert_allclose(contact_target.numpy(), [-1.0], rtol=0.0, atol=2.0e-6)
 
 
 if __name__ == "__main__":

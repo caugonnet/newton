@@ -12,6 +12,7 @@ from ...linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo
 from .joint_factorize import make_batched_body_solve_kernel
 from .linear import HybridLLTBlockedSolver
 from .system import BatchedPrimalBodySystem
+from .time import validate_world_time_step, validate_world_time_steps
 
 __all__ = ["BatchedStructuralJointSolver"]
 
@@ -22,13 +23,17 @@ wp.set_module_options({"enable_backward": False})
 def _load_body_vector(
     values: wp.array[wp.float32],
     body_vector_index: wp.array[wp.int32],
+    prescribed_twist: wp.array[vec6f],
     body: wp.int32,
 ) -> vec6f:
     result = vec6f(0.0)
     if body >= 0:
         offset = body_vector_index[body]
-        for axis in range(6):
-            result[axis] = values[offset + axis]
+        if offset >= 0:
+            for axis in range(6):
+                result[axis] = values[offset + axis]
+        else:
+            result = prescribed_twist[body]
     return result
 
 
@@ -62,7 +67,8 @@ def _build_joint_basis_body_right_hand_sides(
 
 @wp.kernel
 def _build_joint_right_hand_side(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
+    row_world: wp.array[wp.int32],
     row_vector_index: wp.array[wp.int32],
     body_first_global: wp.array[wp.int32],
     body_second_global: wp.array[wp.int32],
@@ -70,32 +76,37 @@ def _build_joint_right_hand_side(
     jacobian_second: wp.array[vec6f],
     residual: wp.array[wp.float32],
     body_vector_index: wp.array[wp.int32],
+    prescribed_twist: wp.array[vec6f],
     linearization_twist: wp.array[vec6f],
     free_body_value: wp.array[wp.float32],
     right_hand_side: wp.array[wp.float32],
 ):
     row = wp.tid()
+    index = row_vector_index[row]
+    if index < 0:
+        return
     free_velocity = wp.float32(0.0)
     linearization_velocity = wp.float32(0.0)
     first_global = body_first_global[row]
     second_global = body_second_global[row]
     if first_global >= 0:
         free_velocity += wp.dot(
-            jacobian_first[row], _load_body_vector(free_body_value, body_vector_index, first_global)
+            jacobian_first[row],
+            _load_body_vector(free_body_value, body_vector_index, prescribed_twist, first_global),
         )
         linearization_velocity += wp.dot(jacobian_first[row], linearization_twist[first_global])
     if second_global >= 0:
         free_velocity += wp.dot(
-            jacobian_second[row], _load_body_vector(free_body_value, body_vector_index, second_global)
+            jacobian_second[row],
+            _load_body_vector(free_body_value, body_vector_index, prescribed_twist, second_global),
         )
         linearization_velocity += wp.dot(jacobian_second[row], linearization_twist[second_global])
-    index = row_vector_index[row]
-    right_hand_side[index] = inverse_time_step * residual[row] + free_velocity - linearization_velocity
+    right_hand_side[index] = inverse_time_step[row_world[row]] * residual[row] + free_velocity - linearization_velocity
 
 
 @wp.kernel
 def _build_blended_joint_residual(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
     row_world: wp.array[wp.int32],
     row_vector_index: wp.array[wp.int32],
     body_first_global: wp.array[wp.int32],
@@ -111,8 +122,11 @@ def _build_blended_joint_residual(
     right_hand_side: wp.array[wp.float32],
 ):
     row = wp.tid()
+    index = row_vector_index[row]
+    if index < 0:
+        return
     if not world_has_unilateral[row_world[row]]:
-        right_hand_side[row_vector_index[row]] = 0.0
+        right_hand_side[index] = 0.0
         return
     global_velocity = wp.float32(0.0)
     projected_velocity = wp.float32(0.0)
@@ -128,14 +142,14 @@ def _build_blended_joint_residual(
         projected_velocity += wp.dot(jacobian_second[row], projected_twist[second])
         linearization_velocity += wp.dot(jacobian_second[row], linearization_twist[second])
     blended_velocity = global_velocity + projected_fraction * (projected_velocity - global_velocity)
-    right_hand_side[row_vector_index[row]] = (
-        inverse_time_step * residual[row] + blended_velocity - linearization_velocity
+    right_hand_side[index] = (
+        inverse_time_step[row_world[row]] * residual[row] + blended_velocity - linearization_velocity
     )
 
 
 @wp.kernel
 def _write_joint_multipliers(
-    inverse_time_step: wp.float32,
+    inverse_time_step: wp.array[wp.float32],
     row_world: wp.array[wp.int32],
     row_vector_index: wp.array[wp.int32],
     multiplier_index: wp.array[wp.int32],
@@ -147,7 +161,12 @@ def _write_joint_multipliers(
     row = wp.tid()
     if not world_active[row_world[row]]:
         return
-    force = inverse_time_step * impulse[row_vector_index[row]]
+    index = row_vector_index[row]
+    if index < 0:
+        multiplier[row] = 0.0
+        destination[multiplier_index[row]] = 0.0
+        return
+    force = inverse_time_step[row_world[row]] * impulse[index]
     multiplier[row] = force
     destination[multiplier_index[row]] = -force
 
@@ -357,7 +376,9 @@ def _transform_joint_right_hand_side(
 
 @wp.kernel
 def _warmstart_transformed_joint_impulse(
-    time_step: wp.float32,
+    time_step: wp.array[wp.float32],
+    block_component: wp.array[wp.int32],
+    component_world: wp.array[wp.int32],
     block_row_offset: wp.array[wp.int32],
     block_row_count: wp.array[wp.int32],
     row_vector_index: wp.array[wp.int32],
@@ -367,6 +388,7 @@ def _warmstart_transformed_joint_impulse(
     impulse: wp.array[wp.float32],
 ):
     block = wp.tid()
+    dt = time_step[component_world[block_component[block]]]
     offset = block_row_offset[block]
     count = block_row_count[block]
     scaling = factor[block]
@@ -374,7 +396,7 @@ def _warmstart_transformed_joint_impulse(
     transformed_value = vec6f(0.0)
     for row in range(6):
         if row < count:
-            physical[row] = time_step * multiplier[offset + row]
+            physical[row] = dt * multiplier[offset + row]
     reverse = int(0)
     while reverse < 6:
         row = 5 - reverse
@@ -488,6 +510,7 @@ class BatchedStructuralJointSolver:
         block_row_offset: wp.array[wp.int32],
         block_row_count: wp.array[wp.int32],
         row_block: wp.array[wp.int32],
+        prescribed_twist: wp.array[vec6f],
     ):
         self.body_system = body_system
         self.device = body_system.device
@@ -497,9 +520,7 @@ class BatchedStructuralJointSolver:
         self.body_second_global = body_second_global
         self.jacobian_first = jacobian_first
         self.jacobian_second = jacobian_second
-        self.block_row_offset = block_row_offset
-        self.block_row_count = block_row_count
-        self.row_block = row_block
+        self.prescribed_twist = prescribed_twist
 
         if any(
             array.shape[0] != self.row_count
@@ -508,53 +529,76 @@ class BatchedStructuralJointSolver:
             raise ValueError("Structural row arrays must have identical lengths.")
         if block_row_offset.shape[0] != block_row_count.shape[0]:
             raise ValueError("Structural block arrays must have identical lengths.")
+        if prescribed_twist.shape[0] != body_system.num_bodies:
+            raise ValueError("prescribed_twist must contain one entry per packed body.")
 
         first_global = body_first_global.numpy().astype(int).tolist()
         second_global = body_second_global.numpy().astype(int).tolist()
-        row_components: list[int] = []
+        row_components = [-1] * self.row_count
         body_first_local: list[int] = []
         body_second_local: list[int] = []
         component_row_counts = [0] * body_system.num_blocks
-        component_row_local: list[int] = []
-        for first, second in zip(first_global, second_global, strict=True):
+        component_row_local = [-1] * self.row_count
+        for row, (first, second) in enumerate(zip(first_global, second_global, strict=True)):
             if first < 0 and second < 0:
                 raise ValueError("Each structural row must reference at least one body.")
             if first >= body_system.num_bodies or second >= body_system.num_bodies:
                 raise ValueError("Structural row body indices must reference packed bodies.")
-            component = body_system.body_block_host[first] if first >= 0 else body_system.body_block_host[second]
-            if second >= 0 and body_system.body_block_host[second] != component:
+            first_local = body_system.body_local_host[first] if first >= 0 else -1
+            second_local = body_system.body_local_host[second] if second >= 0 else -1
+            body_first_local.append(first_local)
+            body_second_local.append(second_local)
+            if first_local < 0 and second_local < 0:
+                continue
+            component = body_system.body_block_host[first] if first_local >= 0 else body_system.body_block_host[second]
+            if second_local >= 0 and body_system.body_block_host[second] != component:
                 raise ValueError("A structural row cannot connect independent body components.")
-            row_components.append(component)
-            component_row_local.append(component_row_counts[component])
+            row_components[row] = component
+            component_row_local[row] = component_row_counts[component]
             component_row_counts[component] += 1
-            body_first_local.append(body_system.body_local_host[first] if first >= 0 else -1)
-            body_second_local.append(body_system.body_local_host[second] if second >= 0 else -1)
 
         storage_dimensions = [max(1, count) for count in component_row_counts]
         vector_offsets = [0]
         for dimension in storage_dimensions:
             vector_offsets.append(vector_offsets[-1] + dimension)
-        row_vector_index = [
-            vector_offsets[component] + local
-            for component, local in zip(row_components, component_row_local, strict=True)
-        ]
+        row_vector_index = [-1] * self.row_count
+        for row, (component, local) in enumerate(zip(row_components, component_row_local, strict=True)):
+            if component >= 0:
+                row_vector_index[row] = vector_offsets[component] + local
 
         block_offsets = block_row_offset.numpy().astype(int).tolist()
         block_counts = block_row_count.numpy().astype(int).tolist()
+        active_block_offsets: list[int] = []
+        active_block_counts: list[int] = []
         block_components: list[int] = []
         for offset, count in zip(block_offsets, block_counts, strict=True):
             if count < 1 or offset < 0 or offset + count > self.row_count:
                 raise ValueError("Structural block row ranges must be nonempty and valid.")
+            active_rows = [row_components[row] >= 0 for row in range(offset, offset + count)]
+            if any(active_rows) and not all(active_rows):
+                raise ValueError("A structural joint block cannot mix prescribed-only and dynamic rows.")
+            if not any(active_rows):
+                continue
             component = row_components[offset]
             if any(row_components[row] != component for row in range(offset, offset + count)):
                 raise ValueError("A structural joint block cannot span body components.")
+            active_block_offsets.append(offset)
+            active_block_counts.append(count)
             block_components.append(component)
+
+        active_row_block = [-1] * self.row_count
+        for block, (offset, count) in enumerate(zip(active_block_offsets, active_block_counts, strict=True)):
+            for row in range(offset, offset + count):
+                active_row_block[row] = block
 
         self.component_row_counts = tuple(component_row_counts)
         self.component_world_host = body_system.block_world_host
         self.row_vector_index = wp.array(row_vector_index, dtype=wp.int32, device=self.device)
         self.body_first_local = wp.array(body_first_local, dtype=wp.int32, device=self.device)
         self.body_second_local = wp.array(body_second_local, dtype=wp.int32, device=self.device)
+        self.block_row_offset = wp.array(active_block_offsets, dtype=wp.int32, device=self.device)
+        self.block_row_count = wp.array(active_block_counts, dtype=wp.int32, device=self.device)
+        self.row_block = wp.array(active_row_block, dtype=wp.int32, device=self.device)
         self.block_component = wp.array(block_components, dtype=wp.int32, device=self.device)
 
         self.info = DenseSquareMultiLinearInfo()
@@ -590,7 +634,8 @@ class BatchedStructuralJointSolver:
         self.body_response_intermediate = wp.zeros_like(self.body_response)
         vector_row = [-1] * self.info.total_vec_size
         for row, vector_index in enumerate(row_vector_index):
-            vector_row[vector_index] = row
+            if vector_index >= 0:
+                vector_row[vector_index] = row
         self.vector_row = wp.array(vector_row, dtype=wp.int32, device=self.device)
         self.block_scaling_factor = wp.zeros(len(block_components), dtype=mat66f, device=self.device)
         self.block_scaling_status = wp.zeros(len(block_components), dtype=wp.int32, device=self.device)
@@ -709,10 +754,9 @@ class BatchedStructuralJointSolver:
             device=self.device,
         )
 
-    def warmstart(self, time_step: float, multiplier: wp.array[wp.float32]) -> None:
+    def warmstart(self, time_step: wp.array[wp.float32], multiplier: wp.array[wp.float32]) -> None:
         """Transform persistent physical joint impulses into the current Schur coordinates."""
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_step(time_step, self.body_system.num_worlds, self.device)
         if multiplier.shape[0] != self.row_count:
             raise ValueError("multiplier must contain one value per structural row.")
         wp.launch(
@@ -720,6 +764,8 @@ class BatchedStructuralJointSolver:
             dim=self.block_component.shape[0],
             inputs=[
                 time_step,
+                self.block_component,
+                self.body_system.block_world,
                 self.block_row_offset,
                 self.block_row_count,
                 self.row_vector_index,
@@ -739,7 +785,8 @@ class BatchedStructuralJointSolver:
 
     def project(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
         linearization_twist: wp.array[vec6f],
         world_active: wp.array[wp.bool],
         residual: wp.array[wp.float32],
@@ -748,8 +795,7 @@ class BatchedStructuralJointSolver:
         multiplier_destination: wp.array[wp.float32],
     ) -> None:
         """Project the free body solution onto the structural constraints."""
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_steps(time_step, inverse_time_step, self.body_system.num_worlds, self.device)
         if world_active.shape[0] != self.body_system.num_worlds:
             raise ValueError("world_active must contain one entry per world.")
         if residual.shape[0] != self.row_count or multiplier.shape[0] != self.row_count:
@@ -759,7 +805,8 @@ class BatchedStructuralJointSolver:
             _build_joint_right_hand_side,
             dim=self.row_count,
             inputs=[
-                1.0 / time_step,
+                inverse_time_step,
+                self.row_world,
                 self.row_vector_index,
                 self.body_first_global,
                 self.body_second_global,
@@ -767,6 +814,7 @@ class BatchedStructuralJointSolver:
                 self.jacobian_second,
                 residual,
                 self.body_system.body_vector_index,
+                self.prescribed_twist,
                 linearization_twist,
                 self.free_body_solution,
             ],
@@ -774,7 +822,7 @@ class BatchedStructuralJointSolver:
             device=self.device,
         )
         self._apply_correction(
-            time_step,
+            inverse_time_step,
             world_active,
             multiplier_index,
             multiplier,
@@ -784,7 +832,8 @@ class BatchedStructuralJointSolver:
 
     def refine_from_twists(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
         linearization_twist: wp.array[vec6f],
         global_twist: wp.array[vec6f],
         projected_twist: wp.array[vec6f],
@@ -797,8 +846,7 @@ class BatchedStructuralJointSolver:
         multiplier_destination: wp.array[wp.float32],
     ) -> None:
         """Apply a Schur correction from the current blended structural residual."""
-        if time_step <= 0.0:
-            raise ValueError("time_step must be positive.")
+        validate_world_time_steps(time_step, inverse_time_step, self.body_system.num_worlds, self.device)
         if any(twist.shape[0] != self.body_system.num_bodies for twist in (global_twist, projected_twist)):
             raise ValueError("Twist arrays must contain one entry per body.")
         if not 0.0 <= projected_fraction <= 1.0:
@@ -813,7 +861,7 @@ class BatchedStructuralJointSolver:
             _build_blended_joint_residual,
             dim=self.row_count,
             inputs=[
-                1.0 / time_step,
+                inverse_time_step,
                 self.row_world,
                 self.row_vector_index,
                 self.body_first_global,
@@ -831,7 +879,7 @@ class BatchedStructuralJointSolver:
             device=self.device,
         )
         self._apply_correction(
-            time_step,
+            inverse_time_step,
             world_active,
             multiplier_index,
             multiplier,
@@ -841,7 +889,7 @@ class BatchedStructuralJointSolver:
 
     def _apply_correction(
         self,
-        time_step: float,
+        inverse_time_step: wp.array[wp.float32],
         world_active: wp.array[wp.bool],
         multiplier_index: wp.array[wp.int32],
         multiplier: wp.array[wp.float32],
@@ -915,7 +963,7 @@ class BatchedStructuralJointSolver:
             _write_joint_multipliers,
             dim=self.row_count,
             inputs=[
-                1.0 / time_step,
+                inverse_time_step,
                 self.row_world,
                 self.row_vector_index,
                 multiplier_index,
@@ -928,7 +976,8 @@ class BatchedStructuralJointSolver:
 
     def solve(
         self,
-        time_step: float,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
         linearization_twist: wp.array[vec6f],
         world_active: wp.array[wp.bool],
         residual: wp.array[wp.float32],
@@ -940,6 +989,7 @@ class BatchedStructuralJointSolver:
         self.solve_free_body()
         self.project(
             time_step,
+            inverse_time_step,
             linearization_twist,
             world_active,
             residual,

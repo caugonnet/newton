@@ -4,11 +4,13 @@
 """Unit tests for LOX body-space projection sweeps."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
 from newton._src.solvers.kamino._src.core.types import mat36f, mat66f, vec6f
+from newton._src.solvers.kamino._src.solvers.lox.apgd import project_constraints_apgd
 from newton._src.solvers.kamino._src.solvers.lox.projection import PROJECTION_STATUS_VALID
 from newton._src.solvers.kamino._src.solvers.lox.sweep import (
     compute_projection_residuals,
@@ -294,6 +296,186 @@ class TestLOXSweep(unittest.TestCase):
             atol=1.0e-6,
         )
         np.testing.assert_array_equal(projection_status.numpy(), [PROJECTION_STATUS_VALID])
+
+    def test_apgd_projects_all_rigid_constraint_families(self):
+        """Match one rigid Jacobi sweep with the first APGD block step."""
+        device = self.device
+        adapter = SimpleNamespace(device=device, friction_capacity=1, contact_capacity=1, limit_capacity=1)
+        adapter.friction_world = wp.array([0], dtype=wp.int32, device=device)
+        adapter.friction_local = wp.array([0], dtype=wp.int32, device=device)
+        adapter.world_friction_count = wp.array([1], dtype=wp.int32, device=device)
+        adapter.friction_body_first = wp.array([0], dtype=wp.int32, device=device)
+        adapter.friction_body_second = wp.array([-1], dtype=wp.int32, device=device)
+        adapter.friction_jacobian_first = wp.array([[0, 0, 0, 1, 0, 0]], dtype=vec6f, device=device)
+        adapter.friction_jacobian_second = wp.zeros(1, dtype=vec6f, device=device)
+        adapter.friction_impulse_bound = wp.array([0.4], dtype=wp.float32, device=device)
+        adapter.friction_reaction = wp.array([0.1], dtype=wp.float32, device=device)
+        adapter.friction_velocity = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.friction_projection_delassus = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.friction_apgd_trial = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.friction_apgd_next = wp.zeros(1, dtype=wp.float32, device=device)
+
+        adapter.contact_world = wp.array([0], dtype=wp.int32, device=device)
+        adapter.contact_local = wp.array([0], dtype=wp.int32, device=device)
+        adapter.world_contact_count = wp.array([1], dtype=wp.int32, device=device)
+        adapter.contact_body_first = wp.array([0], dtype=wp.int32, device=device)
+        adapter.contact_body_second = wp.array([-1], dtype=wp.int32, device=device)
+        contact_jacobian = np.zeros((1, 3, 6), dtype=np.float32)
+        contact_jacobian[0, 0, 1] = 1.0
+        contact_jacobian[0, 1, 2] = 1.0
+        contact_jacobian[0, 2, 0] = 1.0
+        adapter.contact_jacobian_first = wp.array(contact_jacobian, dtype=mat36f, device=device)
+        adapter.contact_jacobian_second = wp.zeros(1, dtype=mat36f, device=device)
+        adapter.contact_bias = wp.array([[0.0, 0.0, -0.2]], dtype=wp.vec3f, device=device)
+        adapter.contact_friction = wp.array([0.5], dtype=wp.float32, device=device)
+        adapter.contact_reaction = wp.zeros(1, dtype=wp.vec3f, device=device)
+        adapter.contact_velocity = wp.zeros(1, dtype=wp.vec3f, device=device)
+        adapter.contact_projection_delassus = wp.zeros(1, dtype=wp.mat33f, device=device)
+        adapter.contact_projection_delassus_normal_first = wp.zeros(1, dtype=wp.mat33f, device=device)
+        adapter.contact_apgd_trial = wp.zeros(1, dtype=wp.vec3f, device=device)
+        adapter.contact_apgd_next = wp.zeros(1, dtype=wp.vec3f, device=device)
+
+        adapter.limit_world = wp.array([0], dtype=wp.int32, device=device)
+        adapter.limit_local = wp.array([0], dtype=wp.int32, device=device)
+        adapter.world_limit_count = wp.array([1], dtype=wp.int32, device=device)
+        adapter.limit_body_first = wp.array([0], dtype=wp.int32, device=device)
+        adapter.limit_body_second = wp.array([-1], dtype=wp.int32, device=device)
+        adapter.limit_jacobian_first = wp.array([[0, 0, 0, 0, 1, 0]], dtype=vec6f, device=device)
+        adapter.limit_jacobian_second = wp.zeros(1, dtype=vec6f, device=device)
+        adapter.limit_bias = wp.array([-0.1], dtype=wp.float32, device=device)
+        adapter.limit_reaction = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.limit_velocity = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.limit_projection_delassus = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.limit_apgd_trial = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.limit_apgd_next = wp.zeros(1, dtype=wp.float32, device=device)
+        adapter.world_jacobi_projection_status = wp.zeros(1, dtype=wp.int32, device=device)
+        adapter.projection_status = wp.zeros(1, dtype=wp.int32, device=device)
+        adapter.projection_twist_delta = wp.zeros(1, dtype=vec6f, device=device)
+
+        inverse_weight_host = np.eye(6, dtype=np.float32)
+        inverse_weight_host[0, 0] = 2.0
+        inverse_weight_host[1, 1] = 1.5
+        inverse_weight_host[2, 2] = 0.75
+        inverse_weight_host[0, 1] = 0.35
+        inverse_weight_host[1, 0] = 0.35
+        inverse_weight = wp.array([inverse_weight_host], dtype=mat66f, device=device)
+        prepare_jacobi_projection_data(
+            adapter.friction_world,
+            adapter.friction_local,
+            adapter.world_friction_count,
+            adapter.friction_body_first,
+            adapter.friction_body_second,
+            adapter.friction_jacobian_first,
+            adapter.friction_jacobian_second,
+            adapter.contact_world,
+            adapter.contact_local,
+            adapter.world_contact_count,
+            adapter.contact_body_first,
+            adapter.contact_body_second,
+            adapter.contact_jacobian_first,
+            adapter.contact_jacobian_second,
+            adapter.contact_bias,
+            adapter.contact_friction,
+            adapter.limit_world,
+            adapter.limit_local,
+            adapter.world_limit_count,
+            adapter.limit_body_first,
+            adapter.limit_body_second,
+            adapter.limit_jacobian_first,
+            adapter.limit_jacobian_second,
+            wp.array([3], dtype=wp.int32, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
+            inverse_weight,
+            adapter.friction_projection_delassus,
+            adapter.contact_projection_delassus,
+            adapter.contact_projection_delassus_normal_first,
+            adapter.limit_projection_delassus,
+            adapter.world_jacobi_projection_status,
+        )
+        candidate = np.array([[-1.0, 0.2, 0.1, 0.8, -0.4, 0.0]], dtype=np.float32)
+        world_active = wp.ones(1, dtype=wp.bool, device=device)
+        body_world = wp.array([0], dtype=wp.int32, device=device)
+        jacobi_projected_twist = wp.array(candidate, dtype=vec6f, device=device)
+        jacobi_friction_reaction = wp.array([0.1], dtype=wp.float32, device=device)
+        jacobi_contact_reaction = wp.zeros(1, dtype=wp.vec3f, device=device)
+        jacobi_limit_reaction = wp.zeros(1, dtype=wp.float32, device=device)
+        jacobi_status = wp.zeros(1, dtype=wp.int32, device=device)
+        project_constraints_jacobi(
+            1,
+            world_active,
+            body_world,
+            adapter.friction_world,
+            adapter.friction_local,
+            adapter.world_friction_count,
+            adapter.friction_body_first,
+            adapter.friction_body_second,
+            adapter.friction_jacobian_first,
+            adapter.friction_jacobian_second,
+            adapter.friction_impulse_bound,
+            adapter.friction_projection_delassus,
+            adapter.contact_world,
+            adapter.contact_local,
+            adapter.world_contact_count,
+            adapter.contact_body_first,
+            adapter.contact_body_second,
+            adapter.contact_jacobian_first,
+            adapter.contact_jacobian_second,
+            adapter.contact_bias,
+            adapter.contact_friction,
+            adapter.contact_projection_delassus,
+            adapter.contact_projection_delassus_normal_first,
+            adapter.limit_world,
+            adapter.limit_local,
+            adapter.world_limit_count,
+            adapter.limit_body_first,
+            adapter.limit_body_second,
+            adapter.limit_jacobian_first,
+            adapter.limit_jacobian_second,
+            adapter.limit_bias,
+            adapter.limit_projection_delassus,
+            inverse_weight,
+            jacobi_projected_twist,
+            wp.zeros(1, dtype=vec6f, device=device),
+            jacobi_contact_reaction,
+            jacobi_limit_reaction,
+            jacobi_friction_reaction,
+            adapter.world_jacobi_projection_status,
+            jacobi_status,
+        )
+
+        projected_twist = wp.array(candidate, dtype=vec6f, device=device)
+        project_constraints_apgd(
+            1,
+            adapter,
+            world_active,
+            body_world,
+            inverse_weight,
+            wp.zeros(1, dtype=vec6f, device=device),
+            projected_twist,
+            wp.ones(1, dtype=wp.float32, device=device),
+            wp.zeros(1, dtype=wp.float32, device=device),
+            wp.zeros(1, dtype=wp.float32, device=device),
+        )
+
+        np.testing.assert_allclose(adapter.friction_reaction.numpy(), jacobi_friction_reaction.numpy(), atol=1.0e-6)
+        np.testing.assert_allclose(adapter.contact_reaction.numpy(), jacobi_contact_reaction.numpy(), atol=1.0e-6)
+        np.testing.assert_allclose(adapter.limit_reaction.numpy(), jacobi_limit_reaction.numpy(), atol=1.0e-6)
+        np.testing.assert_allclose(projected_twist.numpy(), jacobi_projected_twist.numpy(), atol=2.0e-6)
+        contact_reaction = adapter.contact_reaction.numpy()[0]
+        self.assertGreaterEqual(float(contact_reaction[2]), 0.0)
+        self.assertLessEqual(float(np.linalg.norm(contact_reaction[:2])), 0.5 * float(contact_reaction[2]) + 1.0e-6)
+        self.assertGreaterEqual(float(adapter.limit_reaction.numpy()[0]), 0.0)
+        self.assertLessEqual(abs(float(adapter.friction_reaction.numpy()[0])), 0.4 + 1.0e-6)
+        expected = candidate[0].copy()
+        expected += inverse_weight_host @ (
+            float(adapter.friction_reaction.numpy()[0]) * adapter.friction_jacobian_first.numpy()[0]
+        )
+        expected += inverse_weight_host @ (contact_jacobian[0].T @ contact_reaction)
+        expected += inverse_weight_host @ (
+            float(adapter.limit_reaction.numpy()[0]) * adapter.limit_jacobian_first.numpy()[0]
+        )
+        np.testing.assert_allclose(projected_twist.numpy()[0], expected, atol=2.0e-6)
+        np.testing.assert_array_equal(adapter.projection_status.numpy(), [PROJECTION_STATUS_VALID])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 from .....geometry import ShapeFlags
+from .....sim import JointType
 from .....sim.model import Model
 from ....coupled.model_view import ModelView
 from ..utils import logger as msg
@@ -215,6 +216,7 @@ def update_materials_kernel(
 @wp.kernel
 def validate_joint_dof_updates_kernel(
     # Inputs:
+    joint_type: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_armature: wp.array[wp.float32],
     joint_damping: wp.array[wp.float32],
@@ -234,15 +236,16 @@ def validate_joint_dof_updates_kernel(
     if tid < joint_count:
         dof_start = joint_qd_start[tid]
         dof_end = joint_qd_start[tid + 1]
-        if joint_requires_dynamic_constraints(
-            dof_start,
-            dof_end,
-            joint_armature,
-            joint_damping,
-            joint_target_ke,
-            joint_target_kd,
-        ) != (num_dynamic_cts[tid] > 0):
-            wp.atomic_min(violations, JointUpdateViolation.DYNAMIC_CTS, tid)
+        if joint_type[tid] != JointType.CABLE:
+            if joint_requires_dynamic_constraints(
+                dof_start,
+                dof_end,
+                joint_armature,
+                joint_damping,
+                joint_target_ke,
+                joint_target_kd,
+            ) != (num_dynamic_cts[tid] > 0):
+                wp.atomic_min(violations, JointUpdateViolation.DYNAMIC_CTS, tid)
 
     if tid < dof_count:
         current_finite = joint_limit_lower[tid] > JOINT_QMIN or joint_limit_upper[tid] < JOINT_QMAX
@@ -253,6 +256,7 @@ def validate_joint_dof_updates_kernel(
 @wp.kernel
 def validate_joint_actuation_updates_kernel(
     # Inputs:
+    joint_type: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_target_mode: wp.array[wp.int32],
     act_type: wp.array[wp.int32],
@@ -261,6 +265,8 @@ def validate_joint_actuation_updates_kernel(
 ):
     """Find the first joint with an invalid or structurally changed actuation type."""
     joint = wp.tid()
+    if joint_type[joint] == JointType.CABLE:
+        return
     current_actuation = joint_actuation_type_from_dofs(
         joint_qd_start[joint],
         joint_qd_start[joint + 1],
@@ -327,6 +333,7 @@ def validate_joint_axes_kernel(
 @wp.kernel
 def update_joint_actuation_kernel(
     # Inputs:
+    joint_type: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_target_mode: wp.array[wp.int32],
     # Outputs:
@@ -334,11 +341,14 @@ def update_joint_actuation_kernel(
 ):
     """Update each joint's Kamino actuation type from its target modes."""
     joint = wp.tid()
-    act_type[joint] = joint_actuation_type_from_dofs(
-        joint_qd_start[joint],
-        joint_qd_start[joint + 1],
-        joint_target_mode,
-    )
+    if joint_type[joint] == JointType.CABLE:
+        act_type[joint] = JointActuationType.PASSIVE
+    else:
+        act_type[joint] = joint_actuation_type_from_dofs(
+            joint_qd_start[joint],
+            joint_qd_start[joint + 1],
+            joint_target_mode,
+        )
 
 
 @wp.kernel
@@ -438,19 +448,23 @@ def joint_conversion_kernel(
     joint_num_dofs[joint_id] = ndofs_j
 
     # Determine Kamino actuation mode for joint
-    act_type_j = joint_actuation_type_from_dofs(dofs_start_j, dofs_start_j + ndofs_j, model_joint_target_mode)
+    act_type_j = JointActuationType.PASSIVE
+    if dof_type_j != JointDoFType.CABLE:
+        act_type_j = joint_actuation_type_from_dofs(dofs_start_j, dofs_start_j + ndofs_j, model_joint_target_mode)
     assert act_type_j >= 0, "Joint actuation type must be valid"
     joint_act_type[joint_id] = act_type_j
 
     # Infer if the joint requires dynamic constraints
-    is_dynamic_j = joint_requires_dynamic_constraints(
-        dofs_start_j,
-        dofs_start_j + ndofs_j,
-        model_joint_armature,
-        model_joint_damping,
-        model_joint_target_ke,
-        model_joint_target_kd,
-    )
+    is_dynamic_j = bool(False)
+    if dof_type_j != JointDoFType.CABLE:
+        is_dynamic_j = joint_requires_dynamic_constraints(
+            dofs_start_j,
+            dofs_start_j + ndofs_j,
+            model_joint_armature,
+            model_joint_damping,
+            model_joint_target_ke,
+            model_joint_target_kd,
+        )
 
     # Set joint dimensions
     joint_num_kinematic_cts[joint_id] = ncts_j
@@ -519,6 +533,7 @@ def joint_frame_conversion_kernel(
 def joint_indexing_kernel(
     # Inputs:
     model_joint_world_start: wp.array[wp.int32],
+    joint_dof_type: wp.array[wp.int32],
     joint_act_type: wp.array[wp.int32],
     joint_num_coords: wp.array[wp.int32],
     joint_num_dofs: wp.array[wp.int32],
@@ -590,6 +605,7 @@ def joint_indexing_kernel(
         ndofs_j = joint_num_dofs[joint_id]
         n_kin_cts_j = joint_num_kinematic_cts[joint_id]
         n_dyn_cts_j = joint_num_dynamic_cts[joint_id]
+        dof_type_j = joint_dof_type[joint_id]
         act_type_j = joint_act_type[joint_id]
 
         # Update world sizes based on joint sizes
@@ -599,20 +615,21 @@ def joint_indexing_kernel(
         num_kinematic_cts += n_kin_cts_j
 
         # Update sizes based on passive/active joint distinction
-        if act_type_j > JointActuationType.PASSIVE:
-            num_actuated_j += 1
-            num_actuated_coords += ncoords_j
-            num_actuated_dofs += ndofs_j
-            if not model_fk_act_flag or model_fk_act_flag[joint_id] == -1:
+        if dof_type_j != JointDoFType.CABLE:
+            if act_type_j > JointActuationType.PASSIVE:
+                num_actuated_j += 1
+                num_actuated_coords += ncoords_j
+                num_actuated_dofs += ndofs_j
+                if not model_fk_act_flag or model_fk_act_flag[joint_id] == -1:
+                    num_fk_actuated_coords += ncoords_j
+                    num_fk_actuated_dofs += ndofs_j
+            else:
+                num_passive_j += 1
+                num_passive_coords += ncoords_j
+                num_passive_dofs += ndofs_j
+            if model_fk_act_flag and model_fk_act_flag[joint_id] == 1:
                 num_fk_actuated_coords += ncoords_j
                 num_fk_actuated_dofs += ndofs_j
-        else:
-            num_passive_j += 1
-            num_passive_coords += ncoords_j
-            num_passive_dofs += ndofs_j
-        if model_fk_act_flag and model_fk_act_flag[joint_id] == 1:
-            num_fk_actuated_coords += ncoords_j
-            num_fk_actuated_dofs += ndofs_j
 
         # Update sizes based on whether joint is dynamic
         if n_dyn_cts_j > 0:
@@ -914,6 +931,7 @@ def validate_model_joint_updates(
             dim=dim,
             inputs=[
                 # Inputs:
+                model.joint_type,
                 model.joint_qd_start,
                 model.joint_armature,
                 model.joint_damping,
@@ -936,6 +954,7 @@ def validate_model_joint_updates(
             dim=model.joint_count,
             inputs=[
                 # Inputs:
+                model.joint_type,
                 model.joint_qd_start,
                 model.joint_target_mode,
                 joints.act_type,
@@ -971,6 +990,7 @@ def convert_model_joint_actuation(model: Model, joints: JointsModel) -> None:
         dim=model.joint_count,
         inputs=[
             # Inputs:
+            model.joint_type,
             model.joint_qd_start,
             model.joint_target_mode,
             # Outputs:
@@ -1378,6 +1398,7 @@ def convert_joints(
         dim=model.world_count,
         inputs=[
             model.joint_world_start,
+            joint_dof_type,
             joint_act_type,
             joint_num_coords,
             joint_num_dofs,

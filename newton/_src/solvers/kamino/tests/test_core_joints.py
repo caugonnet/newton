@@ -5,9 +5,11 @@
 
 import unittest
 
+import numpy as np
 import warp as wp
 
-from newton._src.solvers.kamino._src.core.joints import JointDoFType
+from newton import JointType
+from newton._src.solvers.kamino._src.core.joints import JointDescriptor, JointDoFType
 from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
@@ -54,6 +56,53 @@ class TestCoreJoints(unittest.TestCase):
         self.assertEqual(doftype.num_dofs, 1)
         self.assertEqual(doftype.cts_axes, (0, 1, 2, 4, 5))
         self.assertEqual(doftype.dofs_axes, (3,))
+
+    def test_cable_dof_type_retains_material_storage_without_joint_rows(self):
+        """Retain cable material slots without ordinary joint constraints."""
+        dof_type = JointDoFType.CABLE
+
+        self.assertEqual(dof_type.num_coords, 4)
+        self.assertEqual(dof_type.num_dofs, 4)
+        self.assertEqual(dof_type.num_cts, 0)
+        self.assertEqual(dof_type.cts_axes, [])
+        self.assertEqual(dof_type.dofs_axes, [])
+        self.assertEqual(
+            JointDoFType.from_newton(
+                JointType.CABLE,
+                q_count=4,
+                qd_count=4,
+                dof_dim=(2, 2),
+                limit_lower=np.full(4, -1.0e10),
+                limit_upper=np.full(4, 1.0e10),
+            ),
+            JointDoFType.CABLE,
+        )
+
+    def test_cable_dof_type_rejects_malformed_storage_layout(self):
+        """Reject cable layouts that do not match the builder representation."""
+        with self.assertRaisesRegex(ValueError, "expected q_count=4"):
+            JointDoFType.from_newton(
+                JointType.CABLE,
+                q_count=2,
+                qd_count=2,
+                dof_dim=(1, 1),
+                limit_lower=np.full(2, -1.0e10),
+                limit_upper=np.full(2, 1.0e10),
+            )
+
+    def test_joint_effort_limit_accepts_zero_and_positive_infinity(self):
+        """Accept nonnegative finite and positively infinite effort limits."""
+        self.assertEqual(JointDescriptor(name="joint", dof_type=JointDoFType.REVOLUTE, tau_j_max=0.0).tau_j_max, [0.0])
+        self.assertEqual(
+            JointDescriptor(name="joint", dof_type=JointDoFType.REVOLUTE, tau_j_max=float("inf")).tau_j_max,
+            [float("inf")],
+        )
+
+    def test_joint_effort_limit_rejects_negative_and_nan(self):
+        """Reject negative and NaN effort limits."""
+        for value in (-1.0, float("-inf"), float("nan")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "joint effort limit"):
+                JointDescriptor(name="joint", dof_type=JointDoFType.REVOLUTE, tau_j_max=value)
 
 
 ###

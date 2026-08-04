@@ -18,17 +18,21 @@ from .contact import solve_contact_coulomb_newton
 
 __all__ = [
     "PROJECTION_STATUS_INVALID",
+    "PROJECTION_STATUS_REGULARIZED",
     "PROJECTION_STATUS_VALID",
     "ContactProjectionResult",
     "FrictionProjectionResult",
     "LimitProjectionResult",
+    "apply_contact_desaxce_correction",
     "compute_contact_delassus",
     "compute_limit_delassus",
     "convert_contact_matrix_normal_first_to_last",
     "convert_contact_matrix_normal_last_to_first",
     "convert_contact_vector_normal_first_to_last",
     "convert_contact_vector_normal_last_to_first",
+    "prepare_contact_coulomb_delassus",
     "project_contact_coulomb",
+    "project_contact_coulomb_cone_orthogonal",
     "project_joint_friction",
     "project_limit_unilateral",
 ]
@@ -38,6 +42,9 @@ PROJECTION_STATUS_INVALID = 0
 
 PROJECTION_STATUS_VALID = 1
 """The one-constraint update completed successfully."""
+
+PROJECTION_STATUS_REGULARIZED = 2
+"""The contact update used a numerically regularized Delassus block."""
 
 wp.set_module_options({"enable_backward": False})
 
@@ -166,6 +173,55 @@ def _is_finite_vec3(value: wp.vec3f) -> wp.bool:
 
 
 @wp.func
+def project_contact_coulomb_cone_orthogonal(value: wp.vec3f, friction: wp.float32) -> wp.vec3f:
+    """Project a normal-last vector orthogonally onto a Coulomb cone.
+
+    Args:
+        value: Normal-last vector to project.
+        friction: Nonnegative isotropic Coulomb friction coefficient.
+
+    Returns:
+        The Euclidean projection of ``value``. Invalid friction disables the
+        contact and returns zero, while a non-finite vector is preserved for
+        the caller's projection-status check.
+    """
+    if not _is_finite_vec3(value):
+        return value
+    if not wp.isfinite(friction) or friction < 0.0:
+        return wp.vec3f(0.0)
+
+    tangent_norm = wp.sqrt(value[0] * value[0] + value[1] * value[1])
+    normal = value[2]
+    if normal + friction * tangent_norm <= 0.0:
+        return wp.vec3f(0.0)
+    if tangent_norm <= friction * normal:
+        return value
+
+    projected_normal = (normal + friction * tangent_norm) / (1.0 + friction * friction)
+    tangent_scale = friction * projected_normal / tangent_norm
+    return wp.vec3f(tangent_scale * value[0], tangent_scale * value[1], projected_normal)
+
+
+@wp.func
+def apply_contact_desaxce_correction(velocity: wp.vec3f, friction: wp.float32) -> wp.vec3f:
+    """Apply the de Saxce correction to a normal-last contact velocity.
+
+    Args:
+        velocity: Raw normal-last relative contact velocity.
+        friction: Nonnegative isotropic Coulomb friction coefficient.
+
+    Returns:
+        The corrected velocity. Invalid inputs are preserved for the caller's
+        projection-status check.
+    """
+    if not _is_finite_vec3(velocity) or not wp.isfinite(friction) or friction <= 0.0:
+        return velocity
+
+    tangent_norm = wp.sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1])
+    return wp.vec3f(velocity[0], velocity[1], velocity[2] + friction * tangent_norm)
+
+
+@wp.func
 def _is_finite_vec6(value: vec6f) -> wp.bool:
     finite = wp.bool(True)
     for index in range(6):
@@ -201,33 +257,6 @@ def _is_finite_mat66(value: mat66f) -> wp.bool:
 
 
 @wp.func
-def _is_symmetric_positive_definite_mat33(value: wp.mat33f) -> wp.bool:
-    if not _is_finite_mat33(value):
-        return False
-
-    scale = wp.float32(1.0)
-    asymmetry = wp.float32(0.0)
-    for row in range(3):
-        for col in range(3):
-            scale = wp.max(scale, wp.abs(value[row, col]))
-            asymmetry = wp.max(asymmetry, wp.abs(value[row, col] - value[col, row]))
-    if asymmetry > 1.0e-5 * scale:
-        return False
-
-    pivot0 = value[0, 0]
-    if pivot0 <= 0.0:
-        return False
-    lower10 = value[1, 0] / wp.sqrt(pivot0)
-    lower20 = value[2, 0] / wp.sqrt(pivot0)
-    pivot1 = value[1, 1] - lower10 * lower10
-    if pivot1 <= 0.0:
-        return False
-    lower21 = (value[2, 1] - lower20 * lower10) / wp.sqrt(pivot1)
-    pivot2 = value[2, 2] - lower20 * lower20 - lower21 * lower21
-    return wp.isfinite(pivot2) and pivot2 > 0.0
-
-
-@wp.func
 def compute_contact_delassus(
     jacobian_first: mat36f,
     inverse_weight_first: mat66f,
@@ -241,6 +270,57 @@ def compute_contact_delassus(
 
 
 @wp.func
+def prepare_contact_coulomb_delassus(
+    delassus: wp.mat33f,
+    velocity_bias: wp.vec3f,
+    friction: wp.float32,
+) -> ContactProjectionData:
+    """Validate and, when numerically marginal, regularize a contact block."""
+    result = ContactProjectionData()
+    result.delassus = delassus
+    result.delassus_normal_first = convert_contact_matrix_normal_last_to_first(delassus)
+    result.status = PROJECTION_STATUS_INVALID
+    if not _is_finite_vec3(velocity_bias) or not wp.isfinite(friction) or friction < 0.0:
+        return result
+    if not _is_finite_mat33(delassus):
+        return result
+
+    scale = wp.float32(0.0)
+    asymmetry = wp.float32(0.0)
+    symmetric = wp.mat33f(0.0)
+    for row in range(3):
+        for col in range(3):
+            scale = wp.max(scale, wp.abs(delassus[row, col]))
+            asymmetry = wp.max(asymmetry, wp.abs(delassus[row, col] - delassus[col, row]))
+            symmetric[row, col] = 0.5 * (delassus[row, col] + delassus[col, row])
+    if scale <= 0.0 or asymmetry > 1.0e-5 * scale:
+        return result
+
+    eigenvectors, eigenvalues = wp.eig3(symmetric)
+    if not _is_finite_vec3(eigenvalues):
+        return result
+    minimum_eigenvalue = wp.min(eigenvalues[0], wp.min(eigenvalues[1], eigenvalues[2]))
+    if minimum_eigenvalue < -1.0e-5 * scale:
+        return result
+
+    eigenvalue_floor = 1.0e-6 * scale
+    clamped_eigenvalues = wp.vec3f(
+        wp.max(eigenvalues[0], eigenvalue_floor),
+        wp.max(eigenvalues[1], eigenvalue_floor),
+        wp.max(eigenvalues[2], eigenvalue_floor),
+    )
+    regularized = minimum_eigenvalue < eigenvalue_floor
+    if regularized:
+        symmetric = eigenvectors @ wp.diag(clamped_eigenvalues) @ wp.transpose(eigenvectors)
+        result.status = PROJECTION_STATUS_REGULARIZED
+    else:
+        result.status = PROJECTION_STATUS_VALID
+    result.delassus = symmetric
+    result.delassus_normal_first = convert_contact_matrix_normal_last_to_first(symmetric)
+    return result
+
+
+@wp.func
 def prepare_contact_coulomb(
     jacobian_first: mat36f,
     inverse_weight_first: mat66f,
@@ -250,27 +330,23 @@ def prepare_contact_coulomb(
     friction: wp.float32,
 ) -> ContactProjectionData:
     """Validate fixed inputs and prepare the normal-first contact block."""
-    result = ContactProjectionData()
-    delassus = compute_contact_delassus(
-        jacobian_first,
-        inverse_weight_first,
-        jacobian_second,
-        inverse_weight_second,
+    result = prepare_contact_coulomb_delassus(
+        compute_contact_delassus(
+            jacobian_first,
+            inverse_weight_first,
+            jacobian_second,
+            inverse_weight_second,
+        ),
+        velocity_bias,
+        friction,
     )
-    result.delassus = delassus
-    result.delassus_normal_first = convert_contact_matrix_normal_last_to_first(delassus)
-    result.status = PROJECTION_STATUS_INVALID
     if (
-        _is_finite_mat36(jacobian_first)
-        and _is_finite_mat66(inverse_weight_first)
-        and _is_finite_mat36(jacobian_second)
-        and _is_finite_mat66(inverse_weight_second)
-        and _is_finite_vec3(velocity_bias)
-        and wp.isfinite(friction)
-        and friction >= 0.0
-        and _is_symmetric_positive_definite_mat33(delassus)
+        not _is_finite_mat36(jacobian_first)
+        or not _is_finite_mat66(inverse_weight_first)
+        or not _is_finite_mat36(jacobian_second)
+        or not _is_finite_mat66(inverse_weight_second)
     ):
-        result.status = PROJECTION_STATUS_VALID
+        result.status = PROJECTION_STATUS_INVALID
     return result
 
 
@@ -341,6 +417,7 @@ def project_contact_coulomb(
     """
     current_velocity = jacobian_first @ twist_first + jacobian_second @ twist_second + velocity_bias
     delassus = compute_contact_delassus(jacobian_first, inverse_weight_first, jacobian_second, inverse_weight_second)
+    data = prepare_contact_coulomb_delassus(delassus, velocity_bias, friction)
     if (
         not _is_finite_mat36(jacobian_first)
         or not _is_finite_mat66(inverse_weight_first)
@@ -348,11 +425,8 @@ def project_contact_coulomb(
         or not _is_finite_mat36(jacobian_second)
         or not _is_finite_mat66(inverse_weight_second)
         or not _is_finite_vec6(twist_second)
-        or not _is_finite_vec3(velocity_bias)
         or not _is_finite_vec3(reaction_old)
-        or not wp.isfinite(friction)
-        or friction < 0.0
-        or not _is_symmetric_positive_definite_mat33(delassus)
+        or data.status == PROJECTION_STATUS_INVALID
     ):
         return _make_invalid_contact_projection_result(
             twist_first, twist_second, reaction_old, current_velocity, delassus
@@ -360,7 +434,7 @@ def project_contact_coulomb(
 
     free_velocity = current_velocity - delassus @ reaction_old
     reaction_new_normal_first = solve_contact_coulomb_newton(
-        convert_contact_matrix_normal_last_to_first(delassus),
+        data.delassus_normal_first,
         convert_contact_vector_normal_last_to_first(free_velocity),
         friction,
     )
@@ -386,8 +460,8 @@ def project_contact_coulomb(
     result.reaction = reaction_new
     result.reaction_delta = reaction_delta
     result.velocity = velocity_new
-    result.delassus = delassus
-    result.status = PROJECTION_STATUS_VALID
+    result.delassus = data.delassus
+    result.status = data.status
     return result
 
 

@@ -62,10 +62,10 @@ from .solvers.common import WarmStartMode
 from .solvers.dvi import DVISolver
 from .solvers.fk import ForwardKinematicsSolver
 from .solvers.lox import (
+    IntegratorLOX,
     LOXKaminoAdapter,
+    LOXProblem,
     LOXSolver,
-    accept_projected_body_state,
-    integrate_projected_body_poses,
 )
 from .solvers.metrics import SolutionMetrics
 from .solvers.padmm import PADMMSolver
@@ -255,10 +255,12 @@ class SolverKaminoImpl(SolverBase):
                 contacts=contacts,
             )
 
-        self._problem_fd: DualProblem | None = None
+        self._problem_fd: DualProblem | LOXProblem
         self._problem_metrics: DualProblem | None = None
         self._lox_adapter: LOXKaminoAdapter | None = None
-        if self._config.dynamics_solver in {"padmm", "dvi"}:
+        if self._config.dynamics_solver == "lox":
+            self._problem_fd = LOXProblem()
+        else:
             # Allocate the dual problem data on the device
             self._problem_fd = DualProblem(
                 model=self._model,
@@ -274,34 +276,17 @@ class SolverKaminoImpl(SolverBase):
 
         # Allocate the forward dynamics solver on the device
         if self._config.dynamics_solver == "lox":
-            self._lox_adapter = LOXKaminoAdapter(
-                model=self._model,
-                data=self._data,
-                jacobians=self._jacobians,
-                limits=self._limits,
-                contacts=contacts,
-            )
-            lox_config = self._config.lox
-            self._solver_fd = LOXSolver(
-                adapter=self._lox_adapter,
-                max_iterations=lox_config.max_iterations,
-                projection_iterations=lox_config.projection_iterations,
-                projection_method=lox_config.projection_method,
-                position_tolerance=lox_config.position_tolerance,
-                rotation_tolerance=lox_config.rotation_tolerance,
-                velocity_tolerance=lox_config.velocity_tolerance,
-                weight_sigma=lox_config.weight_sigma,
-                weight_beta=lox_config.weight_beta,
-                joint_penalty_scale=lox_config.joint_penalty_scale,
-                joint_multiplier_projected_fraction=lox_config.joint_multiplier_projected_fraction,
-                joint_warmstart_factor=lox_config.joint_warmstart_factor,
-                _joint_solve_mode=int(lox_config.joint_solve_direct),
-            )
-            self._lox_pose_begin = wp.zeros_like(self._data.bodies.q_i)
-            self._lox_pose_candidate = wp.zeros_like(self._data.bodies.q_i)
-            self._lox_pose_accepted = wp.zeros_like(self._data.bodies.q_i)
-            self._lox_twist_accepted = wp.zeros_like(self._lox_adapter.projected_twist)
-            self._lox_joint_position_begin = wp.zeros_like(self._data.joints.q_j)
+            if self._model.size.sum_of_num_bodies > 0:
+                self._lox_adapter = LOXKaminoAdapter(
+                    model=self._model,
+                    data=self._data,
+                    jacobians=self._jacobians,
+                    limits=self._limits,
+                    contacts=contacts,
+                    eliminate_fixed_world_islands=self._config.lox.eliminate_fixed_world_islands,
+                )
+            self._solver_fd = LOXSolver.from_config(self._lox_adapter, self._config.lox, self._model._model)
+            self._problem_fd.attach_newton_solver(self._solver_fd)
             if self._config.compute_solution_metrics and self._model.size.sum_of_max_total_cts > 0:
                 self._problem_metrics = DualProblem(
                     model=self._model,
@@ -346,7 +331,9 @@ class SolverKaminoImpl(SolverBase):
             self._solver_fk = ForwardKinematicsSolver(model=self._model, config=self._config.fk)
 
         # Create the time-integrator instance based on the config
-        if self._config.integrator == "euler":
+        if self._config.dynamics_solver == "lox":
+            self._integrator = None
+        elif self._config.integrator == "euler":
             self._integrator = IntegratorEuler(model=self._model)
         elif self._config.integrator == "moreau":
             self._integrator = IntegratorMoreauJean(model=self._model)
@@ -366,7 +353,7 @@ class SolverKaminoImpl(SolverBase):
         # Allocate the contacts warmstarter if enabled
         self._ws_limits: WarmstarterLimits | None = None
         self._ws_contacts: WarmstarterContacts | None = None
-        if self._config.dynamics_solver == "lox" or self._warmstart_mode == WarmStartMode.CONTAINERS:
+        if self._warmstart_mode == WarmStartMode.CONTAINERS:
             self._ws_limits = WarmstarterLimits(limits=self._limits)
             self._ws_contacts = WarmstarterContacts(
                 contacts=contacts,
@@ -385,9 +372,53 @@ class SolverKaminoImpl(SolverBase):
         self._mid_step_cb: SolverKaminoImpl.StepCallbackType | None = None
         self._post_step_cb: SolverKaminoImpl.StepCallbackType | None = None
 
+        if self._config.dynamics_solver == "lox":
+            self._integrator = IntegratorLOX(
+                model=self._model,
+                solver=self._solver_fd,
+                problem=self._problem_fd,
+                config=self._config.lox,
+                constraints_config=self._config.constraints,
+                jacobians=self._jacobians,
+                problem_metrics=self._problem_metrics,
+                warmstarter_limits=self._ws_limits,
+                warmstarter_contacts=self._ws_contacts,
+                contacts=contacts,
+                update_joints_data=self._update_joints_data,
+                update_jacobians=self._update_jacobians,
+                update_actuation_wrenches=self._update_actuation_wrenches,
+                update_wrenches=self._update_wrenches,
+                run_midstep_callback=self._run_midstep_callback,
+            )
+            self._integrator_forward = self._prepare_forward_dynamics
+        else:
+            self._integrator_forward = self._solve_forward_dynamics
+
         # Initialize all internal solver data
         with wp.ScopedDevice(self._model.device):
             self._reset()
+
+    def _rebuild_lox_rigid_topology(self) -> None:
+        """Rebuild LOX allocations after dynamic-body classification changes."""
+        adapter = self._lox_adapter
+        if adapter is None:
+            return
+
+        joint_penalty_scale = self._solver_fd.joint_penalty_scale.numpy()
+        adapter = LOXKaminoAdapter(
+            model=self._model,
+            data=self._data,
+            jacobians=self._jacobians,
+            limits=self._limits,
+            contacts=adapter.contacts,
+            eliminate_fixed_world_islands=self._config.lox.eliminate_fixed_world_islands,
+        )
+        solver = LOXSolver.from_config(adapter, self._config.lox, self._model._model)
+        solver.joint_penalty_scale.assign(joint_penalty_scale)
+        self._lox_adapter = adapter
+        self._solver_fd = solver
+        self._problem_fd.attach_newton_solver(solver)
+        self._integrator.set_solver(solver)
 
     ###
     # Properties
@@ -415,9 +446,9 @@ class SolverKaminoImpl(SolverBase):
         return self._data
 
     @property
-    def problem_fd(self) -> DualProblem | None:
+    def problem_fd(self) -> DualProblem | LOXProblem:
         """
-        Returns the dual forward dynamics problem.
+        Returns the forward dynamics problem.
         """
         return self._problem_fd
 
@@ -502,7 +533,7 @@ class SolverKaminoImpl(SolverBase):
         self._limits.detect(q_j=self._data.joints.q_j)
         self._update_constraint_info()
         self._update_jacobians(contacts=None)
-        return self._solver_fd.joint_penalty_scale_seed(time_step)
+        return self._solver_fd.joint_penalty_scale_seed(self._model.time.dt, self._model.time.inv_dt)
 
     def reset(
         self,
@@ -794,32 +825,27 @@ class SolverKaminoImpl(SolverBase):
         # Copy the new input state and control to the internal solver data
         self._read_step_inputs(state_in=state_in, control_in=control)
 
-        if self._config.dynamics_solver == "lox":
-            self._step_lox(state_in, state_out, control, contacts, detector, dt)
-            self._compute_metrics(state_in=state_in, contacts=contacts)
-        else:
-            # Execute state integration:
-            #  - Optionally calls limit and contact detection to generate unilateral constraints
-            #  - Solves the forward dynamics sub-problem to compute constraint reactions
-            #  - Integrates the state forward in time
-            self._integrator.integrate(
-                forward=self._solve_forward_dynamics,
-                model=self._model,
-                data=self._data,
-                state_in=state_in,
-                state_out=state_out,
-                control=control,
-                limits=self._limits,
-                contacts=contacts,
-                detector=detector,
-            )
+        # Execute state integration:
+        #  - Optionally calls limit and contact detection to generate unilateral constraints
+        #  - Solves the forward dynamics sub-problem to compute constraint reactions
+        #  - Integrates the state forward in time
+        self._integrator.integrate(
+            forward=self._integrator_forward,
+            model=self._model,
+            data=self._data,
+            state_in=state_in,
+            state_out=state_out,
+            control=control,
+            limits=self._limits,
+            contacts=contacts,
+            detector=detector,
+        )
 
-            # Update the internal joint states from the
-            # updated body states after time-integration
+        if not isinstance(self._integrator, IntegratorLOX):
             self._update_joints_data()
 
-            # Compute solver solution metrics if enabled
-            self._compute_metrics(state_in=state_in, contacts=contacts)
+        # Compute solver solution metrics if enabled
+        self._compute_metrics(state_in=state_in, contacts=contacts)
 
         # Update time-keeping (i.e. physical time and discrete steps)
         self._advance_time()
@@ -834,6 +860,11 @@ class SolverKaminoImpl(SolverBase):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         if self._solver_fk is not None:
             self._solver_fk.notify_model_changed(flags)
+        if self._lox_adapter is not None:
+            if flags & ModelFlags.BODY_PROPERTIES and self._lox_adapter.dynamic_body_topology_changed():
+                self._rebuild_lox_rigid_topology()
+            else:
+                self._lox_adapter.notify_model_changed()
 
     def validate_model_changed(self, flags: ModelFlags | int) -> None:
         """Validate solver-specific structural invariants before model updates."""
@@ -1000,113 +1031,16 @@ class SolverKaminoImpl(SolverBase):
         # Reset the forward dynamics solver to clear internal state
         # NOTE: This will cause the solver to perform a cold-start
         # on the first call to `step()`
-        if self._config.dynamics_solver == "lox":
-            self._solver_fd.reset()
-        else:
-            self._solver_fd.reset(problem=self._problem_fd, world_mask=world_mask)
+        self._solver_fd.reset(problem=self._problem_fd, world_mask=world_mask)
 
         # Reset the warm-starting caches if enabled
-        if self._ws_limits is not None:
+        if self._warmstart_mode == WarmStartMode.CONTAINERS:
             self._ws_limits.reset(world_mask=world_mask)
-        if self._ws_contacts is not None:
             self._ws_contacts.reset(world_mask=world_mask)
 
     ###
     # Internals - Step Operations
     ###
-
-    def _step_lox(
-        self,
-        state_in: StateKamino,
-        state_out: StateKamino,
-        control: ControlKamino,
-        contacts: ContactsKamino | None,
-        detector: CollisionDetector | None,
-        time_step: float | None,
-    ) -> None:
-        """Advance one timestep with frozen unilateral contact geometry."""
-        if time_step is None:
-            raise ValueError("The LOX backend requires an explicit uniform time step.")
-
-        solver = self._solver_fd
-        adapter = self._lox_adapter
-        lox_config = self._config.lox
-        constraints_config = self._config.constraints
-        wp.copy(self._lox_pose_begin, state_in.q_i)
-        wp.copy(self._lox_joint_position_begin, self._data.joints.q_j)
-
-        self._update_intermediates(state_in=state_in)
-        if detector is not None:
-            detector.collide(data=self._data, state=state_in, contacts=contacts)
-        self._limits.detect(q_j=self._data.joints.q_j)
-        self._update_constraint_info()
-        self._update_jacobians(contacts=contacts)
-        self._update_actuation_wrenches()
-        self._run_prestep_callback(state_in, state_out, control, contacts)
-
-        if self._ws_limits is not None:
-            self._ws_limits.warmstart(self._limits)
-        if self._ws_contacts is not None and contacts is not None:
-            self._ws_contacts.warmstart(self._model, self._data, contacts)
-
-        if self._problem_metrics is not None:
-            self._problem_metrics.build(
-                model=self._model,
-                data=self._data,
-                limits=self._limits,
-                contacts=contacts,
-                jacobians=self._jacobians,
-                reset_to_zero=True,
-            )
-
-        solver.begin_time_step(
-            time_step,
-            limit_stabilization_fraction=constraints_config.beta,
-            contact_stabilization_fraction=constraints_config.gamma,
-            contact_dead_zone=constraints_config.delta,
-            impact_velocity_threshold=lox_config.impact_velocity_threshold,
-        )
-        wp.copy(self._lox_pose_accepted, self._lox_pose_begin)
-        wp.copy(self._lox_twist_accepted, adapter.body_velocity_begin)
-        adapter.body_linearization_twist.zero_()
-        for nonlinear_iteration in range(lox_config.nonlinear_iterations):
-            solver.solve(time_step, linearization_twist=adapter.body_linearization_twist)
-            integrate_projected_body_poses(
-                self._model.bodies.wid,
-                self._model.time.dt,
-                self._lox_pose_begin,
-                solver.projected_twist,
-                self._lox_pose_candidate,
-            )
-            accept_projected_body_state(
-                self._model.bodies.wid,
-                solver.world_accepted,
-                self._lox_pose_candidate,
-                solver.projected_twist,
-                self._lox_pose_accepted,
-                self._lox_twist_accepted,
-            )
-            wp.copy(self._data.bodies.q_i, self._lox_pose_accepted)
-            wp.copy(solver.projected_twist, self._lox_twist_accepted)
-            adapter.write_outputs(time_step, body_velocity=self._lox_twist_accepted)
-            self._update_joints_data(q_j_p=self._lox_joint_position_begin)
-            update_body_inertias(model=self._model.bodies, data=self._data.bodies)
-            adapter.gather_structural_candidate_residuals()
-
-            if nonlinear_iteration + 1 < lox_config.nonlinear_iterations:
-                wp.copy(adapter.body_linearization_twist, solver.projected_twist)
-                self._update_jacobians(contacts=contacts)
-                self._update_actuation_wrenches()
-
-        wp.copy(self._data.joints.q_j_p, self._lox_joint_position_begin)
-
-        adapter.write_constraint_wrenches(time_step)
-        self._update_wrenches()
-        if self._ws_limits is not None:
-            self._ws_limits.update(self._limits)
-        if self._ws_contacts is not None:
-            self._ws_contacts.update(contacts)
-        self._run_midstep_callback(state_in, state_out, control, contacts)
 
     def _update_joints_data(self, q_j_p: wp.array[wp.float32] | None = None):
         """
@@ -1258,7 +1192,7 @@ class SolverKaminoImpl(SolverBase):
         # Post-processing
         self._update_wrenches()
 
-    def _solve_forward_dynamics(
+    def _prepare_forward_dynamics(
         self,
         state_in: StateKamino,
         state_out: StateKamino,
@@ -1268,8 +1202,7 @@ class SolverKaminoImpl(SolverBase):
         detector: CollisionDetector | None = None,
     ):
         """
-        Solves the forward dynamics sub-problem to compute constraint reactions
-        and total effective body wrenches applied to each body of the system.
+        Prepares kinematics, topology, and actuation for a forward solve.
 
         Args:
             state_in: State of the system at the current time-step.
@@ -1315,6 +1248,25 @@ class SolverKaminoImpl(SolverBase):
 
         # Run the pre-step callback if it has been set
         self._run_prestep_callback(state_in, state_out, control, contacts)
+
+    def _solve_forward_dynamics(
+        self,
+        state_in: StateKamino,
+        state_out: StateKamino,
+        control: ControlKamino,
+        limits: LimitsKamino | None = None,
+        contacts: ContactsKamino | None = None,
+        detector: CollisionDetector | None = None,
+    ):
+        """Prepare and solve the forward dynamics sub-problem."""
+        self._prepare_forward_dynamics(
+            state_in=state_in,
+            state_out=state_out,
+            control=control,
+            limits=limits,
+            contacts=contacts,
+            detector=detector,
+        )
 
         # Solve the forward dynamics sub-problem to compute constraint reactions and body wrenches
         self._forward(contacts=contacts)

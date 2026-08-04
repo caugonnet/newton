@@ -4,13 +4,48 @@
 """Numerical primitives for the LOX rigid-contact backend."""
 
 from .adapter import LOXKaminoAdapter
+from .apgd import project_constraints_apgd, project_deformable_constraints_apgd
+from .avbd import prepare_constraints_avbd, project_constraints_avbd, project_deformable_constraints_avbd
 from .bias import compute_contact_velocity_target, compute_limit_velocity_target
+from .cable import validate_cable_model
 from .contact import (
     compute_contact_scaled_alart_curnier_residual,
     project_contact_coulomb_cone,
     solve_contact_coulomb_newton,
 )
-from .integration import accept_projected_body_state, integrate_projected_body_poses
+from .deformable_contact import (
+    DEFORMABLE_CONTACT_STATUS_CROSS_WORLD,
+    DEFORMABLE_CONTACT_STATUS_DYNAMIC_RIGID,
+    DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS,
+    DEFORMABLE_CONTACT_STATUS_MALFORMED,
+    DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE,
+    DEFORMABLE_CONTACT_STATUS_UNUSED,
+    DEFORMABLE_CONTACT_STATUS_VALID,
+    DeformableContactSystem,
+    compute_deformable_contact_residual,
+    project_deformable_contact_coulomb,
+)
+from .deformable_direct import DeformableBlockLLT
+from .deformable_jacobi import DeformableJacobi
+from .deformable_preconditioner import (
+    DEFORMABLE_PRECONDITIONER_STATUS_FAILED,
+    DEFORMABLE_PRECONDITIONER_STATUS_REGULARIZED,
+    DEFORMABLE_PRECONDITIONER_STATUS_VALID,
+    DeformableIncompleteLDLT,
+)
+from .deformable_splitting import DeformableSplittingState
+from .deformable_system import (
+    DEFORMABLE_WEIGHT_STATUS_INVALID,
+    DEFORMABLE_WEIGHT_STATUS_REGULARIZED,
+    DEFORMABLE_WEIGHT_STATUS_VALID,
+    DeformableClothSystem,
+    DeformableClothTopology,
+    DeformableFEMSystem,
+    DeformableTopology,
+    validate_deformable_cloth_model,
+    validate_deformable_model,
+)
+from .integration import IntegratorLOX, accept_projected_body_state, integrate_projected_body_poses
 from .iteration import SplittingState
 from .metric import (
     METRIC_STATUS_INVALID,
@@ -30,10 +65,12 @@ from .problem import (
 )
 from .projection import (
     PROJECTION_STATUS_INVALID,
+    PROJECTION_STATUS_REGULARIZED,
     PROJECTION_STATUS_VALID,
     ContactProjectionResult,
     FrictionProjectionResult,
     LimitProjectionResult,
+    apply_contact_desaxce_correction,
     compute_contact_delassus,
     compute_limit_delassus,
     convert_contact_matrix_normal_first_to_last,
@@ -41,6 +78,7 @@ from .projection import (
     convert_contact_vector_normal_first_to_last,
     convert_contact_vector_normal_last_to_first,
     project_contact_coulomb,
+    project_contact_coulomb_cone_orthogonal,
     project_joint_friction,
     project_limit_unilateral,
 )
@@ -49,6 +87,7 @@ from .solver import (
     LOX_STATUS_CONVERGED,
     LOX_STATUS_FAILED,
     LOX_STATUS_ITERATION_LIMIT,
+    LOXProblem,
     LOXSolver,
 )
 from .sweep import (
@@ -56,6 +95,8 @@ from .sweep import (
     prepare_jacobi_projection_data,
     project_constraints_jacobi,
     project_constraints_sequential,
+    sweep_constraints_sequential,
+    warm_start_constraints_sequential,
 )
 from .system import BatchedPrimalBodySystem
 from .weight import (
@@ -76,6 +117,19 @@ __all__ = [
     "BODY_WEIGHT_STATUS_INVALID",
     "BODY_WEIGHT_STATUS_REGULARIZED",
     "BODY_WEIGHT_STATUS_VALID",
+    "DEFORMABLE_CONTACT_STATUS_CROSS_WORLD",
+    "DEFORMABLE_CONTACT_STATUS_DYNAMIC_RIGID",
+    "DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS",
+    "DEFORMABLE_CONTACT_STATUS_MALFORMED",
+    "DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE",
+    "DEFORMABLE_CONTACT_STATUS_UNUSED",
+    "DEFORMABLE_CONTACT_STATUS_VALID",
+    "DEFORMABLE_PRECONDITIONER_STATUS_FAILED",
+    "DEFORMABLE_PRECONDITIONER_STATUS_REGULARIZED",
+    "DEFORMABLE_PRECONDITIONER_STATUS_VALID",
+    "DEFORMABLE_WEIGHT_STATUS_INVALID",
+    "DEFORMABLE_WEIGHT_STATUS_REGULARIZED",
+    "DEFORMABLE_WEIGHT_STATUS_VALID",
     "LOX_STATUS_ACTIVE",
     "LOX_STATUS_CONVERGED",
     "LOX_STATUS_FAILED",
@@ -83,19 +137,32 @@ __all__ = [
     "METRIC_STATUS_INVALID",
     "METRIC_STATUS_VALID",
     "PROJECTION_STATUS_INVALID",
+    "PROJECTION_STATUS_REGULARIZED",
     "PROJECTION_STATUS_VALID",
     "BatchedPrimalBodySystem",
     "BodyWeightAnisotropicResult",
     "BodyWeightResult",
     "ConstraintMetricResult",
     "ContactProjectionResult",
+    "DeformableBlockLLT",
+    "DeformableClothSystem",
+    "DeformableClothTopology",
+    "DeformableContactSystem",
+    "DeformableFEMSystem",
+    "DeformableIncompleteLDLT",
+    "DeformableJacobi",
+    "DeformableSplittingState",
+    "DeformableTopology",
     "FrictionProjectionResult",
+    "IntegratorLOX",
     "LOXKaminoAdapter",
+    "LOXProblem",
     "LOXSolver",
     "LimitProjectionResult",
     "PrimalRowContribution",
     "SplittingState",
     "accept_projected_body_state",
+    "apply_contact_desaxce_correction",
     "compute_augmented_joint_multiplier",
     "compute_augmented_joint_row",
     "compute_body_explicit_wrench",
@@ -105,6 +172,7 @@ __all__ = [
     "compute_contact_delassus",
     "compute_contact_scaled_alart_curnier_residual",
     "compute_contact_velocity_target",
+    "compute_deformable_contact_residual",
     "compute_dynamic_joint_row",
     "compute_limit_delassus",
     "compute_limit_velocity_target",
@@ -117,12 +185,24 @@ __all__ = [
     "convert_contact_vector_normal_last_to_first",
     "integrate_projected_body_poses",
     "make_spatial_mass_matrix",
+    "prepare_constraints_avbd",
     "prepare_jacobi_projection_data",
+    "project_constraints_apgd",
+    "project_constraints_avbd",
     "project_constraints_jacobi",
     "project_constraints_sequential",
     "project_contact_coulomb",
     "project_contact_coulomb_cone",
+    "project_contact_coulomb_cone_orthogonal",
+    "project_deformable_constraints_apgd",
+    "project_deformable_constraints_avbd",
+    "project_deformable_contact_coulomb",
     "project_joint_friction",
     "project_limit_unilateral",
     "solve_contact_coulomb_newton",
+    "sweep_constraints_sequential",
+    "validate_cable_model",
+    "validate_deformable_cloth_model",
+    "validate_deformable_model",
+    "warm_start_constraints_sequential",
 ]

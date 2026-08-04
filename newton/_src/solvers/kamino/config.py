@@ -942,11 +942,127 @@ class LOXSolverConfig:
     max_iterations: int = 25
     """Maximum LOX splitting iterations per nonlinear iteration."""
 
-    projection_iterations: int = 3
-    """Fixed unilateral projection sweeps per splitting iteration."""
+    use_graph_conditionals: bool = True
+    """Whether to terminate LOX splitting with a device condition.
 
-    projection_method: Literal["jacobi", "gauss_seidel"] = "jacobi"
-    """Body-space unilateral projection method."""
+    Outside graph capture, this permits early termination through an eager
+    :func:`warp.capture_while` loop. When disabled, or when CUDA graph
+    conditional nodes are unavailable during capture, the solver unrolls
+    :attr:`max_iterations` iterations instead.
+    """
+
+    eliminate_fixed_world_islands: bool = True
+    """Whether to eliminate fixed-joint tree islands attached to the world.
+
+    Disable this to retain those bodies in the dynamic solve and compute their
+    fixed-joint support reactions. Bodies marked with :attr:`newton.BodyFlags.KINEMATIC`
+    remain prescribed.
+    """
+
+    projection_iterations: int = 3
+    """Primary unilateral projection sweeps per splitting iteration.
+
+    One colored Gauss--Seidel iteration visits every unilateral color; after
+    these iterations, one global mass-split Jacobi sweep smooths the resulting
+    impulses. One AVBD iteration visits every rigid and deformable color, then
+    updates all unilateral dual reactions in parallel.
+    """
+
+    projection_method: Literal["jacobi", "gauss_seidel", "apgd", "avbd"] = "jacobi"
+    """Body-space unilateral projection method.
+
+    Select ``"jacobi"`` for mass-split parallel sweeps, ``"gauss_seidel"``
+    for sequential sweeps, ``"apgd"`` for accelerated projected-gradient
+    iterations, or ``"avbd"`` for colored primal/dual block sweeps.
+    """
+
+    inertial_warmstart_fraction: float = 0.0
+    """Fraction of external-force acceleration pre-applied to the initial LOX guess.
+
+    Dynamic rigid bodies and deformable particles start from their step-start
+    velocity plus this fraction of ``dt`` times the acceleration due to State
+    forces and gravity. Prescribed rigid twists are always used in full.
+    """
+
+    deformable_cr_iterations: int = 4
+    """Fixed preconditioned CR iterations per deformable candidate solve."""
+
+    deformable_direct_max_particles: int = 128
+    """Largest structural component solved with batched direct Cholesky.
+
+    The default gives 384 scalar unknowns, exactly six 64-wide factorization
+    tiles. Set to zero to solve every deformable component with CR.
+    """
+
+    deformable_proximal_iterations: int = 1
+    """Fixed local Gauss-Newton iterations per nonlinear elastic-element prox.
+
+    Zero retains the frozen membrane and tetrahedron linearizations. Positive
+    values enable element-local nonlinear refinement within the LOX splitting
+    loop.
+    """
+
+    deformable_proximal_relaxation: float = 1.0
+    """Relaxation factor for nonlinear elastic-element proximal updates.
+
+    Zero disables the local update. Values below one under-relax its local
+    coordinate and multiplier while preserving the same fixed point.
+    """
+
+    deformable_preconditioner: Literal["incomplete_ldlt", "jacobi"] = "incomplete_ldlt"
+    """Preconditioner used by the deformable candidate solve.
+
+    Scalar ``"jacobi"`` reduces setup, storage, and application cost, but
+    generally requires more :attr:`deformable_cr_iterations`.
+    """
+
+    deformable_preconditioner_fill_level: int = 0
+    """Non-negative symbolic fill level for the deformable incomplete factorization."""
+
+    deformable_hessian_regularization: float = 1.0e-6
+    """Relative positive pivot or diagonal floor for the deformable preconditioner."""
+
+    deformable_enable_self_contact: bool = False
+    """Whether to generate cloth vertex-triangle and edge-edge self-contacts."""
+
+    deformable_enable_normal_cone_filtering: bool = True
+    """Whether to prune deformable self-contacts using surface-feature normal cones."""
+
+    deformable_enable_rigid_contact_normal_cone_filtering: bool = False
+    """Whether to prune rigid-deformable SDF contacts using soft-feature normal cones."""
+
+    deformable_normal_cone_filtering_min_distance: float = 1.0e-4
+    """Geometric separation below which normal-cone filtering is bypassed [m]."""
+
+    deformable_self_contact_margin: float = 0.2
+    """Additional cloth self-contact surface thickness [m]."""
+
+    deformable_self_contact_gap: float = 0.0
+    """Additional speculative self-contact detection distance [m]."""
+
+    deformable_self_contact_vertex_buffer_size: int = 32
+    """Maximum candidate triangles stored per cloth vertex."""
+
+    deformable_self_contact_edge_buffer_size: int = 64
+    """Maximum candidate edges stored per cloth edge."""
+
+    deformable_self_contact_topological_filter_threshold: int = 1
+    """Mesh-ring distance within which self-contact candidates are excluded."""
+
+    deformable_self_contact_rest_exclusion_radius: float = 0.0
+    """Rest-space distance below which self-contact candidates are excluded [m]."""
+
+    deformable_self_contact_edge_parallel_epsilon: float = 1.0e-5
+    """Tolerance used to classify nearly parallel cloth edges."""
+
+    deformable_enable_penetration_free_contact: bool = False
+    """Whether to apply VBD-style penetration-free truncation to deformable self-contact.
+
+    This does not truncate rigid-deformable motion.
+    """
+
+    deformable_penetration_free_contact_relaxation: float = 0.85
+    """Safety relaxation applied to deformable directional step bounds."""
 
     position_tolerance: float = 1.0e-5
     """Translational end-of-step convergence tolerance [m]."""
@@ -955,13 +1071,34 @@ class LOXSolverConfig:
     """Rotational end-of-step convergence tolerance [rad]."""
 
     velocity_tolerance: float = 1.0e-5
-    """Consensus dual-velocity convergence tolerance [m/s or rad/s]."""
+    """Velocity-space convergence tolerance for deformable and actuator residuals [m/s or rad/s]."""
 
     weight_sigma: float = 1.0e-3
     """Relative lower scale used by the inertia-normalized body-weight clamp."""
 
     weight_beta: float = 4.0
-    """Upper normalized smooth-weight threshold used by the body-weight heuristic."""
+    """Normalized smooth-weight transition threshold used by the body-weight heuristic.
+
+    The conditioning floor set by :attr:`weight_sigma` may dominate this
+    threshold for sufficiently stiff modes.
+    """
+
+    deformable_weight_beta: float = 25.0
+    """Normalized smooth-weight transition threshold used by the deformable nodal-weight heuristic.
+
+    The conditioning floor set by :attr:`weight_sigma` may dominate this
+    threshold for sufficiently stiff modes.
+    """
+
+    selective_weights: bool = True
+    """Whether to restrict proximal weights to unilateral-constraint incidence.
+
+    When enabled, the LOX splitting operator applies its proximal metric only
+    to rigid bodies and deformable particles incident to a unilateral
+    constraint. The deformable candidate-solve preconditioner retains the full
+    nodal metric. Penetration-free deformable contact retains the full metric
+    because its limiter can truncate any dynamic particle.
+    """
 
     joint_penalty_scale: float = 100.0
     """Dimensionless scale for effective-mass structural penalties and consensus weights."""
@@ -969,6 +1106,8 @@ class LOXSolverConfig:
     joint_multiplier_projected_fraction: float = 1.0
     """Fraction of projected-twist feedback in structural updates, in [0, 1].
 
+    The default reconciles structural reactions with the twist that will be
+    integrated. Zero recovers the global-twist product-space ADMM update.
     Direct structural updates clamp the effective fraction to ``0.5``.
     """
 
@@ -981,6 +1120,9 @@ class LOXSolverConfig:
     impact_velocity_threshold: float = 1.0e-3
     """Minimum approaching normal speed that enables restitution [m/s]."""
 
+    contact_recoverable_response: bool = False
+    """Whether speculative contacts permit overlap recoverable as the unreduced restitution response."""
+
     contact_warmstart_method: Literal[
         "key_and_position",
         "geom_pair_net_force",
@@ -989,6 +1131,17 @@ class LOXSolverConfig:
         "key_and_position_with_net_wrench_backup",
     ] = "key_and_position"
     """Method used to warm-start contacts."""
+
+    gauss_seidel_max_colors: int = 8
+    """Maximum colors used by Gauss--Seidel unilateral projection.
+
+    Zero retains true sequential Gauss--Seidel. One selects the existing
+    mass-split Jacobi projection. Values greater than one process approximate
+    colors sequentially while solving each color with mass-split Jacobi. The
+    multi-color path uses the smaller of this value and its allocated
+    unilateral capacity, retaining one inert internal color for an empty
+    system. It finishes with one global Jacobi smoothing sweep.
+    """
 
     @override
     @staticmethod
@@ -1026,13 +1179,174 @@ class LOXSolverConfig:
             "nonlinear_iterations": self.nonlinear_iterations,
             "max_iterations": self.max_iterations,
             "projection_iterations": self.projection_iterations,
+            "deformable_cr_iterations": self.deformable_cr_iterations,
         }
         for name, value in iteration_fields.items():
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"Invalid {name}: {value}. Must be an integer greater than or equal to one.")
-        if self.projection_method not in ("jacobi", "gauss_seidel"):
+        if not isinstance(self.use_graph_conditionals, bool):
+            raise ValueError(f"Invalid use_graph_conditionals: {self.use_graph_conditionals}. Must be a boolean.")
+        if not isinstance(self.eliminate_fixed_world_islands, bool):
             raise ValueError(
-                f"Invalid projection_method: {self.projection_method}. Must be 'jacobi' or 'gauss_seidel'."
+                f"Invalid eliminate_fixed_world_islands: {self.eliminate_fixed_world_islands}. Must be a boolean."
+            )
+        if (
+            not isinstance(self.deformable_direct_max_particles, int)
+            or isinstance(self.deformable_direct_max_particles, bool)
+            or self.deformable_direct_max_particles < 0
+        ):
+            raise ValueError(
+                "Invalid deformable_direct_max_particles: "
+                f"{self.deformable_direct_max_particles}. Must be a non-negative integer."
+            )
+        if (
+            not isinstance(self.deformable_proximal_iterations, int)
+            or isinstance(self.deformable_proximal_iterations, bool)
+            or self.deformable_proximal_iterations < 0
+        ):
+            raise ValueError(
+                "Invalid deformable_proximal_iterations: "
+                f"{self.deformable_proximal_iterations}. Must be a non-negative integer."
+            )
+        if (
+            not np.isfinite(self.deformable_proximal_relaxation)
+            or self.deformable_proximal_relaxation < 0.0
+            or self.deformable_proximal_relaxation > 1.0
+        ):
+            raise ValueError(
+                "Invalid deformable_proximal_relaxation: "
+                f"{self.deformable_proximal_relaxation}. Must be in range [0, 1]."
+            )
+        if self.projection_method not in ("jacobi", "gauss_seidel", "apgd", "avbd"):
+            raise ValueError(
+                f"Invalid projection_method: {self.projection_method}. "
+                "Must be 'jacobi', 'gauss_seidel', 'apgd', or 'avbd'."
+            )
+        if (
+            not isinstance(self.gauss_seidel_max_colors, int)
+            or isinstance(self.gauss_seidel_max_colors, bool)
+            or self.gauss_seidel_max_colors < 0
+        ):
+            raise ValueError(
+                f"Invalid gauss_seidel_max_colors: {self.gauss_seidel_max_colors}. Must be a non-negative integer."
+            )
+        if (
+            not np.isfinite(self.inertial_warmstart_fraction)
+            or self.inertial_warmstart_fraction < 0.0
+            or self.inertial_warmstart_fraction > 1.0
+        ):
+            raise ValueError(
+                f"Invalid inertial_warmstart_fraction: {self.inertial_warmstart_fraction}. Must be in range [0, 1]."
+            )
+        if self.deformable_preconditioner not in ("incomplete_ldlt", "jacobi"):
+            raise ValueError(
+                "Invalid deformable_preconditioner: "
+                f"{self.deformable_preconditioner!r}. Must be 'incomplete_ldlt' or 'jacobi'."
+            )
+        if (
+            not isinstance(self.deformable_preconditioner_fill_level, int)
+            or isinstance(self.deformable_preconditioner_fill_level, bool)
+            or self.deformable_preconditioner_fill_level < 0
+        ):
+            raise ValueError(
+                "Invalid deformable_preconditioner_fill_level: "
+                f"{self.deformable_preconditioner_fill_level}. Must be a non-negative integer."
+            )
+        if not np.isfinite(self.deformable_hessian_regularization) or self.deformable_hessian_regularization <= 0.0:
+            raise ValueError(
+                "Invalid deformable_hessian_regularization: "
+                f"{self.deformable_hessian_regularization}. Must be finite and greater than zero."
+            )
+        if not isinstance(self.deformable_enable_self_contact, bool):
+            raise ValueError(
+                f"Invalid deformable_enable_self_contact: {self.deformable_enable_self_contact}. Must be a bool."
+            )
+        if not isinstance(self.deformable_enable_normal_cone_filtering, bool):
+            raise ValueError(
+                "Invalid deformable_enable_normal_cone_filtering: "
+                f"{self.deformable_enable_normal_cone_filtering}. Must be a bool."
+            )
+        if not isinstance(self.deformable_enable_rigid_contact_normal_cone_filtering, bool):
+            raise ValueError(
+                "Invalid deformable_enable_rigid_contact_normal_cone_filtering: "
+                f"{self.deformable_enable_rigid_contact_normal_cone_filtering}. Must be a bool."
+            )
+        if (
+            not np.isfinite(self.deformable_normal_cone_filtering_min_distance)
+            or self.deformable_normal_cone_filtering_min_distance < 0.0
+        ):
+            raise ValueError(
+                "Invalid deformable_normal_cone_filtering_min_distance: "
+                f"{self.deformable_normal_cone_filtering_min_distance}. Must be finite and non-negative."
+            )
+        if not np.isfinite(self.deformable_self_contact_margin) or self.deformable_self_contact_margin < 0.0:
+            raise ValueError(
+                "Invalid deformable_self_contact_margin: "
+                f"{self.deformable_self_contact_margin}. Must be finite and non-negative."
+            )
+        if not np.isfinite(self.deformable_self_contact_gap) or self.deformable_self_contact_gap < 0.0:
+            raise ValueError(
+                "Invalid deformable_self_contact_gap: "
+                f"{self.deformable_self_contact_gap}. Must be finite and non-negative."
+            )
+        if self.deformable_self_contact_margin + self.deformable_self_contact_gap <= 0.0:
+            raise ValueError("Invalid deformable self-contact margin and gap: their sum must be greater than zero.")
+        if (
+            not isinstance(self.deformable_self_contact_vertex_buffer_size, int)
+            or isinstance(self.deformable_self_contact_vertex_buffer_size, bool)
+            or self.deformable_self_contact_vertex_buffer_size <= 0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_vertex_buffer_size: "
+                f"{self.deformable_self_contact_vertex_buffer_size}. Must be a positive integer."
+            )
+        if (
+            not isinstance(self.deformable_self_contact_edge_buffer_size, int)
+            or isinstance(self.deformable_self_contact_edge_buffer_size, bool)
+            or self.deformable_self_contact_edge_buffer_size <= 0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_edge_buffer_size: "
+                f"{self.deformable_self_contact_edge_buffer_size}. Must be a positive integer."
+            )
+        if (
+            not isinstance(self.deformable_self_contact_topological_filter_threshold, int)
+            or isinstance(self.deformable_self_contact_topological_filter_threshold, bool)
+            or self.deformable_self_contact_topological_filter_threshold < 0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_topological_filter_threshold: "
+                f"{self.deformable_self_contact_topological_filter_threshold}. Must be a non-negative integer."
+            )
+        if (
+            not np.isfinite(self.deformable_self_contact_rest_exclusion_radius)
+            or self.deformable_self_contact_rest_exclusion_radius < 0.0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_rest_exclusion_radius: "
+                f"{self.deformable_self_contact_rest_exclusion_radius}. Must be finite and non-negative."
+            )
+        if (
+            not np.isfinite(self.deformable_self_contact_edge_parallel_epsilon)
+            or self.deformable_self_contact_edge_parallel_epsilon <= 0.0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_edge_parallel_epsilon: "
+                f"{self.deformable_self_contact_edge_parallel_epsilon}. Must be finite and greater than zero."
+            )
+        if not isinstance(self.deformable_enable_penetration_free_contact, bool):
+            raise ValueError(
+                "Invalid deformable_enable_penetration_free_contact: "
+                f"{self.deformable_enable_penetration_free_contact}. Must be a bool."
+            )
+        if (
+            not np.isfinite(self.deformable_penetration_free_contact_relaxation)
+            or self.deformable_penetration_free_contact_relaxation <= 0.0
+            or self.deformable_penetration_free_contact_relaxation > 1.0
+        ):
+            raise ValueError(
+                "Invalid deformable_penetration_free_contact_relaxation: "
+                f"{self.deformable_penetration_free_contact_relaxation}. Must be in range (0, 1]."
             )
 
         if not np.isfinite(self.position_tolerance) or self.position_tolerance <= 0.0:
@@ -1045,6 +1359,10 @@ class LOXSolverConfig:
             raise ValueError(f"Invalid weight_sigma: {self.weight_sigma}. Must be in range (0, 1].")
         if not np.isfinite(self.weight_beta) or self.weight_beta < 1.0:
             raise ValueError(f"Invalid weight_beta: {self.weight_beta}. Must be at least one.")
+        if not np.isfinite(self.deformable_weight_beta) or self.deformable_weight_beta < 1.0:
+            raise ValueError(f"Invalid deformable_weight_beta: {self.deformable_weight_beta}. Must be at least one.")
+        if not isinstance(self.selective_weights, bool):
+            raise ValueError(f"Invalid selective_weights: {self.selective_weights}. Must be a boolean.")
         if not np.isfinite(self.joint_penalty_scale) or self.joint_penalty_scale <= 0.0:
             raise ValueError(f"Invalid joint_penalty_scale: {self.joint_penalty_scale}. Must be greater than zero.")
         if (
@@ -1067,6 +1385,10 @@ class LOXSolverConfig:
         if not np.isfinite(self.impact_velocity_threshold) or self.impact_velocity_threshold < 0.0:
             raise ValueError(
                 f"Invalid impact_velocity_threshold: {self.impact_velocity_threshold}. Must be non-negative."
+            )
+        if not isinstance(self.contact_recoverable_response, bool):
+            raise ValueError(
+                f"Invalid contact_recoverable_response: {self.contact_recoverable_response}. Must be a boolean."
             )
         WarmstarterContacts.Method.from_string(self.contact_warmstart_method)
 

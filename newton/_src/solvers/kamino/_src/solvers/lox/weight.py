@@ -21,6 +21,7 @@ __all__ = [
     "BODY_WEIGHT_STATUS_INVALID",
     "BODY_WEIGHT_STATUS_REGULARIZED",
     "BODY_WEIGHT_STATUS_VALID",
+    "DEFORMABLE_WEIGHT_BETA_DEFAULT",
     "BodyWeightAnisotropicResult",
     "BodyWeightResult",
     "compute_body_weight_anisotropic",
@@ -31,7 +32,10 @@ BODY_WEIGHT_SIGMA_DEFAULT = 1.0e-3
 """Default lower spectral fraction from Daviet (2020)."""
 
 BODY_WEIGHT_BETA_DEFAULT = 4.0
-"""Default upper normalized smooth-weight threshold."""
+"""Default normalized smooth-weight transition threshold."""
+
+DEFORMABLE_WEIGHT_BETA_DEFAULT = 25.0
+"""Default normalized smooth-weight transition threshold for deformable nodes."""
 
 BODY_WEIGHT_STATUS_INVALID = 0
 """The input contained a non-finite value or an invalid policy parameter."""
@@ -305,7 +309,8 @@ def compute_body_weight_anisotropic(
         mass: Positive body mass [kg].
         inertia_world: Body inertia in world axes [kg m^2].
         sigma: Fraction of the smooth normalized scale used as the floor.
-        beta: Maximum generalized eigenvalue.
+        beta: Nominal generalized-eigenvalue transition threshold. The
+            ``sigma`` floor may exceed it for sufficiently stiff modes.
         mass_floor: Minimum accepted positive mass [kg].
         inertia_floor: Minimum principal moment [kg m^2].
         eta_floor: Minimum smooth normalized eigenvalue.
@@ -451,7 +456,8 @@ def compute_body_weight_mass_proportional(
         inertia_world: Symmetric body inertia about its center of mass in
             world axes [kg m^2].
         sigma: Lower spectral fraction in the weight clamp.
-        beta: Upper weight threshold in the weight clamp.
+        beta: Nominal weight transition threshold. The ``sigma`` floor may
+            exceed it for sufficiently stiff modes.
         mass_floor: Minimum accepted positive mass [kg].
         inertia_floor: Minimum principal moment [kg m^2].
         eta_floor: Minimum dimensionless normalized smooth eigenvalue.

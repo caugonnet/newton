@@ -14,13 +14,19 @@ from newton._src.solvers.kamino._src.solvers.lox.iteration import SplittingState
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
 
+def _world_dt(world_count: int, value: float, device: wp.DeviceLike) -> wp.array[wp.float32]:
+    """Construct an explicit uniform per-world time-step array."""
+    return wp.full(world_count, value, dtype=wp.float32, device=device)
+
+
 class TestLOXIteration(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
             setup_tests(device="cpu", clear_cache=False)
         self.device = wp.get_device(test_context.device)
 
-    def test_residual_dual_update_and_per_world_freeze(self):
+    def test_cross_iterate_update_and_per_world_freeze(self):
+        """Scale cross-iterate residuals and freeze converged worlds."""
         state = SplittingState([1, 2], device=self.device)
         initial = wp.zeros(3, dtype=vec6f, device=self.device)
         state.begin(initial, reset_dual=True)
@@ -36,16 +42,16 @@ class TestLOXIteration(unittest.TestCase):
         status = wp.full(2, PROJECTION_STATUS_VALID, dtype=wp.int32, device=self.device)
         state.finish_iteration(
             status,
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=0.001,
             rotation_tolerance=0.001,
-            velocity_tolerance=1.0,
+            velocity_tolerance=0.1,
         )
 
         np.testing.assert_allclose(state.residual_change.numpy(), [0.5, 2.0], rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(state.residual_split.numpy(), [0.1, 1.0], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(state.residual_unilateral_dual.numpy(), [0.05, 0.2], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(state.residual_total.numpy(), [0.65, 3.2], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(state.residual_cross_iterate.numpy(), [0.5, 2.0], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(state.residual_total.numpy(), [0.5, 2.0], rtol=0.0, atol=1.0e-6)
         np.testing.assert_array_equal(state.world_active.numpy(), [False, True])
         np.testing.assert_array_equal(state.world_converged.numpy(), [True, False])
         np.testing.assert_allclose(state.splitting_dual.numpy()[0, 0], -0.01, rtol=0.0, atol=1.0e-7)
@@ -57,10 +63,10 @@ class TestLOXIteration(unittest.TestCase):
         state.projected_twist.assign(projected)
         state.finish_iteration(
             status,
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=0.001,
             rotation_tolerance=0.001,
-            velocity_tolerance=1.0,
+            velocity_tolerance=0.1,
         )
         np.testing.assert_array_equal(state.world_converged.numpy(), [True, True])
         np.testing.assert_array_equal(state.iteration_count.numpy(), [1, 2])
@@ -72,15 +78,17 @@ class TestLOXIteration(unittest.TestCase):
         state.prepare_projection(initial)
         state.finish_iteration(
             wp.zeros(1, dtype=wp.int32, device=self.device),
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=1.0e-5,
             rotation_tolerance=1.0e-5,
+            velocity_tolerance=1.0e-5,
         )
         np.testing.assert_array_equal(state.world_active.numpy(), [False])
         np.testing.assert_array_equal(state.world_failed.numpy(), [True])
         np.testing.assert_array_equal(state.iteration_count.numpy(), [1])
 
-    def test_dual_velocity_residual_prevents_premature_convergence(self):
+    def test_cross_iterate_residual_uses_pose_scale(self):
+        """Normalize cross-iterate motion with the pose tolerance."""
         state = SplittingState([1], device=self.device)
         initial = wp.zeros(1, dtype=vec6f, device=self.device)
         candidate = wp.array([[0.01, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=vec6f, device=self.device)
@@ -90,28 +98,72 @@ class TestLOXIteration(unittest.TestCase):
         state.prepare_projection(candidate)
         state.finish_iteration(
             status,
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=0.001,
             rotation_tolerance=0.001,
-            velocity_tolerance=0.004,
+            velocity_tolerance=0.1,
         )
 
         np.testing.assert_allclose(state.residual_change.numpy(), [0.1], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(state.residual_unilateral_dual.numpy(), [2.5], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(state.residual_total.numpy(), [2.6], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_array_equal(state.world_active.numpy(), [True])
+        np.testing.assert_allclose(state.residual_cross_iterate.numpy(), [0.1], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(state.residual_total.numpy(), [0.1], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_array_equal(state.world_converged.numpy(), [True])
+
+    def test_split_residual_uses_velocity_tolerance(self):
+        """Normalize the rigid v-p residual directly in velocity space."""
+        state = SplittingState([1], device=self.device)
+        initial = wp.zeros(1, dtype=vec6f, device=self.device)
+        candidate = wp.array([[0.01, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=vec6f, device=self.device)
+        state.begin(initial)
+        state.prepare_projection(candidate)
+        state.projected_twist.assign(np.asarray([[0.005, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32))
+
+        state.finish_iteration(
+            wp.full(1, PROJECTION_STATUS_VALID, dtype=wp.int32, device=self.device),
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
+            position_tolerance=1.0,
+            rotation_tolerance=1.0,
+            velocity_tolerance=1.0e-3,
+        )
+
+        np.testing.assert_allclose(state.residual_split.numpy(), [5.0], rtol=0.0, atol=1.0e-6)
         np.testing.assert_array_equal(state.world_converged.numpy(), [False])
 
-        state.prepare_projection(candidate)
+    def test_lagged_velocity_residual_requires_a_second_iteration(self):
+        """Gate convergence until a required lagged velocity residual is valid."""
+        state = SplittingState([1], device=self.device)
+        initial = wp.zeros(1, dtype=vec6f, device=self.device)
+        status = wp.full(1, PROJECTION_STATUS_VALID, dtype=wp.int32, device=self.device)
+        residual = wp.array([0.5], dtype=wp.float32, device=self.device)
+        required = wp.array([1], dtype=wp.int32, device=self.device)
+        state.begin(initial)
+
+        state.prepare_projection(initial)
         state.finish_iteration(
             status,
-            time_step=0.01,
-            position_tolerance=0.001,
-            rotation_tolerance=0.001,
-            velocity_tolerance=0.004,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
+            position_tolerance=1.0e-5,
+            rotation_tolerance=1.0e-5,
+            velocity_tolerance=1.0e-5,
+            lagged_velocity_residual=residual,
+            lagged_velocity_required=required,
         )
-        np.testing.assert_allclose(state.residual_unilateral_dual.numpy(), [0.0], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_array_equal(state.world_active.numpy(), [True])
+        np.testing.assert_array_equal(state.world_converged.numpy(), [False])
+        np.testing.assert_allclose(state.residual_lagged_velocity.numpy(), [0.5])
+
+        state.prepare_projection(initial)
+        state.finish_iteration(
+            status,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
+            position_tolerance=1.0e-5,
+            rotation_tolerance=1.0e-5,
+            velocity_tolerance=1.0e-5,
+            lagged_velocity_residual=residual,
+            lagged_velocity_required=required,
+        )
         np.testing.assert_array_equal(state.world_converged.numpy(), [True])
+        np.testing.assert_array_equal(state.iteration_count.numpy(), [2])
 
     def test_structural_residual_participates_in_convergence(self):
         state = SplittingState([1], device=self.device)
@@ -121,9 +173,10 @@ class TestLOXIteration(unittest.TestCase):
         state.prepare_projection(initial)
         state.finish_iteration(
             status,
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=1.0e-5,
             rotation_tolerance=1.0e-5,
+            velocity_tolerance=1.0e-5,
             structural_residual=wp.array([2.0], dtype=wp.float32, device=self.device),
             projected_structural_residual=wp.array([3.0], dtype=wp.float32, device=self.device),
         )
@@ -136,9 +189,10 @@ class TestLOXIteration(unittest.TestCase):
         state.prepare_projection(initial)
         state.finish_iteration(
             status,
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=1.0e-5,
             rotation_tolerance=1.0e-5,
+            velocity_tolerance=1.0e-5,
             structural_residual=wp.zeros(1, dtype=wp.float32, device=self.device),
         )
         np.testing.assert_array_equal(state.world_converged.numpy(), [True])
@@ -150,9 +204,10 @@ class TestLOXIteration(unittest.TestCase):
         state.prepare_projection(candidate)
         state.finish_iteration(
             wp.full(1, PROJECTION_STATUS_VALID, dtype=wp.int32, device=self.device),
-            time_step=0.01,
+            time_step=_world_dt(state.num_worlds, 0.01, self.device),
             position_tolerance=1.0e-5,
             rotation_tolerance=1.0e-5,
+            velocity_tolerance=1.0e-5,
         )
 
         np.testing.assert_array_equal(state.world_active.numpy(), [False])

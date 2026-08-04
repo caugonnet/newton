@@ -139,15 +139,18 @@ class TestLOXAdapter(unittest.TestCase):
         adapter = LOXKaminoAdapter(model, data, jacobians, contacts=contacts)
         sparse_adapter = LOXKaminoAdapter(model, data, sparse_jacobians, contacts=contacts)
         time_step = 0.1
+        model.time.set_uniform_timestep(time_step)
         penalty_scale = 3.0
         adapter.begin_time_step(
-            time_step,
+            model.time.dt,
+            model.time.inv_dt,
             contact_stabilization_fraction=0.25,
             contact_dead_zone=0.01,
             impact_velocity_threshold=0.1,
         )
         sparse_adapter.begin_time_step(
-            time_step,
+            model.time.dt,
+            model.time.inv_dt,
             contact_stabilization_fraction=0.25,
             contact_dead_zone=0.01,
             impact_velocity_threshold=0.1,
@@ -162,12 +165,12 @@ class TestLOXAdapter(unittest.TestCase):
         linearization_twist = evaluation_velocity.copy()
         linearization_twist[1] += np.asarray([0.1, 0.2, -0.3, 0.4, -0.2, 0.1], dtype=np.float32)
         adapter.update(
-            time_step,
+            model.time.dt,
             joint_penalty_scale=penalty_scale,
             linearization_twist=wp.array(linearization_twist, dtype=vec6f, device=self.device),
         )
         sparse_adapter.update(
-            time_step,
+            model.time.dt,
             joint_penalty_scale=penalty_scale,
             linearization_twist=wp.array(linearization_twist, dtype=vec6f, device=self.device),
         )
@@ -306,7 +309,7 @@ class TestLOXAdapter(unittest.TestCase):
         contact_velocity[1] = np.asarray([0.7, -0.2, 0.3], dtype=np.float32)
         adapter.contact_velocity.assign(contact_velocity)
         structural_output = adapter.structural_multiplier.numpy()
-        adapter.write_outputs(time_step)
+        adapter.write_outputs(model.time.dt, model.time.inv_dt)
         np.testing.assert_allclose(data.bodies.u_i.numpy(), final_body_velocity, atol=1.0e-7)
         np.testing.assert_allclose(contacts.reaction.numpy()[0], [2.0, 4.0, 6.0], atol=1.0e-6)
         np.testing.assert_allclose(contacts.velocity.numpy()[0], [0.7, -0.2, 0.3], atol=1.0e-7)
@@ -333,9 +336,10 @@ class TestLOXAdapter(unittest.TestCase):
         adapter = LOXKaminoAdapter(model, data, jacobians)
 
         time_step = 0.01
-        adapter.begin_time_step(time_step)
+        model.time.set_uniform_timestep(time_step)
+        adapter.begin_time_step(model.time.dt, model.time.inv_dt)
         adapter.update(
-            time_step,
+            model.time.dt,
             block_joint_metrics=True,
             mass_split_joint_metrics=True,
         )
@@ -392,7 +396,7 @@ class TestLOXAdapter(unittest.TestCase):
                 max_scaled = max(int(multiplicities_first[block]), int(multiplicities_second[block])) * physical
                 self.assertGreater(float(np.linalg.norm(split - max_scaled)), 1.0e-4)
 
-        adapter.update(time_step, block_joint_metrics=True, mass_split_joint_metrics=False)
+        adapter.update(model.time.dt, block_joint_metrics=True, mass_split_joint_metrics=False)
         np.testing.assert_array_equal(adapter.structural_block_body_first_multiplicity.numpy(), [0, 1])
         np.testing.assert_array_equal(adapter.structural_block_body_second_multiplicity.numpy(), [1, 1])
         for block in range(adapter.structural_block_count):
@@ -423,9 +427,10 @@ class TestLOXAdapter(unittest.TestCase):
             [[-0.2, 0.4, 0.1, 0.3, -0.5, 0.2], [0.5, -0.3, 0.2, -0.1, 0.4, -0.2]],
             dtype=np.float32,
         )
-        adapter.begin_time_step(time_step)
+        model.time.set_uniform_timestep(time_step)
+        adapter.begin_time_step(model.time.dt, model.time.inv_dt)
         adapter.update(
-            time_step,
+            model.time.dt,
             joint_penalty_scale=1.0,
             linearization_twist=wp.array(linearization_twist, dtype=vec6f, device=self.device),
             block_joint_metrics=True,
@@ -481,7 +486,7 @@ class TestLOXAdapter(unittest.TestCase):
         multiplier_before = adapter.structural_multiplier.numpy().copy()
         candidate_twist_device = wp.array(candidate_twist, dtype=vec6f, device=self.device)
         adapter.update_structural_multipliers_from_twist(
-            time_step,
+            model.time.dt,
             1.0e-5,
             wp.array(linearization_twist, dtype=vec6f, device=self.device),
             candidate_twist_device,
@@ -507,9 +512,10 @@ class TestLOXAdapter(unittest.TestCase):
         adapter = LOXKaminoAdapter(model, data, jacobians)
 
         time_step = 0.01
-        adapter.begin_time_step(time_step)
+        model.time.set_uniform_timestep(time_step)
+        adapter.begin_time_step(model.time.dt, model.time.inv_dt)
         adapter.update(
-            time_step,
+            model.time.dt,
             joint_penalty_scale=wp.array([2.0, 5.0], dtype=wp.float32, device=self.device),
             block_joint_metrics=True,
             mass_split_joint_metrics=False,
@@ -551,9 +557,10 @@ class TestLOXAdapter(unittest.TestCase):
             [[-0.1, 0.2, 0.1, -0.3, 0.4, 0.2], [0.3, -0.2, 0.4, -0.1, 0.2, 0.5]],
             dtype=np.float32,
         )
-        adapter.begin_time_step(time_step)
+        model.time.set_uniform_timestep(time_step)
+        adapter.begin_time_step(model.time.dt, model.time.inv_dt)
         adapter.update(
-            time_step,
+            model.time.dt,
             joint_penalty_scale=3.0,
             linearization_twist=wp.array(linearization_twist, dtype=vec6f, device=self.device),
         )
@@ -594,7 +601,7 @@ class TestLOXAdapter(unittest.TestCase):
                 expected_rhs[begin : begin + 6] -= time_step * multiplier_delta[row] * jacobian_second[row]
 
         adapter.update_structural_multipliers_from_twist(
-            time_step,
+            model.time.dt,
             tolerance,
             wp.array(linearization_twist, dtype=vec6f, device=self.device),
             wp.array(global_twist, dtype=vec6f, device=self.device),
@@ -646,11 +653,12 @@ class TestLOXAdapter(unittest.TestCase):
         adapter = LOXKaminoAdapter(model, data, jacobians, limits=limits)
         sparse_adapter = LOXKaminoAdapter(model, data, sparse_jacobians, limits=limits)
         time_step = 0.2
-        adapter.begin_time_step(time_step, limit_stabilization_fraction=0.25)
-        sparse_adapter.begin_time_step(time_step, limit_stabilization_fraction=0.25)
+        model.time.set_uniform_timestep(time_step)
+        adapter.begin_time_step(model.time.dt, model.time.inv_dt, limit_stabilization_fraction=0.25)
+        sparse_adapter.begin_time_step(model.time.dt, model.time.inv_dt, limit_stabilization_fraction=0.25)
         limits.reaction.assign(np.asarray([50.0], dtype=np.float32))
-        adapter.update(time_step)
-        sparse_adapter.update(time_step)
+        adapter.update(model.time.dt)
+        sparse_adapter.update(model.time.dt)
 
         for name in (
             "limit_jacobian_first",
@@ -681,7 +689,9 @@ class TestLOXAdapter(unittest.TestCase):
         adapter.limit_reaction.assign(np.asarray([1.4], dtype=np.float32))
         adapter.limit_velocity.assign(np.asarray([0.35], dtype=np.float32))
         adapter.write_outputs(
-            time_step, body_velocity=wp.zeros(model.size.sum_of_num_bodies, dtype=vec6f, device=self.device)
+            model.time.dt,
+            model.time.inv_dt,
+            body_velocity=wp.zeros(model.size.sum_of_num_bodies, dtype=vec6f, device=self.device),
         )
         self.assertAlmostEqual(float(limits.reaction.numpy()[0]), 7.0, places=6)
         self.assertAlmostEqual(float(limits.velocity.numpy()[0]), 0.35, places=6)
@@ -697,7 +707,8 @@ class TestLOXAdapter(unittest.TestCase):
         jacobians.build(model=model, data=data)
         adapter = LOXKaminoAdapter(model, data, jacobians)
         time_step = 0.1
-        adapter.begin_time_step(time_step)
+        model.time.set_uniform_timestep(time_step)
+        adapter.begin_time_step(model.time.dt, model.time.inv_dt)
 
         model.joints.a_j.fill_(0.75)
         model.joints.k_p_j.fill_(100.0)
@@ -712,13 +723,69 @@ class TestLOXAdapter(unittest.TestCase):
         linearization_velocity = float(dynamic_jacobian @ linearization_twist.reshape(-1))
 
         adapter.update(
-            time_step,
+            model.time.dt,
             linearization_twist=wp.array(linearization_twist, dtype=vec6f, device=self.device),
         )
 
         expected = -0.35 + 0.75 * (0.0 - 2.0) / 2.5
         expected += time_step * time_step * 100.0 * linearization_velocity / 2.5
         self.assertAlmostEqual(float(adapter.dynamic_free_velocity.numpy()[0]), expected, places=6)
+
+    def test_finite_effort_preserves_implicit_drive_matrix(self):
+        """Preserve the full implicit drive matrix for finite effort limits."""
+
+        def make_adapter(effort_limit: float) -> LOXKaminoAdapter:
+            model = build_boxes_hinged(ground=False, dynamic_joints=True, implicit_pd=True).finalize(device=self.device)
+            model.joints.tau_j_max.fill_(effort_limit)
+            data = model.data()
+            make_unilateral_constraints_info(model, data)
+            update_body_inertias(model.bodies, data.bodies)
+            compute_joints_data(model, data, q_j_p=wp.zeros_like(data.joints.q_j))
+            jacobians = DenseSystemJacobians(model=model)
+            jacobians.build(model=model, data=data)
+            result = LOXKaminoAdapter(model, data, jacobians)
+            model.time.set_uniform_timestep(0.1)
+            result.begin_time_step(model.time.dt, model.time.inv_dt)
+            result.update(model.time.dt, linearization_twist=wp.zeros(2, dtype=vec6f, device=self.device))
+            return result
+
+        unlimited = make_adapter(float("inf"))
+        finite = make_adapter(1.0)
+        np.testing.assert_array_equal(
+            finite.dynamic_effective_inertia.numpy(), unlimited.dynamic_effective_inertia.numpy()
+        )
+        np.testing.assert_array_equal(finite.dynamic_free_velocity.numpy(), unlimited.dynamic_free_velocity.numpy())
+        np.testing.assert_array_equal(finite.system.smooth_matrix.numpy(), unlimited.system.smooth_matrix.numpy())
+        np.testing.assert_array_equal(finite.system.right_hand_side.numpy(), unlimited.system.right_hand_side.numpy())
+        np.testing.assert_array_equal(finite.body_constraint_count.numpy(), unlimited.body_constraint_count.numpy())
+        np.testing.assert_array_equal(finite.body_has_unilateral.numpy(), unlimited.body_has_unilateral.numpy())
+
+        smooth_before = finite.system.smooth_matrix.numpy().copy()
+        finite.effort_counter_applied.fill_(2.0)
+        finite.system.build_candidate_right_hand_side_with_effort(
+            finite.splitting.projected_twist,
+            finite.splitting.splitting_dual,
+            finite.body_effort_offset,
+            finite.body_effort_index,
+            finite.body_effort_side,
+            finite.effort_dynamic_row_index,
+            finite.dynamic_jacobian_first,
+            finite.dynamic_jacobian_second,
+            finite.effort_counter_applied,
+        )
+
+        expected = finite.system.right_hand_side.numpy().copy()
+        body_vector_index = finite.system.body_vector_index.numpy()
+        first = int(finite.dynamic_body_first_global.numpy()[0])
+        second = int(finite.dynamic_body_second_global.numpy()[0])
+        if first >= 0:
+            start = int(body_vector_index[first])
+            expected[start : start + 6] += 2.0 * finite.dynamic_jacobian_first.numpy()[0]
+        if second >= 0:
+            start = int(body_vector_index[second])
+            expected[start : start + 6] += 2.0 * finite.dynamic_jacobian_second.numpy()[0]
+        np.testing.assert_allclose(finite.system.candidate_right_hand_side.numpy(), expected, rtol=0.0, atol=1.0e-7)
+        np.testing.assert_array_equal(finite.system.smooth_matrix.numpy(), smooth_before)
 
 
 if __name__ == "__main__":
