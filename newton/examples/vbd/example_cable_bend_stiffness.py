@@ -17,10 +17,15 @@
 # calibration and verifies the discrete cable path behaves like a linear bend
 # spring with the correct stiffness ratios.
 #
-# A reference Euler-Bernoulli deflection (delta = F * L^3 / (3 * E*I)) is also
-# rendered using E*I = bend_stiffness * segment_length. The discrete rod has a
-# slightly different effective continuum stiffness, so that overlay is a guide
-# rather than the pass/fail gate.
+# An Euler-Bernoulli small-deflection reference is rendered from the current
+# applied force:
+#
+#     w(x) = F * x^2 * (3 * L - x) / (6 * E*I),
+#     E*I = bend_stiffness * segment_length.
+#
+# The simulation is a discrete rod with a finite-size kinematic root body and a
+# force applied to the tip-body center, so the continuum overlay is a material
+# reference rather than the pass/fail gate.
 #
 # Other assertions:
 #   - Deflection decreases monotonically as bend stiffness increases.
@@ -51,7 +56,6 @@ class Example:
     CABLE_RADIUS = 0.01
     TIP_FORCE_MAX = 0.5  # N, applied in -Z at the tip body
     BEND_STIFFNESS_VALUES = (100.0, 300.0, 900.0)  # 3x ratio between consecutive cables
-    HOOKE_REFERENCE_DELTA_TIMES_K = 41.0
     Y_SEPARATION = 0.40
 
     # Slow ramp + long hold reaches a quiet steady state without oscillating.
@@ -61,18 +65,22 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
+        self._applied_force = 0.0
         self.sim_substeps = 10
-        self.sim_iterations = 10
+        self.sim_iterations = 100
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.cable_length = self.NUM_ELEMENTS * self.SEGMENT_LENGTH
         self.num_cables = len(self.BEND_STIFFNESS_VALUES)
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         self.tip_bodies: list[int] = []
         self.tip_rest_z: list[float] = []
@@ -106,8 +114,9 @@ class Example:
                 label=f"cantilever_k{int(bend_stiffness)}",
                 body_frame_origin="com",
             )
-            # Zero mass + zero inertia in Newton's VBD makes the root kinematic.
+            # Hold the root fixed for both VBD and LOX.
             root_body = rod_bodies[0]
+            builder.body_flags[root_body] = int(newton.BodyFlags.KINEMATIC)
             builder.body_mass[root_body] = 0.0
             builder.body_inv_mass[root_body] = 0.0
             builder.body_inertia[root_body] = wp.mat33(0.0)
@@ -118,7 +127,12 @@ class Example:
         builder.color()
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.lox.max_iterations = self.sim_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -186,14 +200,14 @@ class Example:
             self._simulate_substeps()
 
     def step(self):
-        F_now = self._force_at_time(self.sim_time)
-        self.simulate(F_now)
+        self._applied_force = self._force_at_time(self.sim_time)
+        self.simulate(self._applied_force)
         self.sim_time += self.frame_dt
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self._log_hooke_reference()
+        self._log_euler_bernoulli_reference()
         self.viewer.end_frame()
 
     @staticmethod
@@ -220,33 +234,49 @@ class Example:
             wp.array(np.tile(np.asarray(color, dtype=np.float32), (len(points), 1)), dtype=wp.vec3),
         )
 
-    def _log_hooke_reference(self) -> None:
+    def _log_euler_bernoulli_reference(self) -> None:
         curve_color = (0.0, 0.85, 0.35)
         marker_color = (0.0, 1.0, 0.45)
         markers = []
+        xs = np.linspace(0.0, self.cable_length, 32, dtype=np.float64)
         for i, bend_stiffness in enumerate(self.BEND_STIFFNESS_VALUES):
-            x_tip = self._tip_rest_x[i]
             y = self._tip_rest_y[i]
             z0 = self.tip_rest_z[i]
-            delta = self.HOOKE_REFERENCE_DELTA_TIMES_K / bend_stiffness
-            xs = np.linspace(0.0, x_tip, 32, dtype=np.float64)
-            s = xs / max(x_tip, 1.0e-12)
-            zs = z0 - delta * (s * s * (3.0 - s) * 0.5)
+            EI = bend_stiffness * self.SEGMENT_LENGTH
+            delta = self._euler_bernoulli_tip_deflection(bend_stiffness, self._applied_force)
+            zs = z0 - self._applied_force * xs**2 * (3.0 * self.cable_length - xs) / (6.0 * EI)
             points = np.column_stack((xs, np.full_like(xs, y), zs))
-            self._log_polyline(self.viewer, f"/bend_reference/hooke_curve_{i}", points, curve_color, 0.014)
+            self._log_polyline(
+                self.viewer,
+                f"/bend_reference/euler_bernoulli_curve_{i}",
+                points,
+                curve_color,
+                0.014,
+            )
 
-            tip = np.array([x_tip, y, z0 - delta], dtype=np.float64)
+            tip = np.array([self.cable_length, y, z0 - delta], dtype=np.float64)
             markers.append(tip)
             bar = np.array(
                 [
-                    [x_tip - 0.055, y, z0 - delta],
-                    [x_tip + 0.055, y, z0 - delta],
+                    [self.cable_length - 0.055, y, z0 - delta],
+                    [self.cable_length + 0.055, y, z0 - delta],
                 ],
                 dtype=np.float64,
             )
-            self._log_polyline(self.viewer, f"/bend_reference/tip_bar_{i}", bar, marker_color, 0.022)
+            self._log_polyline(
+                self.viewer,
+                f"/bend_reference/euler_bernoulli_tip_bar_{i}",
+                bar,
+                marker_color,
+                0.022,
+            )
 
-        self._log_point_markers("/bend_reference/tip_markers", np.asarray(markers), marker_color, 0.018)
+        self._log_point_markers(
+            "/bend_reference/euler_bernoulli_tip_markers",
+            np.asarray(markers),
+            marker_color,
+            0.018,
+        )
 
     def _measured_tip_state(self) -> list[tuple[float, float, float]]:
         """Return per-cable (deflection_z, displacement_x, displacement_y) at the tip."""
@@ -260,10 +290,11 @@ class Example:
             out.append((dz, dx, dy))
         return out
 
-    def _eb_reference_deflection(self, bend_stiffness: float) -> float:
+    def _euler_bernoulli_tip_deflection(self, bend_stiffness: float, force: float) -> float:
+        """Return the analytical small-deflection cantilever tip displacement."""
         L = self.cable_length
         EI = bend_stiffness * self.SEGMENT_LENGTH
-        return self.TIP_FORCE_MAX * L**3 / (3.0 * EI)
+        return force * L**3 / (3.0 * EI)
 
     def test_final(self):
         states = self._measured_tip_state()
@@ -304,6 +335,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.set_defaults(num_frames=int(60 * (Example.RAMP_TIME + Example.HOLD_TIME)) + 30)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
