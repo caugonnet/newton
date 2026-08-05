@@ -204,13 +204,22 @@ def _forward_level(
 
 
 @wp.kernel
+def _refresh_upper_values(
+    upper_lower_slots: wp.array[wp.int32],
+    lower_values: wp.array[wp.mat33],
+    upper_values: wp.array[wp.mat33],
+):
+    upper_slot = wp.tid()
+    upper_values[upper_slot] = wp.transpose(lower_values[upper_lower_slots[upper_slot]])
+
+
+@wp.kernel
 def _backward_level(
     level_rows: wp.array[wp.int32],
     level_start: int,
     upper_offsets: wp.array[wp.int32],
     upper_rows: wp.array[wp.int32],
-    upper_lower_slots: wp.array[wp.int32],
-    lower_values: wp.array[wp.mat33],
+    upper_values: wp.array[wp.mat33],
     inverse_diagonal_values: wp.array[wp.mat33],
     forward_solution: wp.array[wp.vec3],
     right_hand_side: wp.array[wp.vec3],
@@ -238,8 +247,7 @@ def _backward_level(
         upper_end = upper_offsets[row + 1]
         while upper_slot < upper_end:
             source_row = upper_rows[upper_slot]
-            lower_slot = upper_lower_slots[upper_slot]
-            value -= wp.transpose(lower_values[lower_slot]) * backward_solution[source_row]
+            value -= upper_values[upper_slot] * backward_solution[source_row]
             upper_slot += 1
     backward_solution[row] = value
     value *= alpha
@@ -582,6 +590,7 @@ class DeformableIncompleteLDLT:
         self.upper_offsets = wp.array(upper_offsets_np, dtype=wp.int32, device=self.device)
         self.upper_rows = wp.array(upper_rows, dtype=wp.int32, device=self.device)
         self.upper_lower_slots = wp.array(upper_lower_slots, dtype=wp.int32, device=self.device)
+        self.upper_values = wp.empty(len(upper_rows), dtype=wp.mat33, device=self.device)
 
         max_world_rows = int(np.max(np.diff(world_row_offsets_np), initial=0))
         self.uses_persistent_apply = (
@@ -643,6 +652,14 @@ class DeformableIncompleteLDLT:
                     self.inverse_diagonal_values,
                     self.world_status,
                 ],
+                device=self.device,
+            )
+        if self.upper_values.shape[0] > 0:
+            wp.launch(
+                _refresh_upper_values,
+                dim=self.upper_values.shape[0],
+                inputs=[self.upper_lower_slots, self.lower_matrix.values],
+                outputs=[self.upper_values],
                 device=self.device,
             )
 
@@ -713,8 +730,7 @@ class DeformableIncompleteLDLT:
                     level_start,
                     self.upper_offsets,
                     self.upper_rows,
-                    self.upper_lower_slots,
-                    self.lower_matrix.values,
+                    self.upper_values,
                     self.inverse_diagonal_values,
                     self.forward_solution,
                     x,
