@@ -664,8 +664,8 @@ class LOXSolver:
             raise ValueError("deformable_proximal_iterations must be a non-negative integer.")
         if not math.isfinite(deformable_proximal_relaxation) or not 0.0 <= deformable_proximal_relaxation <= 1.0:
             raise ValueError("deformable_proximal_relaxation must be finite and in [0, 1].")
-        if deformable_preconditioner not in ("incomplete_ldlt", "jacobi"):
-            raise ValueError("deformable_preconditioner must be 'incomplete_ldlt' or 'jacobi'.")
+        if deformable_preconditioner not in ("incomplete_ldlt", "block_jacobi", "jacobi"):
+            raise ValueError("deformable_preconditioner must be 'incomplete_ldlt', 'block_jacobi', or 'jacobi'.")
         if (
             not isinstance(deformable_preconditioner_fill_level, int)
             or isinstance(deformable_preconditioner_fill_level, bool)

@@ -387,9 +387,10 @@ class DeformableFEMSystem:
             raise ValueError(f"LOX deformable weight sigma must be in (0, 1], got {weight_sigma}.")
         if not np.isfinite(weight_beta) or weight_beta < 1.0:
             raise ValueError(f"LOX deformable weight beta must be at least one, got {weight_beta}.")
-        if preconditioner not in ("incomplete_ldlt", "jacobi"):
+        if preconditioner not in ("incomplete_ldlt", "block_jacobi", "jacobi"):
             raise ValueError(
-                f"LOX deformable preconditioner must be 'incomplete_ldlt' or 'jacobi', got {preconditioner!r}."
+                "LOX deformable preconditioner must be 'incomplete_ldlt', 'block_jacobi', "
+                f"or 'jacobi', got {preconditioner!r}."
             )
         if (
             not isinstance(direct_max_particles, int)
@@ -670,6 +671,7 @@ class DeformableFEMSystem:
                 self.topology.component_dof_offsets,
                 regularization=preconditioner_regularization,
                 row_active=self.packed_iterative,
+                block_diagonal=preconditioner == "block_jacobi",
             )
         else:
             assert self.direct_solver is not None

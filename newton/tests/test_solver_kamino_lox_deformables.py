@@ -36,11 +36,13 @@ _LOX_CLOTH_QUALITY_TESTS = (
 )
 
 _LOX_CLOTH_LINEAR_QUALITY_TESTS = (
+    "test_apply_block_jacobi_against_dense_diagonal",
     "test_apply_incomplete_ldlt_against_dense_factor",
     "test_batch_small_components_with_body_cholesky",
     "test_bound_persistent_apply_by_world_size_and_block_width",
     "test_build_symbolic_ic_levels_and_match_filled_dense_factor",
     "test_capture_persistent_eligible_apply_as_levels",
+    "test_capture_block_jacobi_and_batched_cr",
     "test_capture_mixed_direct_and_iterative_components",
     "test_form_scalar_consensus_weight_and_system_matrix",
     "test_match_persistent_and_level_incomplete_ldlt_apply",

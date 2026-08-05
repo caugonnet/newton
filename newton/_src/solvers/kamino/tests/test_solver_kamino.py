@@ -394,6 +394,15 @@ class TestSolverKaminoConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "'jacobi'.*'gauss_seidel'.*'apgd'.*'avbd'"):
             kamino_config.LOXSolverConfig(projection_method="invalid")
 
+        for preconditioner in ("incomplete_ldlt", "block_jacobi", "jacobi"):
+            with self.subTest(deformable_preconditioner=preconditioner):
+                self.assertEqual(
+                    kamino_config.LOXSolverConfig(deformable_preconditioner=preconditioner).deformable_preconditioner,
+                    preconditioner,
+                )
+        with self.assertRaisesRegex(ValueError, "incomplete_ldlt.*block_jacobi.*jacobi"):
+            kamino_config.LOXSolverConfig(deformable_preconditioner="invalid")
+
         for color_count in (0, 1, 2, 17):
             with self.subTest(gauss_seidel_max_colors=color_count):
                 self.assertEqual(

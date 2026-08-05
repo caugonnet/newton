@@ -575,6 +575,40 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
         self.assertGreater(jacobi_residual, 0.0)
         self.assertLess(incomplete_residual, 0.1 * jacobi_residual)
 
+    def test_apply_block_jacobi_against_dense_diagonal(self):
+        """Apply block Jacobi as the inverse of each regularized diagonal block."""
+        model = _build_grid_model(device=self.device)
+        state = model.state()
+        positions = state.particle_q.numpy()
+        positions[3] += np.array((0.16, -0.08, 0.27), dtype=np.float32)
+        state.particle_q.assign(positions)
+
+        system = DeformableClothSystem(model, preconditioner="block_jacobi")
+        system.assemble(state, _world_dt(model, 0.015, self.device))
+        preconditioner = system.preconditioner
+        diagonal = system.preconditioner_matrix.values.numpy()[system.diagonal_slots.numpy()]
+        diagonal = 0.5 * (diagonal + np.swapaxes(diagonal, 1, 2))
+        expected_inverse = np.linalg.inv(diagonal)
+        np.testing.assert_allclose(
+            preconditioner.inverse_diagonal.numpy(),
+            expected_inverse,
+            rtol=3.0e-4,
+            atol=3.0e-5,
+        )
+
+        right_hand_side_np = np.linspace(-0.8, 0.7, 3 * model.particle_count, dtype=np.float32).reshape((-1, 3))
+        right_hand_side = wp.array(right_hand_side_np, dtype=wp.vec3, device=self.device)
+        addend_np = np.linspace(0.3, -0.4, 3 * model.particle_count, dtype=np.float32).reshape((-1, 3))
+        addend = wp.array(addend_np, dtype=wp.vec3, device=self.device)
+        result = wp.empty_like(right_hand_side)
+        preconditioner.linear_operator.matvec(right_hand_side, addend, result, -0.6, 0.25)
+
+        expected = -0.6 * np.einsum("nij,nj->ni", expected_inverse, right_hand_side_np)
+        expected += 0.25 * addend_np
+        np.testing.assert_allclose(result.numpy(), expected, rtol=3.0e-4, atol=3.0e-5)
+        self.assertTrue(preconditioner.block_diagonal)
+        self.assertTrue(np.all(preconditioner.world_status.numpy() != DEFORMABLE_PRECONDITIONER_STATUS_FAILED))
+
     def test_capture_mixed_direct_and_iterative_components(self):
         """Capture batched Cholesky and CR component solves together."""
         if not self.device.is_cuda:
@@ -605,6 +639,31 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
             model,
             cr_iterations=8,
             preconditioner="jacobi",
+        )
+        center = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        system.assemble(state, _world_dt(model, 0.01, self.device))
+        system.solve_candidate(center)
+
+        with wp.ScopedCapture(device=self.device) as capture:
+            system.assemble(state, _world_dt(model, 0.01, self.device))
+            system.solve_candidate(center)
+        wp.capture_launch(capture.graph)
+
+        self.assertTrue(np.all(np.isfinite(system.smooth_velocity.numpy())))
+        self.assertTrue(np.all(np.isfinite(system.preconditioner.inverse_diagonal.numpy())))
+        self.assertTrue(np.all(system.preconditioner.world_status.numpy() != DEFORMABLE_PRECONDITIONER_STATUS_FAILED))
+        self.assertGreaterEqual(int(system.preconditioner.factorization_count.numpy()[0]), 2)
+
+    def test_capture_block_jacobi_and_batched_cr(self):
+        """Capture and replay block-Jacobi setup and batched CR."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+        model = _build_grid_model(device=self.device, world_count=2)
+        state = model.state()
+        system = DeformableClothSystem(
+            model,
+            cr_iterations=8,
+            preconditioner="block_jacobi",
         )
         center = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         system.assemble(state, _world_dt(model, 0.01, self.device))

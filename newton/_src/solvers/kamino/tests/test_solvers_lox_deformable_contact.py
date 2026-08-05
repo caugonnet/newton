@@ -15,7 +15,6 @@ from newton._src.solvers.kamino._src.solvers.lox import (
     DEFORMABLE_CONTACT_STATUS_MALFORMED,
     DEFORMABLE_CONTACT_STATUS_UNUSED,
     DEFORMABLE_CONTACT_STATUS_VALID,
-    PROJECTION_STATUS_VALID,
     DeformableClothSystem,
     DeformableContactSystem,
 )
@@ -688,7 +687,7 @@ class TestLOXDeformableContact(unittest.TestCase):
         projected_np[0] = (1.0, 0.0, -1.0)
         projected = wp.array(projected_np, dtype=wp.vec3, device=self.device)
         world_active = wp.ones(model.world_count, dtype=wp.bool, device=self.device)
-        projection_status = wp.full(model.world_count, PROJECTION_STATUS_VALID, dtype=wp.int32, device=self.device)
+        projection_status = contact.prepare_apgd_projection(rigid_coordinates=False)
         restart_dot = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
         contact.initialize_apgd(world_active, rigid_coordinates=False)
 
@@ -724,6 +723,57 @@ class TestLOXDeformableContact(unittest.TestCase):
         )
 
         np.testing.assert_allclose(contact.apgd_next.numpy()[0], expected, atol=2.0e-6)
+
+    def test_apgd_traverses_compacted_contacts_with_bounded_workers(self):
+        """Visit every compacted APGD contact with fewer workers than contacts."""
+        model, shapes, _ = _build_contact_model(device=self.device)
+        state, _, contact = self._make_system(model, 8)
+        positions = state.particle_q.numpy()
+        normal = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+        record = {
+            "indices": (0, -1, -1),
+            "barycentric": (1.0, 0.0, 0.0),
+            "shape": shapes[0],
+            "body_position": _surface_position_for_gap(
+                model,
+                positions,
+                (0, -1, -1),
+                (1.0, 0.0, 0.0),
+                shapes[0],
+                0.0,
+                normal,
+            ),
+            "normal": normal,
+        }
+        contacts = _make_contacts(device=self.device, capacity=8, records=[record, record])
+        contact.prepare(contacts, state, _world_dt(model, 0.1, self.device))
+        contact.raise_if_invalid()
+
+        projection_status = contact.prepare_apgd_projection(rigid_coordinates=False)
+        contact.apgd_worker_count = 1
+        world_active = wp.ones(model.world_count, dtype=wp.bool, device=self.device)
+        projected = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        projected.fill_((1.0, 0.0, -1.0))
+        restart_dot = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
+
+        contact.initialize_apgd(world_active, rigid_coordinates=False)
+        contact.project_apgd(
+            world_active,
+            projected,
+            None,
+            restart_dot,
+            projection_status,
+            rigid_coordinates=False,
+        )
+
+        next_reaction = contact.apgd_next.numpy()
+        np.testing.assert_allclose(next_reaction[0], next_reaction[1], atol=2.0e-6)
+        self.assertGreater(float(np.linalg.norm(next_reaction[0])), 0.0)
+        np.testing.assert_array_equal(next_reaction[2:], 0.0)
+
+        beta = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
+        contact.extrapolate_apgd(world_active, beta, projection_status, rigid_coordinates=False)
+        np.testing.assert_allclose(contact.reaction.numpy()[:2], next_reaction[:2], atol=2.0e-6)
 
     def test_accumulate_multiple_contacts_with_mass_split(self):
         """Accumulate simultaneous mass-split corrections from incident contacts."""

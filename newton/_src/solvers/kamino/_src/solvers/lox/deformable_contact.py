@@ -78,6 +78,15 @@ _BODY_FLAG_KINEMATIC = 1 << 1
 _PARTICLE_FLAG_ACTIVE = 1
 _COEFFICIENT_TOLERANCE = 1.0e-5
 _NORMAL_EPSILON = 1.0e-12
+_APGD_BLOCK_DIM = 256
+_APGD_BLOCKS_PER_SM = 2
+
+
+def _bounded_apgd_worker_count(capacity: int, device) -> int:
+    if device.is_cuda:
+        return min(capacity, max(_APGD_BLOCK_DIM, device.sm_count * _APGD_BLOCKS_PER_SM * _APGD_BLOCK_DIM))
+    return capacity
+
 
 wp.set_module_options({"enable_backward": False})
 
@@ -1505,6 +1514,11 @@ def _sweep_contacts_sequential(
 
 @wp.kernel
 def _initialize_contacts_apgd(
+    launch_dim: int,
+    world_count: int,
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_order: wp.array[wp.int32],
     contact_world: wp.array[wp.int32],
     contact_status: wp.array[wp.int32],
     normal: wp.array[wp.vec3],
@@ -1515,22 +1529,30 @@ def _initialize_contacts_apgd(
     rigid_reaction: wp.array[wp.vec3],
     trial: wp.array[wp.vec3],
 ):
-    contact = wp.tid()
-    world = contact_world[contact]
-    if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID or world < 0 or not world_active[world]:
-        return
-    value = particle_reaction[contact]
-    if rigid_coordinates:
-        value = project_contact_coulomb_cone_orthogonal(rigid_reaction[contact], friction[contact])
-        rigid_reaction[contact] = value
-    else:
-        value = _project_world_coulomb_cone(value, normal[contact], friction[contact])
-        particle_reaction[contact] = value
-    trial[contact] = value
+    lane = wp.tid()
+    total = world_contact_offset[world_count - 1] + world_contact_count[world_count - 1]
+    for ordered in range(lane, total, launch_dim):
+        contact = contact_order[ordered]
+        world = contact_world[contact]
+        if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID or world < 0 or not world_active[world]:
+            continue
+        value = particle_reaction[contact]
+        if rigid_coordinates:
+            value = project_contact_coulomb_cone_orthogonal(rigid_reaction[contact], friction[contact])
+            rigid_reaction[contact] = value
+        else:
+            value = _project_world_coulomb_cone(value, normal[contact], friction[contact])
+            particle_reaction[contact] = value
+        trial[contact] = value
 
 
 @wp.kernel
 def _scatter_contacts_apgd(
+    launch_dim: int,
+    world_count: int,
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_order: wp.array[wp.int32],
     particle_indices: wp.array2d[wp.int32],
     coefficients: wp.array2d[float],
     contact_world: wp.array[wp.int32],
@@ -1550,36 +1572,44 @@ def _scatter_contacts_apgd(
     particle_delta: wp.array[wp.vec3],
     body_delta: wp.array[vec6f],
 ):
-    contact = wp.tid()
-    world = contact_world[contact]
-    if (
-        contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
-        or world < 0
-        or not world_active[world]
-        or projection_status[world] != PROJECTION_STATUS_VALID
-    ):
-        return
-    impulse = particle_reaction[contact]
-    if rigid_coordinates:
-        impulse = rigid_reaction[contact]
-    if use_trial:
-        impulse = trial[contact]
-    world_impulse = impulse
-    if rigid_coordinates:
-        world_impulse = frame[contact] @ impulse
-    for slot in range(4):
-        particle = particle_indices[contact, slot]
-        if particle >= 0:
-            particle_correction = particle_inverse_weight[particle] * coefficients[contact, slot] * world_impulse
-            wp.atomic_add(particle_delta, particle, particle_correction)
-    body = contact_body[contact]
-    if rigid_coordinates and body >= 0:
-        body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ impulse)
-        wp.atomic_add(body_delta, body, body_correction)
+    lane = wp.tid()
+    total = world_contact_offset[world_count - 1] + world_contact_count[world_count - 1]
+    for ordered in range(lane, total, launch_dim):
+        contact = contact_order[ordered]
+        world = contact_world[contact]
+        if (
+            contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
+            or world < 0
+            or not world_active[world]
+            or projection_status[world] != PROJECTION_STATUS_VALID
+        ):
+            continue
+        impulse = particle_reaction[contact]
+        if rigid_coordinates:
+            impulse = rigid_reaction[contact]
+        if use_trial:
+            impulse = trial[contact]
+        world_impulse = impulse
+        if rigid_coordinates:
+            world_impulse = frame[contact] @ impulse
+        for slot in range(4):
+            particle = particle_indices[contact, slot]
+            if particle >= 0:
+                particle_correction = particle_inverse_weight[particle] * coefficients[contact, slot] * world_impulse
+                wp.atomic_add(particle_delta, particle, particle_correction)
+        body = contact_body[contact]
+        if rigid_coordinates and body >= 0:
+            body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ impulse)
+            wp.atomic_add(body_delta, body, body_correction)
 
 
 @wp.kernel
 def _project_contacts_apgd(
+    launch_dim: int,
+    world_count: int,
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_order: wp.array[wp.int32],
     particle_indices: wp.array2d[wp.int32],
     coefficients: wp.array2d[float],
     contact_world: wp.array[wp.int32],
@@ -1606,82 +1636,90 @@ def _project_contacts_apgd(
     projection_status: wp.array[wp.int32],
     contact_world_status: wp.array[wp.int32],
 ):
-    contact = wp.tid()
-    world = contact_world[contact]
-    if (
-        contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
-        or world < 0
-        or not world_active[world]
-        or projection_status[world] != PROJECTION_STATUS_VALID
-    ):
-        return
-    contact_frame = frame[contact]
-    velocity = bias[contact]
-    if rigid_coordinates:
-        velocity = rigid_bias[contact]
-    for slot in range(4):
-        particle = particle_indices[contact, slot]
-        if particle >= 0:
-            particle_velocity = projected_velocity[particle]
-            if rigid_coordinates:
-                particle_velocity = wp.transpose(contact_frame) @ particle_velocity
-            velocity += coefficients[contact, slot] * particle_velocity
-    body = contact_body[contact]
-    if rigid_coordinates and body >= 0:
-        velocity += body_jacobian[contact] @ projected_twist[body]
+    lane = wp.tid()
+    total = world_contact_offset[world_count - 1] + world_contact_count[world_count - 1]
+    for ordered in range(lane, total, launch_dim):
+        contact = contact_order[ordered]
+        world = contact_world[contact]
+        if (
+            contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
+            or world < 0
+            or not world_active[world]
+            or projection_status[world] != PROJECTION_STATUS_VALID
+        ):
+            continue
+        contact_frame = frame[contact]
+        velocity = bias[contact]
+        if rigid_coordinates:
+            velocity = rigid_bias[contact]
+        for slot in range(4):
+            particle = particle_indices[contact, slot]
+            if particle >= 0:
+                particle_velocity = projected_velocity[particle]
+                if rigid_coordinates:
+                    particle_velocity = wp.transpose(contact_frame) @ particle_velocity
+                velocity += coefficients[contact, slot] * particle_velocity
+        body = contact_body[contact]
+        if rigid_coordinates and body >= 0:
+            velocity += body_jacobian[contact] @ projected_twist[body]
 
-    contact_normal = normal[contact]
-    corrected = velocity
-    if rigid_coordinates:
-        tangent_speed = wp.sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1])
-        corrected[2] += friction[contact] * tangent_speed
-    else:
-        normal_velocity = wp.dot(contact_normal, velocity)
-        tangent_velocity = velocity - normal_velocity * contact_normal
-        corrected += friction[contact] * wp.length(tangent_velocity) * contact_normal
-    if not _is_finite_vec3(corrected):
-        contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
-        contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
-        projection_status[world] = PROJECTION_STATUS_INVALID
-        return
-
-    current = particle_reaction[contact]
-    local_trial = trial[contact]
-    local_delassus = scalar_delassus[contact]
-    next_value = wp.vec3(0.0)
-    if rigid_coordinates:
-        free_velocity = velocity - rigid_delassus[contact] @ local_trial
-        next_value = _solve_contact_coulomb_newton_normal_last(
-            rigid_delassus[contact],
-            free_velocity,
-            friction[contact],
-        )
-        current = rigid_reaction[contact]
-    else:
-        if not wp.isfinite(local_delassus) or local_delassus <= 0.0:
+        contact_normal = normal[contact]
+        corrected = velocity
+        if rigid_coordinates:
+            tangent_speed = wp.sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1])
+            corrected[2] += friction[contact] * tangent_speed
+        else:
+            normal_velocity = wp.dot(contact_normal, velocity)
+            tangent_velocity = velocity - normal_velocity * contact_normal
+            corrected += friction[contact] * wp.length(tangent_velocity) * contact_normal
+        if not _is_finite_vec3(corrected):
             contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
             contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
             projection_status[world] = PROJECTION_STATUS_INVALID
-            return
-        next_value = _project_world_coulomb_cone(
-            local_trial - corrected / local_delassus,
-            contact_normal,
-            friction[contact],
-        )
-    if not _is_finite_vec3(next_value):
-        contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
-        contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
-        projection_status[world] = PROJECTION_STATUS_INVALID
-        return
-    next_reaction[contact] = next_value
-    contact_velocity[contact] = velocity
-    if rigid_coordinates:
-        contact_velocity[contact] = contact_frame @ velocity
-    wp.atomic_add(restart_dot, world, wp.dot(next_value - current, -corrected))
+            continue
+
+        current = particle_reaction[contact]
+        local_trial = trial[contact]
+        local_delassus = scalar_delassus[contact]
+        next_value = wp.vec3(0.0)
+        if rigid_coordinates:
+            free_velocity = velocity - rigid_delassus[contact] @ local_trial
+            next_value = _solve_contact_coulomb_newton_normal_last(
+                rigid_delassus[contact],
+                free_velocity,
+                friction[contact],
+            )
+            current = rigid_reaction[contact]
+        else:
+            if not wp.isfinite(local_delassus) or local_delassus <= 0.0:
+                contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
+                contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
+                projection_status[world] = PROJECTION_STATUS_INVALID
+                continue
+            next_value = _project_world_coulomb_cone(
+                local_trial - corrected / local_delassus,
+                contact_normal,
+                friction[contact],
+            )
+        if not _is_finite_vec3(next_value):
+            contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
+            contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
+            projection_status[world] = PROJECTION_STATUS_INVALID
+            continue
+        next_reaction[contact] = next_value
+        contact_velocity[contact] = velocity
+        if rigid_coordinates:
+            contact_velocity[contact] = contact_frame @ velocity
+        wp.atomic_add(restart_dot, world, wp.dot(next_value - current, -corrected))
 
 
 @wp.kernel
 def _extrapolate_contacts_apgd(
+    launch_dim: int,
+    world_count: int,
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_order: wp.array[wp.int32],
     contact_world: wp.array[wp.int32],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
@@ -1693,24 +1731,27 @@ def _extrapolate_contacts_apgd(
     rigid_reaction: wp.array[wp.vec3],
     trial: wp.array[wp.vec3],
 ):
-    contact = wp.tid()
-    world = contact_world[contact]
-    if (
-        contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
-        or world < 0
-        or not world_active[world]
-        or projection_status[world] != PROJECTION_STATUS_VALID
-    ):
-        return
-    old = particle_reaction[contact]
-    if rigid_coordinates:
-        old = rigid_reaction[contact]
-    value = next_reaction[contact]
-    if rigid_coordinates:
-        rigid_reaction[contact] = value
-    else:
-        particle_reaction[contact] = value
-    trial[contact] = value + beta[world] * (value - old)
+    lane = wp.tid()
+    total = world_contact_offset[world_count - 1] + world_contact_count[world_count - 1]
+    for ordered in range(lane, total, launch_dim):
+        contact = contact_order[ordered]
+        world = contact_world[contact]
+        if (
+            contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
+            or world < 0
+            or not world_active[world]
+            or projection_status[world] != PROJECTION_STATUS_VALID
+        ):
+            continue
+        old = particle_reaction[contact]
+        if rigid_coordinates:
+            old = rigid_reaction[contact]
+        value = next_reaction[contact]
+        if rigid_coordinates:
+            rigid_reaction[contact] = value
+        else:
+            particle_reaction[contact] = value
+        trial[contact] = value + beta[world] * (value - old)
 
 
 @wp.kernel
@@ -1892,6 +1933,7 @@ class DeformableContactSystem:
         self.rigid_contact_capacity = contact_capacity
         self.self_contact_capacity = self_contact_capacity
         self.contact_capacity = total_contact_capacity
+        self.apgd_worker_count = _bounded_apgd_worker_count(self.contact_capacity, self.device)
         self.stabilization_fraction = float(stabilization_fraction)
         self.dead_zone = float(dead_zone)
         self.impact_velocity_threshold = float(impact_velocity_threshold)
@@ -1983,7 +2025,7 @@ class DeformableContactSystem:
         self.world_contact_count = wp.zeros(world_count, dtype=wp.int32, device=self.device)
         self.world_contact_offset = wp.zeros(world_count, dtype=wp.int32, device=self.device)
         self._world_contact_cursor = wp.zeros(world_count, dtype=wp.int32, device=self.device)
-        self.contact_order = wp.full(self.contact_capacity, -1, dtype=wp.int32, device=self.device)
+        self.contact_order = wp.empty(self.contact_capacity, dtype=wp.int32, device=self.device)
         self.sequential_projection_status = wp.zeros(world_count, dtype=wp.int32, device=self.device)
         self.world_status = wp.zeros(world_count, dtype=wp.int32, device=self.device)
         self.global_status = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -2315,7 +2357,6 @@ class DeformableContactSystem:
         """Compact valid contacts into device-resident per-world ranges."""
         wp.utils.array_scan(self.world_contact_count, self.world_contact_offset, inclusive=False)
         wp.copy(self._world_contact_cursor, self.world_contact_offset)
-        self.contact_order.fill_(-1)
         wp.launch(
             _scatter_contact_order,
             dim=self.contact_capacity,
@@ -2334,7 +2375,6 @@ class DeformableContactSystem:
         self.reaction.zero_()
         self.rigid_reaction.zero_()
         self.particle_delta.zero_()
-        self.contact_order.fill_(-1)
         self.sequential_projection_status.zero_()
         self._source_count = None
         self._prepared = False
@@ -2607,6 +2647,7 @@ class DeformableContactSystem:
         prepared_status: wp.array[wp.int32] | None = None,
     ) -> wp.array[wp.int32]:
         """Select the prepared status for APGD contact steps."""
+        self._build_contact_order()
         if rigid_coordinates:
             if prepared_status is None:
                 raise ValueError("Mixed APGD projection requires a prepared rigid status array.")
@@ -2626,8 +2667,13 @@ class DeformableContactSystem:
         """Project contact warm starts and initialize the extrapolated field."""
         wp.launch(
             _initialize_contacts_apgd,
-            dim=self.contact_capacity,
+            dim=self.apgd_worker_count,
             inputs=[
+                self.apgd_worker_count,
+                int(self.model.world_count),
+                self.world_contact_offset,
+                self.world_contact_count,
+                self.contact_order,
                 self.contact_world,
                 self.status,
                 self.normal,
@@ -2637,6 +2683,7 @@ class DeformableContactSystem:
             ],
             outputs=[self.reaction, self.rigid_reaction, self.apgd_trial],
             device=self.device,
+            block_dim=_APGD_BLOCK_DIM,
         )
 
     def begin_apgd_scatter(self) -> None:
@@ -2665,8 +2712,13 @@ class DeformableContactSystem:
             status = self.sequential_projection_status
         wp.launch(
             _scatter_contacts_apgd,
-            dim=self.contact_capacity,
+            dim=self.apgd_worker_count,
             inputs=[
+                self.apgd_worker_count,
+                int(self.model.world_count),
+                self.world_contact_offset,
+                self.world_contact_count,
+                self.contact_order,
                 self.particle_indices,
                 self.coefficients,
                 self.contact_world,
@@ -2686,6 +2738,7 @@ class DeformableContactSystem:
             ],
             outputs=[self.particle_delta, delta],
             device=self.device,
+            block_dim=_APGD_BLOCK_DIM,
         )
 
     def reconstruct_apgd_particle_velocity(
@@ -2723,8 +2776,13 @@ class DeformableContactSystem:
         twist = projected_twist if rigid_coordinates else self._empty_body_twist
         wp.launch(
             _project_contacts_apgd,
-            dim=self.contact_capacity,
+            dim=self.apgd_worker_count,
             inputs=[
+                self.apgd_worker_count,
+                int(self.model.world_count),
+                self.world_contact_offset,
+                self.world_contact_count,
+                self.contact_order,
                 self.particle_indices,
                 self.coefficients,
                 self.contact_world,
@@ -2754,6 +2812,7 @@ class DeformableContactSystem:
                 self.world_status,
             ],
             device=self.device,
+            block_dim=_APGD_BLOCK_DIM,
         )
 
     def extrapolate_apgd(
@@ -2766,8 +2825,13 @@ class DeformableContactSystem:
         """Commit the feasible contact iterate and build its extrapolation."""
         wp.launch(
             _extrapolate_contacts_apgd,
-            dim=self.contact_capacity,
+            dim=self.apgd_worker_count,
             inputs=[
+                self.apgd_worker_count,
+                int(self.model.world_count),
+                self.world_contact_offset,
+                self.world_contact_count,
+                self.contact_order,
                 self.contact_world,
                 self.status,
                 world_active,
@@ -2778,6 +2842,7 @@ class DeformableContactSystem:
             ],
             outputs=[self.reaction, self.rigid_reaction, self.apgd_trial],
             device=self.device,
+            block_dim=_APGD_BLOCK_DIM,
         )
 
     def begin_rigid_jacobi_accumulation(self) -> None:
