@@ -4,9 +4,8 @@
 """Matrix-free one-constraint projection primitives.
 
 Contact-facing functions use Kamino's normal-last order
-``(tangent_x, tangent_y, normal_z)``. Only the local Coulomb--Newton solve uses
-normal-first vectors, through the explicit adapters in this module. Body
-twists and Jacobian columns use Kamino's linear-first 6D convention.
+``(tangent_x, tangent_y, normal_z)``. Body twists and Jacobian columns use
+Kamino's linear-first 6D convention.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
-from .contact import solve_contact_coulomb_newton
+from .contact import _solve_contact_coulomb_newton_normal_last
 
 __all__ = [
     "PROJECTION_STATUS_INVALID",
@@ -108,7 +107,6 @@ class ContactProjectionData:
     """Contact data that is invariant throughout a body-space solve."""
 
     delassus: wp.mat33f
-    delassus_normal_first: wp.mat33f
     status: wp.int32
 
 
@@ -278,7 +276,6 @@ def prepare_contact_coulomb_delassus(
     """Validate and, when numerically marginal, regularize a contact block."""
     result = ContactProjectionData()
     result.delassus = delassus
-    result.delassus_normal_first = convert_contact_matrix_normal_last_to_first(delassus)
     result.status = PROJECTION_STATUS_INVALID
     if not _is_finite_vec3(velocity_bias) or not wp.isfinite(friction) or friction < 0.0:
         return result
@@ -316,7 +313,6 @@ def prepare_contact_coulomb_delassus(
     else:
         result.status = PROJECTION_STATUS_VALID
     result.delassus = symmetric
-    result.delassus_normal_first = convert_contact_matrix_normal_last_to_first(symmetric)
     return result
 
 
@@ -329,7 +325,7 @@ def prepare_contact_coulomb(
     velocity_bias: wp.vec3f,
     friction: wp.float32,
 ) -> ContactProjectionData:
-    """Validate fixed inputs and prepare the normal-first contact block."""
+    """Validate fixed inputs and prepare the normal-last contact block."""
     result = prepare_contact_coulomb_delassus(
         compute_contact_delassus(
             jacobian_first,
@@ -433,12 +429,7 @@ def project_contact_coulomb(
         )
 
     free_velocity = current_velocity - delassus @ reaction_old
-    reaction_new_normal_first = solve_contact_coulomb_newton(
-        data.delassus_normal_first,
-        convert_contact_vector_normal_last_to_first(free_velocity),
-        friction,
-    )
-    reaction_new = convert_contact_vector_normal_first_to_last(reaction_new_normal_first)
+    reaction_new = _solve_contact_coulomb_newton_normal_last(data.delassus, free_velocity, friction)
     reaction_delta = reaction_new - reaction_old
     twist_first_new = twist_first + inverse_weight_first @ (wp.transpose(jacobian_first) @ reaction_delta)
     twist_second_new = twist_second + inverse_weight_second @ (wp.transpose(jacobian_second) @ reaction_delta)
@@ -477,12 +468,10 @@ def project_contact_coulomb_prepared(
     reaction_old: wp.vec3f,
     friction: wp.float32,
     delassus: wp.mat33f,
-    delassus_normal_first: wp.mat33f,
 ) -> ContactSweepResult:
     """Perform the changing work of a prepared Coulomb contact update."""
     current_velocity = jacobian_first @ twist_first + jacobian_second @ twist_second + velocity_bias
-    reaction_old_normal_first = convert_contact_vector_normal_last_to_first(reaction_old)
-    free_velocity_normal_first = convert_contact_vector_normal_last_to_first(current_velocity - delassus @ reaction_old)
+    free_velocity = current_velocity - delassus @ reaction_old
 
     result = ContactSweepResult()
     result.twist_first = twist_first
@@ -490,17 +479,11 @@ def project_contact_coulomb_prepared(
     result.reaction = reaction_old
     result.velocity = current_velocity
     result.status = PROJECTION_STATUS_INVALID
-    if not _is_finite_vec3(free_velocity_normal_first):
+    if not _is_finite_vec3(free_velocity):
         return result
 
-    reaction_new_normal_first = solve_contact_coulomb_newton(
-        delassus_normal_first,
-        free_velocity_normal_first,
-        friction,
-    )
-    reaction_delta_normal_first = reaction_new_normal_first - reaction_old_normal_first
-    reaction_new = convert_contact_vector_normal_first_to_last(reaction_new_normal_first)
-    reaction_delta = convert_contact_vector_normal_first_to_last(reaction_delta_normal_first)
+    reaction_new = _solve_contact_coulomb_newton_normal_last(delassus, free_velocity, friction)
+    reaction_delta = reaction_new - reaction_old
     twist_first_new = twist_first + inverse_weight_first @ (wp.transpose(jacobian_first) @ reaction_delta)
     twist_second_new = twist_second + inverse_weight_second @ (wp.transpose(jacobian_second) @ reaction_delta)
     velocity_new = jacobian_first @ twist_first_new + jacobian_second @ twist_second_new + velocity_bias

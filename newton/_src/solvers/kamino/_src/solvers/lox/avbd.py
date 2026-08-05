@@ -8,14 +8,11 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
-from .contact import solve_contact_coulomb_newton
+from .contact import _solve_contact_coulomb_newton_normal_last
 from .deformable_contact import DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE, DEFORMABLE_CONTACT_STATUS_VALID
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
-    convert_contact_matrix_normal_last_to_first,
-    convert_contact_vector_normal_first_to_last,
-    convert_contact_vector_normal_last_to_first,
     project_contact_coulomb_cone_orthogonal,
 )
 
@@ -265,7 +262,6 @@ def _evaluate_rigid_contact_resolvent(
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     world_active: wp.array[wp.bool],
     projection_status: wp.array[wp.int32],
     projected_twist: wp.array[vec6f],
@@ -291,12 +287,10 @@ def _evaluate_rigid_contact_resolvent(
     if second >= 0:
         velocity += contact_jacobian_second[contact] @ projected_twist[second]
     free_velocity = velocity - contact_delassus[contact] @ contact_reaction[contact]
-    value = convert_contact_vector_normal_first_to_last(
-        solve_contact_coulomb_newton(
-            contact_delassus_normal_first[contact],
-            convert_contact_vector_normal_last_to_first(free_velocity),
-            contact_friction[contact],
-        )
+    value = _solve_contact_coulomb_newton_normal_last(
+        contact_delassus[contact],
+        free_velocity,
+        contact_friction[contact],
     )
     if not _is_finite_vec3(value):
         projection_status[world] = PROJECTION_STATUS_INVALID
@@ -504,7 +498,6 @@ def _update_rigid_duals(
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     limit_world: wp.array[wp.int32],
     limit_local: wp.array[wp.int32],
     world_limit_count: wp.array[wp.int32],
@@ -560,12 +553,10 @@ def _update_rigid_duals(
         if second >= 0:
             contact_velocity += contact_jacobian_second[constraint] @ projected_twist[second]
         free_velocity = contact_velocity - contact_delassus[constraint] @ contact_reaction[constraint]
-        value = convert_contact_vector_normal_first_to_last(
-            solve_contact_coulomb_newton(
-                contact_delassus_normal_first[constraint],
-                convert_contact_vector_normal_last_to_first(free_velocity),
-                contact_friction[constraint],
-            )
+        value = _solve_contact_coulomb_newton_normal_last(
+            contact_delassus[constraint],
+            free_velocity,
+            contact_friction[constraint],
         )
         if not _is_finite_vec3(value):
             projection_status[world] = PROJECTION_STATUS_INVALID
@@ -602,14 +593,12 @@ def _prepare_deformable_penalties(
     body_inverse_weight: wp.array[mat66f],
     include_rigid: bool,
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     inverse_delassus: wp.array[wp.mat33f],
     contact_world_status: wp.array[wp.int32],
     projection_status: wp.array[wp.int32],
 ):
     contact = wp.tid()
     delassus[contact] = wp.mat33f(0.0)
-    delassus_normal_first[contact] = wp.mat33f(0.0)
     inverse_delassus[contact] = wp.mat33f(0.0)
     if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
         return
@@ -637,7 +626,6 @@ def _prepare_deformable_penalties(
         projection_status[world] = PROJECTION_STATUS_INVALID
         return
     delassus[contact] = block
-    delassus_normal_first[contact] = convert_contact_matrix_normal_last_to_first(block)
     inverse_delassus[contact] = block_inverse
 
 
@@ -700,7 +688,6 @@ def _evaluate_deformable_contact_resolvent(
     rigid_bias: wp.array[wp.vec3f],
     friction: wp.array[wp.float32],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     projection_status: wp.array[wp.int32],
@@ -739,12 +726,10 @@ def _evaluate_deformable_contact_resolvent(
         velocity = wp.transpose(contact_frame) @ velocity
         reaction = wp.transpose(contact_frame) @ particle_reaction[contact]
     free_velocity = velocity - delassus[contact] @ reaction
-    resolved = convert_contact_vector_normal_first_to_last(
-        solve_contact_coulomb_newton(
-            delassus_normal_first[contact],
-            convert_contact_vector_normal_last_to_first(free_velocity),
-            friction[contact],
-        )
+    resolved = _solve_contact_coulomb_newton_normal_last(
+        delassus[contact],
+        free_velocity,
+        friction[contact],
     )
     if not _is_finite_vec3(resolved):
         projection_status[world] = PROJECTION_STATUS_INVALID
@@ -864,7 +849,6 @@ def _update_deformable_duals(
     rigid_bias: wp.array[wp.vec3f],
     friction: wp.array[wp.float32],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     projection_status: wp.array[wp.int32],
@@ -902,12 +886,10 @@ def _update_deformable_duals(
         velocity = wp.transpose(contact_frame) @ velocity
         reaction = wp.transpose(contact_frame) @ particle_reaction[contact]
     free_velocity = velocity - delassus[contact] @ reaction
-    resolved = convert_contact_vector_normal_first_to_last(
-        solve_contact_coulomb_newton(
-            delassus_normal_first[contact],
-            convert_contact_vector_normal_last_to_first(free_velocity),
-            friction[contact],
-        )
+    resolved = _solve_contact_coulomb_newton_normal_last(
+        delassus[contact],
+        free_velocity,
+        friction[contact],
     )
     if not _is_finite_vec3(resolved):
         projection_status[world] = PROJECTION_STATUS_INVALID
@@ -1187,7 +1169,6 @@ def _prepare_deformable(contact_system, world_active, projection_status, body_in
         ],
         outputs=[
             contact_system.avbd_delassus,
-            contact_system.avbd_delassus_normal_first,
             contact_system.avbd_inverse_delassus,
             contact_system.world_status,
             projection_status,
@@ -1381,7 +1362,6 @@ def _update_rigid(adapter, world_active, projected_twist) -> None:
             adapter.contact_bias,
             adapter.contact_friction,
             adapter.contact_projection_delassus,
-            adapter.contact_projection_delassus_normal_first,
             adapter.limit_world,
             adapter.limit_local,
             adapter.world_limit_count,
@@ -1417,7 +1397,6 @@ def _evaluate_rigid_contacts(adapter, world_active, projected_twist) -> None:
             adapter.contact_bias,
             adapter.contact_friction,
             adapter.contact_projection_delassus,
-            adapter.contact_projection_delassus_normal_first,
             world_active,
             adapter.projection_status,
             projected_twist,
@@ -1445,7 +1424,6 @@ def _update_deformable(
             contact_system.rigid_bias,
             contact_system.friction,
             contact_system.avbd_delassus,
-            contact_system.avbd_delassus_normal_first,
             contact_system.status,
             world_active,
             projection_status,
@@ -1475,7 +1453,6 @@ def _evaluate_deformable_contacts(
             contact_system.rigid_bias,
             contact_system.friction,
             contact_system.avbd_delassus,
-            contact_system.avbd_delassus_normal_first,
             contact_system.status,
             world_active,
             projection_status,

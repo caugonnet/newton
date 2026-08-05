@@ -361,9 +361,10 @@ class Example:
         )
 
         self.state_0 = self.model.state()
-        self.state_1 = self.model.state()
+        self.state_1 = self.model.state() if self.solver_type == "vbd" else None
         self.control = self.model.control()
         self.contacts = self.pipeline.contacts()
+        self.graph = None
 
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "renderer"):
@@ -373,23 +374,46 @@ class Example:
         if hasattr(self.viewer, "set_camera"):
             self.viewer.set_camera(wp.vec3(0.41, -0.72, 0.54), -5.3, 121.5)
 
+        self.capture()
+
+    def capture(self):
+        """Warm up and capture the LOX solve on a single simulation state."""
+        if self.solver_type != "lox" or not self.model.device.is_cuda or wp.config.verify_cuda:
+            return
+
+        # Initialize lazy contact/solver storage before capture, then restore
+        # both simulation and contact-matching state.
+        self.pipeline.collide(self.state_0, self.contacts)
+        self.solver.step(self.state_0, self.state_0, self.control, self.contacts, self.sim_dt)
+        self.solver.reset(self.state_0)
+        self.pipeline.reset_contact_matching()
+
+        with wp.ScopedCapture(self.model.device) as capture:
+            self.solver.step(self.state_0, self.state_0, self.control, self.contacts, self.sim_dt)
+        self.graph = capture.graph
+
     def simulate(self):
         dz = 0.0
         if self.frame > self.params["settle_frames"]:
             dz = self.params["lift_speed"] * (self.frame - self.params["settle_frames"]) * self.frame_dt
 
         for _ in range(self.sim_substeps):
+            state_1 = self.state_0 if self.state_1 is None else self.state_1
             wp.launch(
                 lift_pinned_vertices,
                 dim=self.pinned_indices.shape[0],
                 inputs=[self.pinned_indices, self.pinned_original, dz],
-                outputs=[self.state_0.particle_q, self.state_1.particle_q],
+                outputs=[self.state_0.particle_q, state_1.particle_q],
             )
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.pipeline.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
+            if self.graph is None:
+                self.solver.step(self.state_0, state_1, self.control, self.contacts, self.sim_dt)
+            else:
+                wp.capture_launch(self.graph)
+            if self.state_1 is not None:
+                self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
         self.frame += 1

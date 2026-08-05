@@ -23,12 +23,13 @@ def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: 
     del loader, tests, pattern
     return unittest.TestSuite(
         (
-            TestSolverKaminoLOX("test_cuda_graph_capture"),
+            TestSolverKaminoLOX("test_cuda_graph_capture_uses_conditional_loop"),
             TestLOXDeformableSystem("test_capture_frozen_assembly"),
             TestLOXDeformableLinearSolve("test_capture_factorization_and_batched_cr"),
             TestLOXDeformableLinearSolve("test_capture_mixed_direct_and_iterative_components"),
             TestLOXDeformableContact("test_capture_contact_prepare_projection_and_residuals"),
             TestLOXDeformableIntegration("test_capture_public_pure_cloth_step"),
+            TestLOXDeformableIntegration("test_capture_step_in_place_matches_ping_pong_with_nonzero_body_com"),
         )
     )
 

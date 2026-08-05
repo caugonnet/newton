@@ -8,7 +8,7 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
-from .contact import solve_contact_coulomb_newton
+from .contact import _solve_contact_coulomb_newton_normal_last
 from .deformable_contact import (
     DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS,
     DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE,
@@ -20,8 +20,6 @@ from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
     compute_limit_delassus,
-    convert_contact_vector_normal_first_to_last,
-    convert_contact_vector_normal_last_to_first,
     prepare_contact_coulomb,
     prepare_contact_coulomb_delassus,
 )
@@ -632,7 +630,6 @@ def _prepare_contacts_colored(
     occupancy: wp.array2d[wp.int32],
     inverse_weight: wp.array[mat66f],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_status: wp.array[wp.int32],
 ):
     lane = wp.tid()
@@ -644,7 +641,6 @@ def _prepare_contacts_colored(
         second = endpoint_second[constraint]
         if first < 0 and second < 0:
             delassus[constraint] = wp.mat33f(0.0)
-            delassus_normal_first[constraint] = wp.mat33f(0.0)
             continue
         inverse_first = mat66f(0.0)
         inverse_second = mat66f(0.0)
@@ -661,7 +657,6 @@ def _prepare_contacts_colored(
             friction[constraint],
         )
         delassus[constraint] = data.delassus
-        delassus_normal_first[constraint] = data.delassus_normal_first
         if data.status == PROJECTION_STATUS_INVALID:
             world_status[constraint_world[constraint]] = data.status
 
@@ -700,7 +695,6 @@ def _prepare_rigid_colored(
     inverse_weight: wp.array[mat66f],
     friction_delassus: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     limit_delassus: wp.array[wp.float32],
     world_status: wp.array[wp.int32],
 ):
@@ -738,7 +732,6 @@ def _prepare_rigid_colored(
         second = contact_second[constraint]
         if first < 0 and second < 0:
             contact_delassus[constraint] = wp.mat33f(0.0)
-            contact_delassus_normal_first[constraint] = wp.mat33f(0.0)
             continue
         inverse_first = mat66f(0.0)
         inverse_second = mat66f(0.0)
@@ -755,7 +748,6 @@ def _prepare_rigid_colored(
             contact_friction[constraint],
         )
         contact_delassus[constraint] = data.delassus
-        contact_delassus_normal_first[constraint] = data.delassus_normal_first
         if data.status == PROJECTION_STATUS_INVALID:
             world_status[contact_world[constraint]] = data.status
 
@@ -804,7 +796,6 @@ def _prepare_deformable_colored(
     contact_status: wp.array[wp.int32],
     scalar_delassus: wp.array[wp.float32],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     prepared_status: wp.array[wp.int32],
     contact_world_status: wp.array[wp.int32],
     invalid_count: wp.array[wp.int32],
@@ -832,7 +823,6 @@ def _prepare_deformable_colored(
         data = prepare_contact_coulomb_delassus(value, rigid_bias[contact], friction[contact])
         scalar_delassus[contact] = particle_value
         delassus[contact] = data.delassus
-        delassus_normal_first[contact] = data.delassus_normal_first
         if data.status == PROJECTION_STATUS_INVALID or (not include_rigid and particle_value <= 0.0):
             contact_status[contact] = DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS
             world = contact_world[contact]
@@ -1033,7 +1023,6 @@ def _project_contacts_colored(
     bias: wp.array[wp.vec3f],
     friction: wp.array[wp.float32],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_active: wp.array[wp.bool],
     occupancy: wp.array2d[wp.int32],
     inverse_weight: wp.array[mat66f],
@@ -1065,9 +1054,9 @@ def _project_contacts_colored(
         velocity = (
             jacobian_first[constraint] @ twist_first + jacobian_second[constraint] @ twist_second + bias[constraint]
         )
-        free = convert_contact_vector_normal_last_to_first(velocity - delassus[constraint] @ old)
-        new_nf = solve_contact_coulomb_newton(delassus_normal_first[constraint], free, friction[constraint])
-        new = convert_contact_vector_normal_first_to_last(new_nf)
+        contact_block = delassus[constraint]
+        free = velocity - contact_block @ old
+        new = _solve_contact_coulomb_newton_normal_last(contact_block, free, friction[constraint])
         delta = new - old
         if not _finite_vec3(new) or not _finite_vec3(delta):
             world_status[world] = PROJECTION_STATUS_INVALID
@@ -1118,7 +1107,6 @@ def _project_rigid_colored(
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     limit_counts: wp.array[wp.int32],
     limit_offsets: wp.array[wp.int32],
     limit_order: wp.array[wp.int32],
@@ -1212,13 +1200,9 @@ def _project_rigid_colored(
             + contact_jacobian_second[constraint] @ twist_second
             + contact_bias[constraint]
         )
-        free = convert_contact_vector_normal_last_to_first(
-            contact_velocity - contact_delassus[constraint] @ contact_old
-        )
-        new_nf = solve_contact_coulomb_newton(
-            contact_delassus_normal_first[constraint], free, contact_friction[constraint]
-        )
-        contact_new = convert_contact_vector_normal_first_to_last(new_nf)
+        contact_block = contact_delassus[constraint]
+        free = contact_velocity - contact_block @ contact_old
+        contact_new = _solve_contact_coulomb_newton_normal_last(contact_block, free, contact_friction[constraint])
         contact_delta = contact_new - contact_old
         if not _finite_vec3(contact_new) or not _finite_vec3(contact_delta):
             world_status[world] = PROJECTION_STATUS_INVALID
@@ -1311,7 +1295,6 @@ def _project_deformable_colored(
     friction: wp.array[wp.float32],
     scalar_delassus: wp.array[wp.float32],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     particle_occupancy: wp.array2d[wp.int32],
@@ -1358,10 +1341,9 @@ def _project_deformable_colored(
         new = wp.vec3f(0.0)
         if include_rigid:
             old = rigid_reaction[contact]
-            free = convert_contact_vector_normal_last_to_first(velocity - delassus[contact] @ old)
-            new = convert_contact_vector_normal_first_to_last(
-                solve_contact_coulomb_newton(delassus_normal_first[contact], free, friction[contact])
-            )
+            contact_block = delassus[contact]
+            free = velocity - contact_block @ old
+            new = _solve_contact_coulomb_newton_normal_last(contact_block, free, friction[contact])
         else:
             value = scalar_delassus[contact]
             new = project_deformable_contact_coulomb(velocity - value * old, normal[contact], value, friction[contact])
@@ -1553,11 +1535,11 @@ class ColoredGaussSeidelProjection:
         )
         self.friction_delassus = wp.zeros(self.friction.capacity, dtype=wp.float32, device=self.device)
         self.contact_delassus = wp.zeros(self.contact.capacity, dtype=wp.mat33f, device=self.device)
-        self.contact_delassus_normal_first = wp.zeros(self.contact.capacity, dtype=wp.mat33f, device=self.device)
         self.limit_delassus = wp.zeros(self.limit.capacity, dtype=wp.float32, device=self.device)
         self._families = (self.friction, self.contact, self.limit)
         self.rigid_worker_count = _bounded_worker_count(rigid_capacity, self.device)
-        self.deformable_worker_count = self.deformable.worker_count
+        deformable_per_color_capacity = (self.deformable.capacity + self.color_count - 1) // self.color_count
+        self.deformable_projection_worker_count = _bounded_worker_count(deformable_per_color_capacity, self.device)
         self._fuse_rigid_families = sum(family.capacity > 0 for family in self._families) > 1
         self.apply_worker_count = _bounded_worker_count(max(body_count, particle_count), self.device)
         # Split domain kernels preserve occupancy on older architectures; launch fusion wins on Blackwell and newer.
@@ -1745,7 +1727,6 @@ class ColoredGaussSeidelProjection:
                 inverse_weight,
                 adapter.friction_projection_delassus,
                 adapter.contact_projection_delassus,
-                adapter.contact_projection_delassus_normal_first,
                 adapter.limit_projection_delassus,
                 prepared_status,
             )
@@ -1798,7 +1779,6 @@ class ColoredGaussSeidelProjection:
                             outputs=[
                                 self.friction_delassus,
                                 self.contact_delassus,
-                                self.contact_delassus_normal_first,
                                 self.limit_delassus,
                                 prepared_status,
                             ],
@@ -1848,11 +1828,7 @@ class ColoredGaussSeidelProjection:
                                     self.body_occupancy,
                                     inverse_weight,
                                 ],
-                                outputs=[
-                                    self.contact_delassus,
-                                    self.contact_delassus_normal_first,
-                                    prepared_status,
-                                ],
+                                outputs=[self.contact_delassus, prepared_status],
                                 device=self.device,
                                 block_dim=_COLOR_BLOCK_DIM,
                             )
@@ -1911,7 +1887,6 @@ class ColoredGaussSeidelProjection:
                         deformable.status,
                         deformable.gauss_seidel_scalar_delassus,
                         deformable.gauss_seidel_delassus,
-                        deformable.gauss_seidel_delassus_normal_first,
                         prepared_status,
                         deformable.world_status,
                         deformable.invalid_count,
@@ -2092,7 +2067,6 @@ class ColoredGaussSeidelProjection:
                                     adapter.contact_bias,
                                     adapter.contact_friction,
                                     self.contact_delassus,
-                                    self.contact_delassus_normal_first,
                                     self.limit.counts,
                                     self.limit.offsets,
                                     self.limit.order,
@@ -2162,7 +2136,6 @@ class ColoredGaussSeidelProjection:
                                     adapter.contact_bias,
                                     adapter.contact_friction,
                                     self.contact_delassus,
-                                    self.contact_delassus_normal_first,
                                     world_active,
                                     self.body_occupancy,
                                     inverse_weight,
@@ -2205,9 +2178,9 @@ class ColoredGaussSeidelProjection:
                     body_delta = twist_delta if include_rigid else deformable._empty_body_twist
                     wp.launch(
                         _project_deformable_colored,
-                        dim=self.deformable.worker_count,
+                        dim=self.deformable_projection_worker_count,
                         inputs=[
-                            self.deformable.worker_count,
+                            self.deformable_projection_worker_count,
                             color,
                             self.deformable.counts,
                             self.deformable.offsets,
@@ -2224,7 +2197,6 @@ class ColoredGaussSeidelProjection:
                             deformable.friction,
                             deformable.gauss_seidel_scalar_delassus,
                             deformable.gauss_seidel_delassus,
-                            deformable.gauss_seidel_delassus_normal_first,
                             deformable.status,
                             world_active,
                             self.particle_occupancy,
@@ -2305,7 +2277,6 @@ class ColoredGaussSeidelProjection:
                 adapter.contact_bias,
                 adapter.contact_friction,
                 adapter.contact_projection_delassus,
-                adapter.contact_projection_delassus_normal_first,
                 adapter.limit_world,
                 adapter.limit_local,
                 adapter.world_limit_count,

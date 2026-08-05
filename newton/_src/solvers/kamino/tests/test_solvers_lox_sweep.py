@@ -200,7 +200,6 @@ class TestLOXSweep(unittest.TestCase):
         contact_bias = wp.zeros(2, dtype=wp.vec3f, device=self.device)
         contact_friction = wp.zeros(2, dtype=wp.float32, device=self.device)
         contact_delassus = wp.zeros(2, dtype=wp.mat33f, device=self.device)
-        contact_delassus_normal_first = wp.zeros(2, dtype=wp.mat33f, device=self.device)
         contact_reaction = wp.zeros(2, dtype=wp.vec3f, device=self.device)
 
         empty_int = wp.empty(0, dtype=wp.int32, device=self.device)
@@ -240,7 +239,6 @@ class TestLOXSweep(unittest.TestCase):
             inverse_weight,
             empty_float,
             contact_delassus,
-            contact_delassus_normal_first,
             empty_float,
             prepared_status,
         )
@@ -267,7 +265,6 @@ class TestLOXSweep(unittest.TestCase):
             contact_bias,
             contact_friction,
             contact_delassus,
-            contact_delassus_normal_first,
             empty_int,
             empty_int,
             world_limit_count,
@@ -331,7 +328,6 @@ class TestLOXSweep(unittest.TestCase):
         adapter.contact_reaction = wp.zeros(1, dtype=wp.vec3f, device=device)
         adapter.contact_velocity = wp.zeros(1, dtype=wp.vec3f, device=device)
         adapter.contact_projection_delassus = wp.zeros(1, dtype=wp.mat33f, device=device)
-        adapter.contact_projection_delassus_normal_first = wp.zeros(1, dtype=wp.mat33f, device=device)
         adapter.contact_apgd_trial = wp.zeros(1, dtype=wp.vec3f, device=device)
         adapter.contact_apgd_next = wp.zeros(1, dtype=wp.vec3f, device=device)
 
@@ -388,7 +384,6 @@ class TestLOXSweep(unittest.TestCase):
             inverse_weight,
             adapter.friction_projection_delassus,
             adapter.contact_projection_delassus,
-            adapter.contact_projection_delassus_normal_first,
             adapter.limit_projection_delassus,
             adapter.world_jacobi_projection_status,
         )
@@ -423,7 +418,6 @@ class TestLOXSweep(unittest.TestCase):
             adapter.contact_bias,
             adapter.contact_friction,
             adapter.contact_projection_delassus,
-            adapter.contact_projection_delassus_normal_first,
             adapter.limit_world,
             adapter.limit_local,
             adapter.world_limit_count,

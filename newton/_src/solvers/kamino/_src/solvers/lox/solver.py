@@ -1362,7 +1362,6 @@ class LOXSolver:
                 self.system.inverse_weight,
                 adapter.friction_projection_delassus,
                 adapter.contact_projection_delassus,
-                adapter.contact_projection_delassus_normal_first,
                 adapter.limit_projection_delassus,
                 adapter.world_jacobi_projection_status,
             )
@@ -1394,7 +1393,6 @@ class LOXSolver:
                 adapter.contact_friction,
                 self.system.inverse_weight,
                 adapter.contact_projection_delassus,
-                adapter.contact_projection_delassus_normal_first,
                 adapter.world_contact_projection_status,
             )
             if self._deformable_contacts_active:
@@ -1435,7 +1433,6 @@ class LOXSolver:
                 adapter.contact_bias,
                 adapter.contact_friction,
                 adapter.contact_projection_delassus,
-                adapter.contact_projection_delassus_normal_first,
                 adapter.limit_world,
                 adapter.limit_local,
                 adapter.world_limit_count,
@@ -1540,7 +1537,6 @@ class LOXSolver:
                 adapter.limit_velocity,
                 adapter.projection_status,
                 adapter.contact_projection_delassus,
-                adapter.contact_projection_delassus_normal_first,
                 adapter.world_contact_projection_status,
             )
         elif self.projection_method == "gauss_seidel":
@@ -1596,7 +1592,6 @@ class LOXSolver:
                     adapter.contact_jacobian_first,
                     adapter.contact_jacobian_second,
                     adapter.contact_projection_delassus,
-                    adapter.contact_projection_delassus_normal_first,
                     adapter.contact_bias,
                     adapter.contact_friction,
                     adapter.world_limit_offset,

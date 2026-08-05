@@ -1108,12 +1108,15 @@ class SolverKamino(SolverBase, CouplingInterface):
             dt=dt,
         )
 
-        # Convert back from Kamino CoM-frame to Newton body-frame poses
-        self._kamino.convert_body_com_to_origin(
-            body_com=self._model_kamino.bodies.i_r_com_i,
-            body_q_com=state_in_kamino.q_i,
-            body_q=state_in_kamino.q_i,
-        )
+        # Convert back from Kamino CoM-frame to Newton body-frame poses. When
+        # stepping in place, the output write replaced the aliased input pose,
+        # so converting it twice would apply the CoM offset twice.
+        if state_in_kamino.q_i.ptr != state_out_kamino.q_i.ptr:
+            self._kamino.convert_body_com_to_origin(
+                body_com=self._model_kamino.bodies.i_r_com_i,
+                body_q_com=state_in_kamino.q_i,
+                body_q=state_in_kamino.q_i,
+            )
         self._kamino.convert_body_com_to_origin(
             body_com=self._model_kamino.bodies.i_r_com_i,
             body_q_com=state_out_kamino.q_i,

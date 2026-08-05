@@ -67,7 +67,6 @@ def _make_adapter(device, endpoints):
         contact_bias=wp.zeros(count, dtype=wp.vec3f, device=device),
         contact_friction=wp.zeros(count, dtype=wp.float32, device=device),
         contact_projection_delassus=wp.zeros(count, dtype=wp.mat33f, device=device),
-        contact_projection_delassus_normal_first=wp.zeros(count, dtype=wp.mat33f, device=device),
         contact_reaction=wp.zeros(count, dtype=wp.vec3f, device=device),
         limit_capacity=0,
         limit_world=empty_int,
@@ -163,9 +162,7 @@ def _make_deformable(device, *, body, status, world_status, global_status):
         status=wp.full(1, status, dtype=wp.int32, device=device),
         gauss_seidel_scalar_delassus=wp.zeros(1, dtype=wp.float32, device=device),
         gauss_seidel_delassus=wp.zeros(1, dtype=wp.mat33f, device=device),
-        gauss_seidel_delassus_normal_first=wp.zeros(1, dtype=wp.mat33f, device=device),
         rigid_delassus=wp.zeros(1, dtype=wp.mat33f, device=device),
-        rigid_delassus_normal_first=wp.zeros(1, dtype=wp.mat33f, device=device),
         reaction=wp.zeros(1, dtype=wp.vec3f, device=device),
         rigid_reaction=wp.zeros(1, dtype=wp.vec3f, device=device),
         particle_delta=wp.zeros(1, dtype=wp.vec3f, device=device),
@@ -185,6 +182,101 @@ def _make_deformable(device, *, body, status, world_status, global_status):
 
     deformable.prepare_rigid_projection = prepare_rigid_projection
     return deformable
+
+
+def _make_deformable_projection_case(device, counts):
+    counts = np.asarray(counts, dtype=np.int32)
+    color_count = len(counts)
+    capacity = int(np.sum(counts))
+    offsets = np.zeros(color_count, dtype=np.int32)
+    if color_count > 1:
+        offsets[1:] = np.cumsum(counts[:-1], dtype=np.int32)
+    particle_indices = np.full((capacity, 4), -1, dtype=np.int32)
+    particle_indices[:, 0] = np.arange(capacity, dtype=np.int32)
+    coefficients = np.zeros((capacity, 4), dtype=np.float32)
+    coefficients[:, 0] = 1.0
+    bias = np.zeros((capacity, 3), dtype=np.float32)
+    bias[:, 2] = -(np.arange(capacity, dtype=np.float32) + 1.0)
+    case = SimpleNamespace(
+        capacity=capacity,
+        color_count=color_count,
+        counts=wp.array(counts, dtype=wp.int32, device=device),
+        offsets=wp.array(offsets, dtype=wp.int32, device=device),
+        order=wp.array(np.arange(capacity, dtype=np.int32), dtype=wp.int32, device=device),
+        particle_indices=wp.array(particle_indices, dtype=wp.int32, device=device),
+        coefficients=wp.array(coefficients, dtype=wp.float32, device=device),
+        contact_world=wp.zeros(capacity, dtype=wp.int32, device=device),
+        body=wp.full(capacity, -1, dtype=wp.int32, device=device),
+        normal=wp.array(np.tile([0.0, 0.0, 1.0], (capacity, 1)), dtype=wp.vec3f, device=device),
+        frame=wp.array(np.tile(np.eye(3, dtype=np.float32), (capacity, 1, 1)), dtype=wp.mat33f, device=device),
+        body_jacobian=wp.zeros(capacity, dtype=mat36f, device=device),
+        bias=wp.array(bias, dtype=wp.vec3f, device=device),
+        rigid_bias=wp.zeros(capacity, dtype=wp.vec3f, device=device),
+        friction=wp.zeros(capacity, dtype=wp.float32, device=device),
+        scalar_delassus=wp.ones(capacity, dtype=wp.float32, device=device),
+        delassus=wp.zeros(capacity, dtype=wp.mat33f, device=device),
+        status=wp.full(capacity, DEFORMABLE_CONTACT_STATUS_VALID, dtype=wp.int32, device=device),
+        world_active=wp.ones(1, dtype=wp.bool, device=device),
+        particle_occupancy=wp.ones((capacity, color_count), dtype=wp.int32, device=device),
+        body_occupancy=wp.zeros((0, color_count), dtype=wp.int32, device=device),
+        particle_inverse_weight=wp.ones(capacity, dtype=wp.float32, device=device),
+        body_inverse_weight=wp.empty(0, dtype=mat66f, device=device),
+        projected_velocity=wp.zeros(capacity, dtype=wp.vec3f, device=device),
+        projected_twist=wp.empty(0, dtype=vec6f, device=device),
+        particle_reaction=wp.zeros(capacity, dtype=wp.vec3f, device=device),
+        rigid_reaction=wp.zeros(capacity, dtype=wp.vec3f, device=device),
+        particle_delta=wp.zeros(capacity, dtype=wp.vec3f, device=device),
+        body_delta=wp.empty(0, dtype=vec6f, device=device),
+        projection_status=wp.ones(1, dtype=wp.int32, device=device),
+        world_status=wp.full(1, DEFORMABLE_CONTACT_STATUS_VALID, dtype=wp.int32, device=device),
+    )
+
+    def launch(worker_count):
+        for color in range(color_count):
+            wp.launch(
+                _project_deformable_colored,
+                dim=worker_count,
+                inputs=[
+                    worker_count,
+                    color,
+                    case.counts,
+                    case.offsets,
+                    case.order,
+                    case.particle_indices,
+                    case.coefficients,
+                    case.contact_world,
+                    case.body,
+                    case.normal,
+                    case.frame,
+                    case.body_jacobian,
+                    case.bias,
+                    case.rigid_bias,
+                    case.friction,
+                    case.scalar_delassus,
+                    case.delassus,
+                    case.status,
+                    case.world_active,
+                    case.particle_occupancy,
+                    case.body_occupancy,
+                    case.particle_inverse_weight,
+                    case.body_inverse_weight,
+                    False,
+                    case.projected_velocity,
+                    case.projected_twist,
+                ],
+                outputs=[
+                    case.particle_reaction,
+                    case.rigid_reaction,
+                    case.particle_delta,
+                    case.body_delta,
+                    case.projection_status,
+                    case.world_status,
+                ],
+                device=device,
+            )
+
+    case.launch = launch
+    return case
 
 
 class TestLOXColoredGaussSeidel(unittest.TestCase):
@@ -479,7 +571,6 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
                 deformable.friction,
                 deformable.gauss_seidel_scalar_delassus,
                 deformable.gauss_seidel_delassus,
-                deformable.gauss_seidel_delassus_normal_first,
                 deformable.status,
                 wp.ones(1, dtype=wp.bool, device=self.device),
                 projection.particle_occupancy,
@@ -507,6 +598,42 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
             [DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE],
         )
         np.testing.assert_array_equal(projection_status.numpy(), [0])
+
+    def test_deformable_projection_worker_count_bounds_per_color_work(self):
+        """Bound projection workers by per-color capacity while retaining full preparation workers."""
+        deformable = SimpleNamespace(
+            device=self.device,
+            contact_capacity=103,
+            cloth_system=SimpleNamespace(particle_count=103),
+        )
+        projection = ColoredGaussSeidelProjection(None, deformable, 8)
+
+        self.assertEqual(projection.deformable.worker_count, 103)
+        self.assertEqual(projection.deformable_projection_worker_count, 13)
+
+        empty = SimpleNamespace(
+            device=self.device,
+            contact_capacity=0,
+            cloth_system=SimpleNamespace(particle_count=0),
+        )
+        empty_projection = ColoredGaussSeidelProjection(None, empty, 8)
+        self.assertEqual(empty_projection.deformable.worker_count, 0)
+        self.assertEqual(empty_projection.deformable_projection_worker_count, 0)
+
+    def test_reduced_deformable_workers_cover_skewed_and_balanced_colors(self):
+        """Process every contact with reduced workers for skewed, balanced, and empty colors."""
+        for counts in ([7, 1, 1, 0], [3, 2, 2, 2]):
+            with self.subTest(counts=counts):
+                case = _make_deformable_projection_case(self.device, counts)
+                worker_count = (case.capacity + case.color_count - 1) // case.color_count
+                case.launch(worker_count)
+                expected = np.arange(1, case.capacity + 1, dtype=np.float32)
+                np.testing.assert_allclose(
+                    case.particle_reaction.numpy()[:, 2],
+                    expected,
+                    rtol=0.0,
+                    atol=1.0e-6,
+                )
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required for graph capture")
     def test_cuda_graph_capture_replays_large_color_compaction(self):
@@ -571,6 +698,23 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
             run()
         wp.capture_launch(capture.graph)
         np.testing.assert_allclose(projected_twist.numpy()[0, 0], 2.0, rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required for graph capture")
+    def test_cuda_graph_capture_replays_reduced_deformable_workers(self):
+        """Capture reduced-worker projection and replay all contacts in a skewed color."""
+        device = wp.get_device("cuda:0")
+        case = _make_deformable_projection_case(device, [7, 1, 1, 0])
+        worker_count = (case.capacity + case.color_count - 1) // case.color_count
+
+        case.launch(worker_count)
+        case.particle_reaction.zero_()
+        case.particle_delta.zero_()
+        with wp.ScopedCapture(device=device) as capture:
+            case.launch(worker_count)
+        wp.capture_launch(capture.graph)
+
+        expected = np.arange(1, case.capacity + 1, dtype=np.float32)
+        np.testing.assert_allclose(case.particle_reaction.numpy()[:, 2], expected, rtol=0.0, atol=1.0e-6)
 
 
 if __name__ == "__main__":

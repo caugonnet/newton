@@ -26,12 +26,15 @@ DEFORMABLE_PRECONDITIONER_STATUS_REGULARIZED = 1
 DEFORMABLE_PRECONDITIONER_STATUS_FAILED = 2
 """The factorization encountered non-finite matrix data."""
 
-_PERSISTENT_ROW_LIMIT = 256
-"""Largest world processed by one persistent thread block.
+_PERSISTENT_ROW_LIMIT = 4096
+"""Largest world eligible for eager persistent application.
 
 The factor vectors remain in preallocated global storage, so this is a
 parallelism crossover rather than a shared-memory capacity limit.
 """
+
+_PERSISTENT_BLOCK_DIM_LIMIT = 512
+"""Largest thread block used by persistent application."""
 
 
 @wp.func
@@ -373,8 +376,8 @@ class DeformableIncompleteLDLT:
             batch_offsets: Scalar degree-of-freedom offsets for Warp batching.
             regularization: Relative eigenvalue floor applied to pivots.
             fill_level: Non-negative symbolic level of fill.
-            persistent_row_limit: Largest world assigned to one persistent
-                thread block. Pass zero to use level-scheduled launches.
+            persistent_row_limit: Largest world eligible for eager persistent
+                application. Pass zero to always use level-scheduled launches.
             row_active: Optional nonzero flag for rows assigned to CR.
         """
         if system_matrix.block_shape != (3, 3) or system_matrix.nrow != system_matrix.ncol:
@@ -585,7 +588,7 @@ class DeformableIncompleteLDLT:
             self.device.is_cuda and persistent_row_limit > 0 and max_world_rows <= persistent_row_limit
         )
         self._persistent_block_dim = min(
-            256,
+            _PERSISTENT_BLOCK_DIM_LIMIT,
             max(32, 1 << max(0, max_world_level_width - 1).bit_length()),
         )
 
@@ -651,7 +654,7 @@ class DeformableIncompleteLDLT:
         alpha: float,
         beta: float,
     ) -> None:
-        if self.uses_persistent_apply:
+        if self.uses_persistent_apply and not self.device.is_capturing:
             wp.launch(
                 _persistent_apply,
                 dim=self.world_active.shape[0] * self._persistent_block_dim,

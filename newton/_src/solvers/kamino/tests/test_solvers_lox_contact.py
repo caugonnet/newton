@@ -12,6 +12,10 @@ from newton._src.solvers.kamino._src.solvers.lox import (
     compute_contact_scaled_alart_curnier_residual,
     solve_contact_coulomb_newton,
 )
+from newton._src.solvers.kamino._src.solvers.lox.contact import (
+    _solve_contact_coulomb_newton_normal_last,
+    _solve_contact_coulomb_newton_normal_last_instrumented,
+)
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
 
@@ -32,6 +36,35 @@ def _solve_contacts(
     residual[contact] = compute_contact_scaled_alart_curnier_residual(
         delassus[contact], reaction_i, velocity_i, friction[contact]
     )
+
+
+@wp.kernel
+def _solve_contacts_normal_last(
+    delassus: wp.array[wp.mat33f],
+    free_velocity: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    reaction: wp.array[wp.vec3f],
+):
+    contact = wp.tid()
+    reaction[contact] = _solve_contact_coulomb_newton_normal_last(
+        delassus[contact], free_velocity[contact], friction[contact]
+    )
+
+
+@wp.kernel
+def _solve_contacts_normal_last_instrumented(
+    delassus: wp.array[wp.mat33f],
+    free_velocity: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    reaction: wp.array[wp.vec3f],
+    branch: wp.array[wp.int32],
+):
+    contact = wp.tid()
+    result = _solve_contact_coulomb_newton_normal_last_instrumented(
+        delassus[contact], free_velocity[contact], friction[contact]
+    )
+    reaction[contact] = result.reaction
+    branch[contact] = result.branch
 
 
 class TestLOXContact(unittest.TestCase):
@@ -61,6 +94,38 @@ class TestLOXContact(unittest.TestCase):
             device=self.device,
         )
         return reaction_wp.numpy(), velocity_wp.numpy(), residual_wp.numpy()
+
+    def _solve_normal_last(
+        self,
+        delassus: np.ndarray,
+        free_velocity: np.ndarray,
+        friction: np.ndarray,
+        *,
+        instrumented: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        delassus_wp = wp.array(delassus, dtype=wp.mat33f, device=self.device)
+        free_velocity_wp = wp.array(free_velocity, dtype=wp.vec3f, device=self.device)
+        friction_wp = wp.array(friction, dtype=wp.float32, device=self.device)
+        reaction_wp = wp.empty(len(friction), dtype=wp.vec3f, device=self.device)
+        if not instrumented:
+            wp.launch(
+                _solve_contacts_normal_last,
+                dim=len(friction),
+                inputs=[delassus_wp, free_velocity_wp, friction_wp],
+                outputs=[reaction_wp],
+                device=self.device,
+            )
+            return reaction_wp.numpy(), None
+
+        branch_wp = wp.empty(len(friction), dtype=wp.int32, device=self.device)
+        wp.launch(
+            _solve_contacts_normal_last_instrumented,
+            dim=len(friction),
+            inputs=[delassus_wp, free_velocity_wp, friction_wp],
+            outputs=[reaction_wp, branch_wp],
+            device=self.device,
+        )
+        return reaction_wp.numpy(), branch_wp.numpy()
 
     def test_separating_contact(self):
         delassus = np.asarray([np.diag([2.0, 3.0, 4.0])], dtype=np.float32)
@@ -175,6 +240,67 @@ class TestLOXContact(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(reaction[0])))
         self.assertTrue(np.all(np.isfinite(residual[0])))
         self.assertLess(np.linalg.norm(residual[0]), 1.0e-6)
+
+    def test_normal_last_wrapper_matches_all_solver_branches(self):
+        """Match normal-first results and diagnostics across every solver branch."""
+        delassus = np.asarray(
+            [
+                np.diag([2.0, 3.0, 4.0]),
+                np.diag([2.0, 0.0, 0.0]),
+                np.diag([2.0, 3.0, 4.0]),
+                np.diag([2.0, 1.0, 1.0]),
+            ],
+            dtype=np.float32,
+        )
+        free_velocity = np.asarray(
+            [
+                [0.25, -4.0, 2.0],
+                [-1.0, 3.0, -2.0],
+                [-1.0, 0.2, -0.1],
+                [-1.0, 2.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        friction = np.asarray([0.7, 0.0, 0.8, 0.5], dtype=np.float32)
+        permutation = (1, 2, 0)
+        delassus_normal_last = delassus[:, permutation][:, :, permutation]
+        velocity_normal_last = free_velocity[:, permutation]
+
+        expected, _, _ = self._solve(delassus, free_velocity, friction)
+        actual, _ = self._solve_normal_last(delassus_normal_last, velocity_normal_last, friction)
+        instrumented, branches = self._solve_normal_last(
+            delassus_normal_last,
+            velocity_normal_last,
+            friction,
+            instrumented=True,
+        )
+
+        np.testing.assert_array_equal(actual, expected[:, permutation])
+        np.testing.assert_array_equal(instrumented, actual)
+        np.testing.assert_array_equal(branches, [0, 1, 2, 3])
+
+    def test_normal_last_wrapper_matches_random_spd_blocks(self):
+        """Match normal-first results for randomized coupled SPD contact blocks."""
+        rng = np.random.default_rng(20260805)
+        count = 512
+        factors = rng.normal(size=(count, 3, 3)).astype(np.float32)
+        delassus = factors @ np.transpose(factors, (0, 2, 1))
+        delassus += 0.2 * np.identity(3, dtype=np.float32)[None, :, :]
+        free_velocity = rng.normal(size=(count, 3)).astype(np.float32)
+        free_velocity[:, 0] -= 0.35
+        friction = rng.uniform(0.0, 2.0, size=count).astype(np.float32)
+        friction[::11] = 0.0
+        free_velocity[::13, 0] = np.abs(free_velocity[::13, 0])
+        permutation = (1, 2, 0)
+
+        expected, _, _ = self._solve(delassus, free_velocity, friction)
+        actual, _ = self._solve_normal_last(
+            delassus[:, permutation][:, :, permutation],
+            free_velocity[:, permutation],
+            friction,
+        )
+
+        np.testing.assert_array_equal(actual, expected[:, permutation])
 
 
 if __name__ == "__main__":

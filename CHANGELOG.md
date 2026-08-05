@@ -130,6 +130,7 @@
 - Fix `ModelBuilder.add_usd()` ignoring `newton:mimicEnabled` on a joint with `MjcEqualityJointAPI` applied. Such a joint is now imported disabled rather than coupled, which also stops the default equality conversion from enforcing the coupling in every solver.
 - Fix `SolverVBD` failing to construct on large multi-world scenes containing particles and rigid shapes. (#3660)
 - Fix `SolverKamino` runtime model updates for joint limits, body inertia and centers of mass, shape properties, and forward-kinematics state. (#3386, #3549, #3577, #3602)
+- Fix `SolverKamino.step()` applying the center-of-mass offset twice when its input and output states alias, enabling correct single-state stepping.
 - Fix Style3D solver divergence caused by isolated vertices.
 - Fix a use-after-free where finalizing a second model built from shared mesh geometry (e.g. via `ModelBuilder.replicate()` or `ModelBuilder.add_builder()`) invalidated the meshes referenced by previously finalized models.
 - Fix compiler warnings about overflowing int32 constants when compiling SDF texture and `SensorTiledCamera` kernels.

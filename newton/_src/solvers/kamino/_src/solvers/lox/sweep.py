@@ -11,9 +11,9 @@ from ...core.types import mat36f, mat66f, vec6f
 from .contact import (
     CoulombSolveStatistics,
     _record_coulomb_solve_statistics,
-    _solve_contact_coulomb_newton_instrumented,
+    _solve_contact_coulomb_newton_normal_last,
+    _solve_contact_coulomb_newton_normal_last_instrumented,
     compute_contact_scaled_alart_curnier_residual,
-    solve_contact_coulomb_newton,
 )
 from .projection import (
     PROJECTION_STATUS_INVALID,
@@ -21,7 +21,6 @@ from .projection import (
     compute_contact_delassus,
     compute_limit_delassus,
     convert_contact_matrix_normal_last_to_first,
-    convert_contact_vector_normal_first_to_last,
     convert_contact_vector_normal_last_to_first,
     prepare_contact_coulomb,
     project_contact_coulomb,
@@ -56,7 +55,6 @@ def _prepare_contact_projection_data(
     contact_friction: wp.array[wp.float32],
     inverse_weight: wp.array[mat66f],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_status: wp.array[wp.int32],
 ):
     contact = wp.tid()
@@ -70,7 +68,6 @@ def _prepare_contact_projection_data(
     second = contact_body_second[contact]
     if first < 0 and second < 0:
         delassus[contact] = wp.mat33f(0.0)
-        delassus_normal_first[contact] = wp.mat33f(0.0)
         return
     if first >= 0:
         inverse_weight_first = inverse_weight[first]
@@ -85,7 +82,6 @@ def _prepare_contact_projection_data(
         contact_friction[contact],
     )
     delassus[contact] = data.delassus
-    delassus_normal_first[contact] = data.delassus_normal_first
     if data.status == PROJECTION_STATUS_INVALID:
         world_status[world] = data.status
 
@@ -119,7 +115,6 @@ def _prepare_contacts_jacobi(
     static_body_constraint_count: wp.array[wp.int32],
     inverse_weight: wp.array[mat66f],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_status: wp.array[wp.int32],
 ):
     contact = wp.tid()
@@ -133,7 +128,6 @@ def _prepare_contacts_jacobi(
     second = contact_body_second[contact]
     if first < 0 and second < 0:
         delassus[contact] = wp.mat33f(0.0)
-        delassus_normal_first[contact] = wp.mat33f(0.0)
         return
     if first >= 0:
         multiplicity = wp.max(1, body_constraint_count[first] - static_body_constraint_count[first])
@@ -150,7 +144,6 @@ def _prepare_contacts_jacobi(
         contact_friction[contact],
     )
     delassus[contact] = data.delassus
-    delassus_normal_first[contact] = data.delassus_normal_first
     if data.status == PROJECTION_STATUS_INVALID:
         world_status[world] = data.status
 
@@ -365,7 +358,6 @@ def _project_contacts_jacobi(
     contact_jacobian_first: wp.array[mat36f],
     contact_jacobian_second: wp.array[mat36f],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     inverse_weight: wp.array[mat66f],
@@ -404,15 +396,13 @@ def _project_contacts_jacobi(
         + contact_jacobian_second[contact] @ twist_second
         + contact_bias[contact]
     )
-    free_velocity_normal_first = convert_contact_vector_normal_last_to_first(
-        current_velocity - contact_delassus[contact] @ reaction_old
-    )
-    reaction_new_normal_first = solve_contact_coulomb_newton(
-        contact_delassus_normal_first[contact],
-        free_velocity_normal_first,
+    contact_block = contact_delassus[contact]
+    free_velocity = current_velocity - contact_block @ reaction_old
+    reaction_new = _solve_contact_coulomb_newton_normal_last(
+        contact_block,
+        free_velocity,
         contact_friction[contact],
     )
-    reaction_new = convert_contact_vector_normal_first_to_last(reaction_new_normal_first)
     reaction_delta = reaction_new - reaction_old
     if (
         not wp.isfinite(reaction_new[0])
@@ -451,7 +441,6 @@ def _project_contacts_jacobi_instrumented(
     contact_jacobian_first: wp.array[mat36f],
     contact_jacobian_second: wp.array[mat36f],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     inverse_weight: wp.array[mat66f],
@@ -494,12 +483,11 @@ def _project_contacts_jacobi_instrumented(
         + contact_jacobian_second[contact] @ twist_second
         + contact_bias[contact]
     )
-    free_velocity_normal_first = convert_contact_vector_normal_last_to_first(
-        current_velocity - contact_delassus[contact] @ reaction_old
-    )
-    solve_result = _solve_contact_coulomb_newton_instrumented(
-        contact_delassus_normal_first[contact],
-        free_velocity_normal_first,
+    contact_block = contact_delassus[contact]
+    free_velocity = current_velocity - contact_block @ reaction_old
+    solve_result = _solve_contact_coulomb_newton_normal_last_instrumented(
+        contact_block,
+        free_velocity,
         contact_friction[contact],
     )
     _record_coulomb_solve_statistics(
@@ -510,7 +498,7 @@ def _project_contacts_jacobi_instrumented(
         root_histogram,
         failure_counts,
     )
-    reaction_new = convert_contact_vector_normal_first_to_last(solve_result.reaction)
+    reaction_new = solve_result.reaction
     reaction_delta = reaction_new - reaction_old
     if (
         not wp.isfinite(reaction_new[0])
@@ -879,7 +867,6 @@ def _project_constraints_sequential_prepared(
     contact_jacobian_first: wp.array[mat36f],
     contact_jacobian_second: wp.array[mat36f],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     contact_projection_status: wp.array[wp.int32],
@@ -1044,7 +1031,6 @@ def _project_constraints_sequential_prepared(
                 contact_reaction[contact],
                 contact_friction[contact],
                 contact_delassus[contact],
-                contact_delassus_normal_first[contact],
             )
             if result_contact.status == PROJECTION_STATUS_INVALID:
                 world_status[world] = result_contact.status
@@ -1148,7 +1134,6 @@ def _sweep_constraints_sequential_prepared(
     contact_jacobian_first: wp.array[mat36f],
     contact_jacobian_second: wp.array[mat36f],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     world_limit_offset: wp.array[wp.int32],
@@ -1276,7 +1261,6 @@ def _sweep_constraints_sequential_prepared(
             contact_reaction[contact],
             contact_friction[contact],
             contact_delassus[contact],
-            contact_delassus_normal_first[contact],
         )
         if result_contact.status == PROJECTION_STATUS_INVALID:
             world_status[world] = result_contact.status
@@ -1636,7 +1620,6 @@ def prepare_contact_projection_data(
     contact_friction: wp.array[wp.float32],
     inverse_weight: wp.array[mat66f],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_status: wp.array[wp.int32],
 ) -> None:
     """Prepare fixed body-space contact data once per solve."""
@@ -1662,7 +1645,7 @@ def prepare_contact_projection_data(
             contact_friction,
             inverse_weight,
         ],
-        outputs=[delassus, delassus_normal_first, world_status],
+        outputs=[delassus, world_status],
         device=inverse_weight.device,
     )
 
@@ -1696,7 +1679,6 @@ def prepare_jacobi_projection_data(
     inverse_weight: wp.array[mat66f],
     friction_delassus: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     limit_delassus: wp.array[wp.float32],
     world_status: wp.array[wp.int32],
 ) -> None:
@@ -1748,7 +1730,7 @@ def prepare_jacobi_projection_data(
                 static_body_constraint_count,
                 inverse_weight,
             ],
-            outputs=[contact_delassus, contact_delassus_normal_first, world_status],
+            outputs=[contact_delassus, world_status],
             device=inverse_weight.device,
         )
     if limit_world.shape[0] > 0:
@@ -1795,7 +1777,6 @@ def project_constraints_jacobi(
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     limit_world: wp.array[wp.int32],
     limit_local: wp.array[wp.int32],
     world_limit_count: wp.array[wp.int32],
@@ -1972,7 +1953,6 @@ def project_constraints_jacobi(
                 contact_jacobian_first,
                 contact_jacobian_second,
                 contact_delassus,
-                contact_delassus_normal_first,
                 contact_bias,
                 contact_friction,
                 inverse_weight,
@@ -2084,7 +2064,6 @@ def project_constraints_sequential(
     limit_velocity: wp.array[wp.float32],
     world_status: wp.array[wp.int32],
     contact_delassus: wp.array[wp.mat33f] | None = None,
-    contact_delassus_normal_first: wp.array[wp.mat33f] | None = None,
     contact_projection_status: wp.array[wp.int32] | None = None,
 ) -> None:
     """Run fixed sequential limit/contact sweeps with one worker per world."""
@@ -2104,7 +2083,6 @@ def project_constraints_sequential(
         raise ValueError("Active, contact, limit, and status world arrays must have identical lengths.")
     prepared_arrays = (
         contact_delassus,
-        contact_delassus_normal_first,
         contact_projection_status,
     )
     prepared = any(array is not None for array in prepared_arrays)
@@ -2131,7 +2109,6 @@ def project_constraints_sequential(
         inputs = [
             *common_prefix,
             contact_delassus,
-            contact_delassus_normal_first,
             contact_bias,
             contact_friction,
             contact_projection_status,
@@ -2251,7 +2228,6 @@ def sweep_constraints_sequential(
     contact_jacobian_first: wp.array[mat36f],
     contact_jacobian_second: wp.array[mat36f],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     world_limit_offset: wp.array[wp.int32],
@@ -2291,7 +2267,6 @@ def sweep_constraints_sequential(
             contact_jacobian_first,
             contact_jacobian_second,
             contact_delassus,
-            contact_delassus_normal_first,
             contact_bias,
             contact_friction,
             world_limit_offset,

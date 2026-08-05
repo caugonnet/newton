@@ -4,6 +4,7 @@
 """Tests for the LOX cloth linear solve and incomplete preconditioner."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -19,6 +20,9 @@ from newton._src.solvers.kamino._src.solvers.lox import (
     DEFORMABLE_WEIGHT_STATUS_VALID,
     DeformableClothSystem,
     DeformableIncompleteLDLT,
+)
+from newton._src.solvers.kamino._src.solvers.lox import (
+    deformable_preconditioner as deformable_preconditioner_module,
 )
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_system import (
@@ -86,6 +90,28 @@ def _make_cycle_system(device: wp.DeviceLike):
     world_active = wp.ones(1, dtype=wp.int32, device=device)
     batch_offsets = wp.array([0, 12], dtype=wp.int32, device=device)
     return matrix, packed_world, world_active, batch_offsets
+
+
+def _make_diagonal_matrix(row_count: int, device: wp.DeviceLike) -> wps.BsrMatrix:
+    """Build an identity block matrix with the requested row count."""
+    coordinates = np.arange(row_count, dtype=np.int32)
+    rows = wp.array(coordinates, dtype=wp.int32, device=device)
+    columns = wp.array(coordinates, dtype=wp.int32, device=device)
+    values = wp.array(
+        np.repeat(np.eye(3, dtype=np.float32)[None, :, :], row_count, axis=0),
+        dtype=wp.mat33,
+        device=device,
+    )
+    matrix = wps.bsr_zeros(row_count, row_count, wp.mat33, device=device)
+    wps.bsr_set_from_triplets(
+        matrix,
+        rows,
+        columns,
+        values,
+        prune_numerical_zeros=False,
+        topology="compact",
+    )
+    return matrix
 
 
 def _lower_coordinates(preconditioner: DeformableIncompleteLDLT) -> list[tuple[int, int]]:
@@ -271,6 +297,115 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
         expected = alpha * np.linalg.solve(factor, right_hand_side_np.reshape(-1))
         expected += beta * addend_np.reshape(-1)
         np.testing.assert_allclose(result.numpy().reshape(-1), expected, rtol=2.0e-5, atol=2.0e-5)
+
+    def test_select_persistent_apply_for_small_eager_cuda_system(self):
+        """Select persistent application only for eligible eager CUDA systems."""
+        matrix, packed_world, world_active, batch_offsets = _make_cycle_system(self.device)
+        default = DeformableIncompleteLDLT(matrix, packed_world, world_active, batch_offsets)
+        disabled = DeformableIncompleteLDLT(
+            matrix,
+            packed_world,
+            world_active,
+            batch_offsets,
+            persistent_row_limit=0,
+        )
+
+        self.assertEqual(default.uses_persistent_apply, self.device.is_cuda)
+        self.assertFalse(disabled.uses_persistent_apply)
+
+    def test_bound_persistent_apply_by_world_size_and_block_width(self):
+        """Include 4096-row worlds, exclude larger worlds, and cap blocks at 512 threads."""
+        row_count = 4097
+        matrix = _make_diagonal_matrix(row_count, self.device)
+        qualifying_world = wp.array(
+            np.concatenate((np.zeros(4096, dtype=np.int32), np.ones(1, dtype=np.int32))),
+            dtype=wp.int32,
+            device=self.device,
+        )
+        qualifying_active = wp.ones(2, dtype=wp.int32, device=self.device)
+        qualifying_batches = wp.array([0, 3 * 4096, 3 * row_count], dtype=wp.int32, device=self.device)
+        qualifying = DeformableIncompleteLDLT(
+            matrix,
+            qualifying_world,
+            qualifying_active,
+            qualifying_batches,
+        )
+
+        oversized_world = wp.zeros(row_count, dtype=wp.int32, device=self.device)
+        oversized_active = wp.ones(1, dtype=wp.int32, device=self.device)
+        oversized_batches = wp.array([0, 3 * row_count], dtype=wp.int32, device=self.device)
+        oversized = DeformableIncompleteLDLT(
+            matrix,
+            oversized_world,
+            oversized_active,
+            oversized_batches,
+        )
+
+        self.assertEqual(qualifying.uses_persistent_apply, self.device.is_cuda)
+        self.assertEqual(qualifying._persistent_block_dim, 512)
+        self.assertFalse(oversized.uses_persistent_apply)
+        self.assertEqual(oversized._persistent_block_dim, 512)
+
+    def test_capture_persistent_eligible_apply_as_levels(self):
+        """Record level-scheduled kernels for a persistent-eligible CUDA preconditioner."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+        matrix, packed_world, world_active, batch_offsets = _make_cycle_system(self.device)
+        preconditioner = DeformableIncompleteLDLT(matrix, packed_world, world_active, batch_offsets)
+        preconditioner.factorize()
+        right_hand_side = wp.ones(4, dtype=wp.vec3, device=self.device)
+        addend = wp.zeros_like(right_hand_side)
+        result = wp.empty_like(right_hand_side)
+
+        preconditioner.uses_persistent_apply = False
+        preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
+        preconditioner.uses_persistent_apply = True
+        preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
+        wp.synchronize_device(self.device)
+
+        launches = []
+        original_launch = wp.launch
+
+        def record_launch(kernel, *args, **kwargs):
+            launches.append(kernel)
+            return original_launch(kernel, *args, **kwargs)
+
+        with mock.patch.object(deformable_preconditioner_module.wp, "launch", side_effect=record_launch):
+            with wp.ScopedCapture(device=self.device) as capture:
+                preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
+
+        self.assertNotIn(deformable_preconditioner_module._persistent_apply, launches)
+        self.assertEqual(launches.count(deformable_preconditioner_module._forward_level), preconditioner.level_count)
+        self.assertEqual(launches.count(deformable_preconditioner_module._backward_level), preconditioner.level_count)
+        wp.capture_launch(capture.graph)
+        self.assertTrue(np.all(np.isfinite(result.numpy())))
+
+    def test_match_persistent_and_level_incomplete_ldlt_apply(self):
+        """Match persistent and level-scheduled applications on one factorization."""
+        if not self.device.is_cuda:
+            self.skipTest("Persistent application requires a CUDA device.")
+        matrix, packed_world, world_active, batch_offsets = _make_cycle_system(self.device)
+        preconditioner = DeformableIncompleteLDLT(matrix, packed_world, world_active, batch_offsets)
+        preconditioner.factorize()
+        right_hand_side = wp.array(
+            np.linspace(-0.8, 0.9, 12, dtype=np.float32).reshape((-1, 3)),
+            dtype=wp.vec3,
+            device=self.device,
+        )
+        addend = wp.array(
+            np.linspace(0.3, -0.4, 12, dtype=np.float32).reshape((-1, 3)),
+            dtype=wp.vec3,
+            device=self.device,
+        )
+        level_result = wp.empty_like(right_hand_side)
+        persistent_result = wp.empty_like(right_hand_side)
+
+        preconditioner.uses_persistent_apply = False
+        preconditioner.linear_operator.matvec(right_hand_side, addend, level_result, -0.7, 0.2)
+        preconditioner.uses_persistent_apply = True
+        preconditioner.linear_operator.matvec(right_hand_side, addend, persistent_result, -0.7, 0.2)
+
+        np.testing.assert_array_equal(persistent_result.numpy(), level_result.numpy())
 
     def test_reduce_one_step_cr_residual_with_ic1_fill(self):
         """Reduce a cycle-system one-step CR residual using IC(1) fill."""

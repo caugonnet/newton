@@ -8,13 +8,11 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
-from .contact import solve_contact_coulomb_newton
+from .contact import _solve_contact_coulomb_newton_normal_last
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
     apply_contact_desaxce_correction,
-    convert_contact_vector_normal_first_to_last,
-    convert_contact_vector_normal_last_to_first,
     project_contact_coulomb_cone_orthogonal,
 )
 
@@ -263,7 +261,6 @@ def _project_rigid_steps_fused(
     contact_bias: wp.array[wp.vec3f],
     contact_friction: wp.array[wp.float32],
     contact_delassus: wp.array[wp.mat33f],
-    contact_delassus_normal_first: wp.array[wp.mat33f],
     limit_world: wp.array[wp.int32],
     limit_local: wp.array[wp.int32],
     world_limit_count: wp.array[wp.int32],
@@ -351,15 +348,11 @@ def _project_rigid_steps_fused(
         if not _is_finite_vec3(corrected):
             projection_status[world] = PROJECTION_STATUS_INVALID
             return
-        free_velocity_normal_first = convert_contact_vector_normal_last_to_first(
-            contact_value - contact_delassus[constraint] @ contact_trial[constraint]
-        )
-        contact_next_value = convert_contact_vector_normal_first_to_last(
-            solve_contact_coulomb_newton(
-                contact_delassus_normal_first[constraint],
-                free_velocity_normal_first,
-                contact_friction[constraint],
-            )
+        free_velocity = contact_value - contact_delassus[constraint] @ contact_trial[constraint]
+        contact_next_value = _solve_contact_coulomb_newton_normal_last(
+            contact_delassus[constraint],
+            free_velocity,
+            contact_friction[constraint],
         )
         if not _is_finite_vec3(contact_next_value):
             projection_status[world] = PROJECTION_STATUS_INVALID
@@ -674,7 +667,6 @@ def project_constraints_apgd(
                     adapter.contact_bias,
                     adapter.contact_friction,
                     adapter.contact_projection_delassus,
-                    adapter.contact_projection_delassus_normal_first,
                     adapter.limit_world,
                     adapter.limit_local,
                     adapter.world_limit_count,

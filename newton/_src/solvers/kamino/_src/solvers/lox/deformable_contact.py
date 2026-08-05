@@ -17,14 +17,14 @@ from .bias import compute_contact_velocity_target
 from .contact import (
     CoulombSolveStatistics,
     _record_coulomb_solve_statistics,
-    _solve_contact_coulomb_newton_instrumented,
+    _solve_contact_coulomb_newton_normal_last,
+    _solve_contact_coulomb_newton_normal_last_instrumented,
     compute_contact_scaled_alart_curnier_residual,
-    solve_contact_coulomb_newton,
 )
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
-    convert_contact_vector_normal_first_to_last,
+    convert_contact_matrix_normal_last_to_first,
     convert_contact_vector_normal_last_to_first,
     prepare_contact_coulomb_delassus,
     project_contact_coulomb_cone_orthogonal,
@@ -747,14 +747,12 @@ def _prepare_gauss_seidel_contacts(
     contact_status: wp.array[wp.int32],
     scalar_delassus: wp.array[float],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_status: wp.array[wp.int32],
     invalid_count: wp.array[wp.int32],
 ):
     contact = wp.tid()
     scalar_delassus[contact] = 0.0
     delassus[contact] = wp.mat33f(0.0)
-    delassus_normal_first[contact] = wp.mat33f(0.0)
     if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
         return
 
@@ -773,7 +771,6 @@ def _prepare_gauss_seidel_contacts(
     data = prepare_contact_coulomb_delassus(value, rigid_bias[contact], friction[contact])
     scalar_delassus[contact] = particle_value
     delassus[contact] = data.delassus
-    delassus_normal_first[contact] = data.delassus_normal_first
     if data.status == PROJECTION_STATUS_INVALID or (not include_rigid and particle_value <= 0.0):
         contact_status[contact] = DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS
         wp.atomic_max(world_status, contact_world[contact], DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS)
@@ -1033,13 +1030,11 @@ def _prepare_rigid_contacts(
     body_inverse_weight: wp.array[mat66f],
     contact_status: wp.array[wp.int32],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     world_status: wp.array[wp.int32],
     invalid_count: wp.array[wp.int32],
 ):
     contact = wp.tid()
     delassus[contact] = wp.mat33f(0.0)
-    delassus_normal_first[contact] = wp.mat33f(0.0)
     if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
         return
 
@@ -1057,7 +1052,6 @@ def _prepare_rigid_contacts(
         friction[contact],
     )
     delassus[contact] = data.delassus
-    delassus_normal_first[contact] = data.delassus_normal_first
     if data.status == PROJECTION_STATUS_INVALID:
         contact_status[contact] = DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS
         wp.atomic_max(
@@ -1144,7 +1138,6 @@ def _project_rigid_contacts(
     rigid_bias: wp.array[wp.vec3],
     friction: wp.array[float],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     particle_inverse_weight: wp.array[float],
@@ -1179,12 +1172,11 @@ def _project_rigid_contacts(
 
     reaction_old = reaction[contact]
     free_velocity = velocity - delassus[contact] @ reaction_old
-    reaction_new_normal_first = solve_contact_coulomb_newton(
-        delassus_normal_first[contact],
-        convert_contact_vector_normal_last_to_first(free_velocity),
+    reaction_new = _solve_contact_coulomb_newton_normal_last(
+        delassus[contact],
+        free_velocity,
         friction[contact],
     )
-    reaction_new = convert_contact_vector_normal_first_to_last(reaction_new_normal_first)
     reaction_delta = reaction_new - reaction_old
     if not _is_finite_vec3(reaction_new) or not _is_finite_vec3(reaction_delta):
         contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
@@ -1238,7 +1230,6 @@ def _project_rigid_contacts_instrumented(
     rigid_bias: wp.array[wp.vec3],
     friction: wp.array[float],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     particle_inverse_weight: wp.array[float],
@@ -1277,9 +1268,9 @@ def _project_rigid_contacts_instrumented(
 
     reaction_old = reaction[contact]
     free_velocity = velocity - delassus[contact] @ reaction_old
-    solve_result = _solve_contact_coulomb_newton_instrumented(
-        delassus_normal_first[contact],
-        convert_contact_vector_normal_last_to_first(free_velocity),
+    solve_result = _solve_contact_coulomb_newton_normal_last_instrumented(
+        delassus[contact],
+        free_velocity,
         friction[contact],
     )
     _record_coulomb_solve_statistics(
@@ -1290,7 +1281,7 @@ def _project_rigid_contacts_instrumented(
         root_histogram,
         failure_counts,
     )
-    reaction_new = convert_contact_vector_normal_first_to_last(solve_result.reaction)
+    reaction_new = solve_result.reaction
     reaction_delta = reaction_new - reaction_old
     if not _is_finite_vec3(reaction_new) or not _is_finite_vec3(reaction_delta):
         contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
@@ -1411,7 +1402,6 @@ def _sweep_contacts_sequential(
     friction: wp.array[float],
     scalar_delassus: wp.array[float],
     delassus: wp.array[wp.mat33f],
-    delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     particle_inverse_weight: wp.array[float],
@@ -1455,12 +1445,11 @@ def _sweep_contacts_sequential(
         if rigid_coordinates:
             reaction_old = rigid_reaction[contact]
             free_velocity = velocity - delassus[contact] @ reaction_old
-            reaction_new_normal_first = solve_contact_coulomb_newton(
-                delassus_normal_first[contact],
-                convert_contact_vector_normal_last_to_first(free_velocity),
+            reaction_new = _solve_contact_coulomb_newton_normal_last(
+                delassus[contact],
+                free_velocity,
                 friction[contact],
             )
-            reaction_new = convert_contact_vector_normal_first_to_last(reaction_new_normal_first)
         else:
             value = scalar_delassus[contact]
             free_velocity = velocity - value * reaction_old
@@ -1603,7 +1592,6 @@ def _project_contacts_apgd(
     friction: wp.array[float],
     scalar_delassus: wp.array[float],
     rigid_delassus: wp.array[wp.mat33f],
-    rigid_delassus_normal_first: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     rigid_coordinates: bool,
@@ -1663,12 +1651,11 @@ def _project_contacts_apgd(
     next_value = wp.vec3(0.0)
     if rigid_coordinates:
         free_velocity = velocity - rigid_delassus[contact] @ local_trial
-        next_value_normal_first = solve_contact_coulomb_newton(
-            rigid_delassus_normal_first[contact],
-            convert_contact_vector_normal_last_to_first(free_velocity),
+        next_value = _solve_contact_coulomb_newton_normal_last(
+            rigid_delassus[contact],
+            free_velocity,
             friction[contact],
         )
-        next_value = convert_contact_vector_normal_first_to_last(next_value_normal_first)
         current = rigid_reaction[contact]
     else:
         if not wp.isfinite(local_delassus) or local_delassus <= 0.0:
@@ -1769,7 +1756,7 @@ def _compute_rigid_contact_residuals(
     body_jacobian: wp.array[mat36f],
     rigid_bias: wp.array[wp.vec3],
     friction: wp.array[float],
-    delassus_normal_first: wp.array[wp.mat33f],
+    delassus: wp.array[wp.mat33f],
     contact_status: wp.array[wp.int32],
     world_active: wp.array[wp.int32],
     projected_velocity: wp.array[wp.vec3],
@@ -1798,7 +1785,7 @@ def _compute_rigid_contact_residuals(
     contact_velocity[contact] = contact_frame @ velocity
 
     residual_vector = compute_contact_scaled_alart_curnier_residual(
-        delassus_normal_first[contact],
+        convert_contact_matrix_normal_last_to_first(delassus[contact]),
         convert_contact_vector_normal_last_to_first(reaction[contact]),
         convert_contact_vector_normal_last_to_first(velocity),
         friction[contact],
@@ -1950,27 +1937,12 @@ class DeformableContactSystem:
         self.inverse_delassus = wp.zeros(self.contact_capacity, dtype=wp.float32, device=self.device)
         self.reaction = wp.zeros(self.contact_capacity, dtype=wp.vec3, device=self.device)
         self.rigid_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
-        self.rigid_delassus_normal_first = wp.zeros(
-            self.contact_capacity,
-            dtype=wp.mat33f,
-            device=self.device,
-        )
         self.rigid_reaction = wp.zeros(self.contact_capacity, dtype=wp.vec3, device=self.device)
         self.gauss_seidel_scalar_delassus = wp.zeros(self.contact_capacity, dtype=wp.float32, device=self.device)
         self.gauss_seidel_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
-        self.gauss_seidel_delassus_normal_first = wp.zeros(
-            self.contact_capacity,
-            dtype=wp.mat33f,
-            device=self.device,
-        )
         self.apgd_trial = wp.zeros(self.contact_capacity, dtype=wp.vec3, device=self.device)
         self.apgd_next = wp.zeros(self.contact_capacity, dtype=wp.vec3, device=self.device)
         self.avbd_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
-        self.avbd_delassus_normal_first = wp.zeros(
-            self.contact_capacity,
-            dtype=wp.mat33f,
-            device=self.device,
-        )
         self.avbd_inverse_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
         self.avbd_augmented_reaction = wp.zeros(self.contact_capacity, dtype=wp.vec3, device=self.device)
         self.contact_velocity = wp.zeros(self.contact_capacity, dtype=wp.vec3, device=self.device)
@@ -2464,7 +2436,6 @@ class DeformableContactSystem:
             outputs=[
                 self.status,
                 self.rigid_delassus,
-                self.rigid_delassus_normal_first,
                 self.world_status,
                 self.invalid_count,
             ],
@@ -2516,7 +2487,6 @@ class DeformableContactSystem:
                 self.status,
                 self.gauss_seidel_scalar_delassus,
                 self.gauss_seidel_delassus,
-                self.gauss_seidel_delassus_normal_first,
                 self.world_status,
                 self.invalid_count,
             ],
@@ -2613,7 +2583,6 @@ class DeformableContactSystem:
                 self.friction,
                 self.gauss_seidel_scalar_delassus,
                 self.gauss_seidel_delassus,
-                self.gauss_seidel_delassus_normal_first,
                 self.status,
                 world_active,
                 self.cloth_system.inverse_weight,
@@ -2768,7 +2737,6 @@ class DeformableContactSystem:
                 self.friction,
                 self.delassus,
                 self.rigid_delassus,
-                self.rigid_delassus_normal_first,
                 self.status,
                 world_active,
                 rigid_coordinates,
@@ -2876,7 +2844,6 @@ class DeformableContactSystem:
             self.rigid_bias,
             self.friction,
             self.rigid_delassus,
-            self.rigid_delassus_normal_first,
             self.status,
             world_active,
             particle_inverse_weight,
@@ -3090,7 +3057,7 @@ class DeformableContactSystem:
                     self.body_jacobian,
                     self.rigid_bias,
                     self.friction,
-                    self.rigid_delassus_normal_first,
+                    self.rigid_delassus,
                     self.status,
                     self.cloth_system.world_active,
                     projected_velocity,

@@ -2118,9 +2118,6 @@ class LOXKaminoAdapter:
         self.contact_velocity = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
         self.contact_residual = wp.zeros(self.contact_capacity, dtype=wp.float32, device=self.device)
         self.contact_projection_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
-        self.contact_projection_delassus_normal_first = wp.zeros(
-            self.contact_capacity, dtype=wp.mat33f, device=self.device
-        )
         self.contact_apgd_trial = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
         self.contact_apgd_next = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
         self.friction_avbd_penalty = wp.zeros(self.friction_capacity, dtype=wp.float32, device=self.device)

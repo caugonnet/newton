@@ -3,11 +3,10 @@
 
 """Local isotropic Coulomb-contact numerical primitives.
 
-This module is deliberately independent of Kamino containers. Its contact
-vectors use the normal-first convention ``(normal, tangent_0, tangent_1)`` and
-the rows and columns of every Delassus block follow the same order. Kamino's
-contact containers use a normal-last convention, so the backend must perform
-an explicit permutation at this module's boundary.
+This module is deliberately independent of Kamino containers. Its public
+contact primitives use the normal-first convention ``(normal, tangent_0,
+tangent_1)``. Internal normal-last wrappers let Kamino containers use their
+native layout without materializing permuted vectors or Delassus blocks.
 
 The local solve expects a symmetric positive-definite ``3 x 3`` Delassus
 block. Degenerate blocks must be regularized during contact preprocessing.
@@ -107,29 +106,18 @@ def _compute_sliding_root_data(
 
 
 @wp.func
-def solve_contact_coulomb_newton(
-    delassus: wp.mat33f,
-    free_velocity: wp.vec3f,
+def _solve_contact_coulomb_newton_components(
+    normal_delassus: wp.float32,
+    normal_tangent: wp.vec2f,
+    tangent_delassus00: wp.float32,
+    tangent_delassus01: wp.float32,
+    tangent_delassus10: wp.float32,
+    tangent_delassus11: wp.float32,
+    normal_rhs: wp.float32,
+    tangent_rhs_raw: wp.vec2f,
     friction: wp.float32,
 ) -> wp.vec3f:
-    """Solve one normal-first isotropic Coulomb contact.
-
-    The returned impulse ``reaction`` satisfies the contact law for
-    ``velocity = delassus @ reaction + free_velocity``. Sliding contacts are
-    reduced to a scalar root and solved by bracketed Newton. Every rejected or
-    unusable Newton step falls back to bisection of the current bracket.
-
-    Args:
-        delassus: Symmetric positive-definite local Delassus block.
-        free_velocity: Contact velocity before applying the local impulse.
-        friction: Nonnegative isotropic Coulomb friction coefficient.
-
-    Returns:
-        The normal-first contact impulse.
-    """
-    normal_delassus = delassus[0, 0]
-    normal_rhs = free_velocity[0]
-
+    """Solve from layout-independent normal and tangential components."""
     # These branches also avoid touching an unused, potentially ill-conditioned
     # tangential block for separating or frictionless contacts.
     if normal_rhs >= 0.0:
@@ -137,12 +125,11 @@ def solve_contact_coulomb_newton(
     if friction <= 0.0:
         return wp.vec3f(-normal_rhs / normal_delassus, 0.0, 0.0)
 
-    normal_tangent = wp.vec2f(delassus[1, 0], delassus[2, 0])
-    tangent00 = delassus[1, 1] - normal_tangent[0] * normal_tangent[0] / normal_delassus
-    tangent01 = delassus[1, 2] - normal_tangent[0] * normal_tangent[1] / normal_delassus
-    tangent10 = delassus[2, 1] - normal_tangent[1] * normal_tangent[0] / normal_delassus
-    tangent11 = delassus[2, 2] - normal_tangent[1] * normal_tangent[1] / normal_delassus
-    tangent_rhs = wp.vec2f(free_velocity[1], free_velocity[2]) - (normal_rhs / normal_delassus) * normal_tangent
+    tangent00 = tangent_delassus00 - normal_tangent[0] * normal_tangent[0] / normal_delassus
+    tangent01 = tangent_delassus01 - normal_tangent[0] * normal_tangent[1] / normal_delassus
+    tangent10 = tangent_delassus10 - normal_tangent[1] * normal_tangent[0] / normal_delassus
+    tangent11 = tangent_delassus11 - normal_tangent[1] * normal_tangent[1] / normal_delassus
+    tangent_rhs = tangent_rhs_raw - (normal_rhs / normal_delassus) * normal_tangent
 
     unshifted = _solve_mat22(
         tangent00,
@@ -229,9 +216,69 @@ def solve_contact_coulomb_newton(
 
 
 @wp.func
-def _solve_contact_coulomb_newton_instrumented(
+def solve_contact_coulomb_newton(
     delassus: wp.mat33f,
     free_velocity: wp.vec3f,
+    friction: wp.float32,
+) -> wp.vec3f:
+    """Solve one normal-first isotropic Coulomb contact.
+
+    The returned impulse ``reaction`` satisfies the contact law for
+    ``velocity = delassus @ reaction + free_velocity``. Sliding contacts are
+    reduced to a scalar root and solved by bracketed Newton. Every rejected or
+    unusable Newton step falls back to bisection of the current bracket.
+
+    Args:
+        delassus: Symmetric positive-definite local Delassus block.
+        free_velocity: Contact velocity before applying the local impulse.
+        friction: Nonnegative isotropic Coulomb friction coefficient.
+
+    Returns:
+        The normal-first contact impulse.
+    """
+    return _solve_contact_coulomb_newton_components(
+        delassus[0, 0],
+        wp.vec2f(delassus[1, 0], delassus[2, 0]),
+        delassus[1, 1],
+        delassus[1, 2],
+        delassus[2, 1],
+        delassus[2, 2],
+        free_velocity[0],
+        wp.vec2f(free_velocity[1], free_velocity[2]),
+        friction,
+    )
+
+
+@wp.func
+def _solve_contact_coulomb_newton_normal_last(
+    delassus: wp.mat33f,
+    free_velocity: wp.vec3f,
+    friction: wp.float32,
+) -> wp.vec3f:
+    reaction = _solve_contact_coulomb_newton_components(
+        delassus[2, 2],
+        wp.vec2f(delassus[0, 2], delassus[1, 2]),
+        delassus[0, 0],
+        delassus[0, 1],
+        delassus[1, 0],
+        delassus[1, 1],
+        free_velocity[2],
+        wp.vec2f(free_velocity[0], free_velocity[1]),
+        friction,
+    )
+    return wp.vec3f(reaction[1], reaction[2], reaction[0])
+
+
+@wp.func
+def _solve_contact_coulomb_newton_instrumented_components(
+    normal_delassus: wp.float32,
+    normal_tangent: wp.vec2f,
+    tangent_delassus00: wp.float32,
+    tangent_delassus01: wp.float32,
+    tangent_delassus10: wp.float32,
+    tangent_delassus11: wp.float32,
+    normal_rhs: wp.float32,
+    tangent_rhs_raw: wp.vec2f,
     friction: wp.float32,
 ) -> _CoulombSolveResult:
     result = _CoulombSolveResult()
@@ -242,8 +289,6 @@ def _solve_contact_coulomb_newton_instrumented(
     result.bracketed = wp.int32(1)
     result.converged = wp.int32(1)
 
-    normal_delassus = delassus[0, 0]
-    normal_rhs = free_velocity[0]
     if normal_rhs >= 0.0:
         return result
     if friction <= 0.0:
@@ -251,12 +296,11 @@ def _solve_contact_coulomb_newton_instrumented(
         result.reaction = wp.vec3f(-normal_rhs / normal_delassus, 0.0, 0.0)
         return result
 
-    normal_tangent = wp.vec2f(delassus[1, 0], delassus[2, 0])
-    tangent00 = delassus[1, 1] - normal_tangent[0] * normal_tangent[0] / normal_delassus
-    tangent01 = delassus[1, 2] - normal_tangent[0] * normal_tangent[1] / normal_delassus
-    tangent10 = delassus[2, 1] - normal_tangent[1] * normal_tangent[0] / normal_delassus
-    tangent11 = delassus[2, 2] - normal_tangent[1] * normal_tangent[1] / normal_delassus
-    tangent_rhs = wp.vec2f(free_velocity[1], free_velocity[2]) - (normal_rhs / normal_delassus) * normal_tangent
+    tangent00 = tangent_delassus00 - normal_tangent[0] * normal_tangent[0] / normal_delassus
+    tangent01 = tangent_delassus01 - normal_tangent[0] * normal_tangent[1] / normal_delassus
+    tangent10 = tangent_delassus10 - normal_tangent[1] * normal_tangent[0] / normal_delassus
+    tangent11 = tangent_delassus11 - normal_tangent[1] * normal_tangent[1] / normal_delassus
+    tangent_rhs = tangent_rhs_raw - (normal_rhs / normal_delassus) * normal_tangent
 
     unshifted = _solve_mat22(
         tangent00,
@@ -347,6 +391,47 @@ def _solve_contact_coulomb_newton_instrumented(
     tangent_reaction = -last_s
     normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
     result.reaction = wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
+    return result
+
+
+@wp.func
+def _solve_contact_coulomb_newton_instrumented(
+    delassus: wp.mat33f,
+    free_velocity: wp.vec3f,
+    friction: wp.float32,
+) -> _CoulombSolveResult:
+    return _solve_contact_coulomb_newton_instrumented_components(
+        delassus[0, 0],
+        wp.vec2f(delassus[1, 0], delassus[2, 0]),
+        delassus[1, 1],
+        delassus[1, 2],
+        delassus[2, 1],
+        delassus[2, 2],
+        free_velocity[0],
+        wp.vec2f(free_velocity[1], free_velocity[2]),
+        friction,
+    )
+
+
+@wp.func
+def _solve_contact_coulomb_newton_normal_last_instrumented(
+    delassus: wp.mat33f,
+    free_velocity: wp.vec3f,
+    friction: wp.float32,
+) -> _CoulombSolveResult:
+    result = _solve_contact_coulomb_newton_instrumented_components(
+        delassus[2, 2],
+        wp.vec2f(delassus[0, 2], delassus[1, 2]),
+        delassus[0, 0],
+        delassus[0, 1],
+        delassus[1, 0],
+        delassus[1, 1],
+        free_velocity[2],
+        wp.vec2f(free_velocity[0], free_velocity[1]),
+        friction,
+    )
+    reaction = result.reaction
+    result.reaction = wp.vec3f(reaction[1], reaction[2], reaction[0])
     return result
 
 

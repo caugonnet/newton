@@ -668,18 +668,84 @@ class TestLOXDeformableIntegration(unittest.TestCase):
         expected_delassus = float(mixed.delassus.numpy()[0]) * np.identity(3)
         expected_delassus += multiplicity * jacobian @ lox.system.inverse_weight.numpy()[body] @ jacobian.T
         np.testing.assert_allclose(mixed.rigid_delassus.numpy()[0], expected_delassus, atol=2.0e-6)
-        permutation = (2, 0, 1)
-        np.testing.assert_allclose(
-            mixed.rigid_delassus_normal_first.numpy()[0],
-            expected_delassus[np.ix_(permutation, permutation)],
-            atol=2.0e-6,
-        )
         self.assertEqual(int(adapter.body_has_unilateral.numpy()[body]), 1)
         self.assertGreater(float(state_out.particle_qd.numpy()[0, 2]), -1.0)
         self.assertLess(float(state_out.body_qd.numpy()[bodies[0], 2]), 0.0)
         momentum_after = np.sum(particle_mass[:, None] * state_out.particle_qd.numpy(), axis=0)
         momentum_after += body_mass * state_out.body_qd.numpy()[bodies[0], :3]
         np.testing.assert_allclose(momentum_after, momentum_before, rtol=2.0e-3, atol=2.0e-3)
+
+    def _check_step_in_place_matches_ping_pong_with_nonzero_body_com(self, *, capture: bool) -> None:
+        """Compare in-place LOX stepping with a ping-pong reference."""
+        model, shapes, _ = _build_contact_model(
+            device=self.device,
+            collider="dynamic",
+            body_com=(0.1, -0.05, 0.25),
+        )
+        state_ping = model.state()
+        state_ping.particle_qd.fill_((0.0, 0.0, -1.0))
+        state_pong = model.state()
+        state_in_place = model.state()
+        state_in_place.particle_qd.fill_((0.0, 0.0, -1.0))
+        contacts_ping = _make_particle_contact(model, state_ping, shapes[0], gap=0.0)
+        contacts_in_place = _make_particle_contact(model, state_in_place, shapes[0], gap=0.0)
+        solver_ping_pong = newton.solvers.SolverKamino(
+            model,
+            config=_make_lox_config(max_iterations=50, nonlinear_iterations=2),
+        )
+        solver_in_place = newton.solvers.SolverKamino(
+            model,
+            config=_make_lox_config(max_iterations=50, nonlinear_iterations=2),
+        )
+
+        graph = None
+        if capture:
+            solver_in_place.step(state_in_place, state_in_place, None, contacts_in_place, 0.01)
+            solver_in_place.reset(state_in_place)
+            state_in_place.particle_qd.fill_((0.0, 0.0, -1.0))
+            with wp.ScopedCapture(device=self.device) as captured:
+                solver_in_place.step(state_in_place, state_in_place, None, contacts_in_place, 0.01)
+            graph = captured.graph
+
+        for _ in range(3):
+            solver_ping_pong.step(state_ping, state_pong, None, contacts_ping, 0.01)
+            state_ping, state_pong = state_pong, state_ping
+            if graph is None:
+                solver_in_place.step(state_in_place, state_in_place, None, contacts_in_place, 0.01)
+            else:
+                wp.capture_launch(graph)
+
+        self.assertGreater(float(np.linalg.norm(state_ping.body_lox_dual_impulse.numpy())), 0.0)
+        self.assertGreater(float(np.linalg.norm(state_ping.particle_lox_dual_impulse.numpy())), 0.0)
+        for name in ("body_q", "body_qd", "particle_q", "particle_qd"):
+            np.testing.assert_allclose(
+                getattr(state_in_place, name).numpy(),
+                getattr(state_ping, name).numpy(),
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+        np.testing.assert_allclose(
+            state_in_place.body_lox_dual_impulse.numpy(),
+            state_ping.body_lox_dual_impulse.numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            state_in_place.particle_lox_dual_impulse.numpy(),
+            state_ping.particle_lox_dual_impulse.numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+
+    def test_step_in_place_matches_ping_pong_with_nonzero_body_com(self):
+        """Match ping-pong LOX stepping in place with persistent warm starts."""
+        self._check_step_in_place_matches_ping_pong_with_nonzero_body_com(capture=False)
+
+    def test_capture_step_in_place_matches_ping_pong_with_nonzero_body_com(self):
+        """Replay in-place LOX capture in origin coordinates with persistent warm starts."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+        self._check_step_in_place_matches_ping_pong_with_nonzero_body_com(capture=True)
 
     def test_step_dynamic_rigid_contact_against_pinned_particle(self):
         """Resolve a dynamic contact whose cloth endpoint has zero inverse mass."""
