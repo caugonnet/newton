@@ -22,6 +22,9 @@ from newton._src.solvers.kamino._src.solvers.lox import (
     DeformableIncompleteLDLT,
 )
 from newton._src.solvers.kamino._src.solvers.lox import (
+    deformable_linear as deformable_linear_module,
+)
+from newton._src.solvers.kamino._src.solvers.lox import (
     deformable_preconditioner as deformable_preconditioner_module,
 )
 from newton._src.solvers.kamino.tests import setup_tests, test_context
@@ -189,6 +192,17 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
         if not test_context.setup_done:
             setup_tests(clear_cache=False)
         self.device = wp.get_device(test_context.device)
+
+    def test_select_bounded_tiled_dot_for_large_single_batch(self):
+        """Select bounded-tree reductions only for large single batches."""
+        select = deformable_linear_module._select_tiled_dot_tile_size
+        self.assertEqual(select(16_384, 1), 512)
+        self.assertEqual(select(16_385, 1), 128)
+        self.assertEqual(select(32_768, 1), 128)
+        self.assertEqual(select(32_769, 1), 256)
+        self.assertEqual(select(65_536, 1), 256)
+        self.assertEqual(select(65_537, 1), 512)
+        self.assertEqual(select(40_000, 2), 512)
 
     def test_form_scalar_consensus_weight_and_system_matrix(self):
         """Form one scalar nodal weight and add it isotropically to each diagonal."""

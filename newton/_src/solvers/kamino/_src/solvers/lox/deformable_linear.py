@@ -11,6 +11,22 @@ from warp.optim import linear as wpl
 
 __all__ = ["DeformableCRState"]
 
+_TILED_DOT_DEFAULT_TILE_SIZE = 512
+_TILED_DOT_MIN_TREE_TILE_SIZE = 128
+_TILED_DOT_MAX_ITEMS_PER_LANE = 128
+
+
+def _select_tiled_dot_tile_size(scalar_length: int, batch_count: int) -> int:
+    """Select a bounded-tree tile without dropping below 128 threads."""
+    if batch_count != 1:
+        return _TILED_DOT_DEFAULT_TILE_SIZE
+    tile_size = _TILED_DOT_DEFAULT_TILE_SIZE
+    while tile_size >= _TILED_DOT_MIN_TREE_TILE_SIZE:
+        if scalar_length > _TILED_DOT_MAX_ITEMS_PER_LANE * tile_size:
+            return tile_size
+        tile_size //= 2
+    return _TILED_DOT_DEFAULT_TILE_SIZE
+
 
 def _run_capturable_loop(
     do_cycle: Callable[[], None],
@@ -37,6 +53,19 @@ class DeformableCRState(wpl.CR):
 
     def _allocate(self) -> None:
         super()._allocate()
+        scalar_length = self._b.shape[0] * self._dofs_per_entry
+        tile_size = _TILED_DOT_DEFAULT_TILE_SIZE
+        if self._device.is_cuda and self._A.batch_offsets is not None:
+            tile_size = _select_tiled_dot_tile_size(scalar_length, self._batch_count)
+        if tile_size != _TILED_DOT_DEFAULT_TILE_SIZE:
+            self._tiled_dot = _wpl_internal.TiledDot(
+                max_length=scalar_length,
+                scalar_type=self._scalar_type,
+                tile_size=tile_size,
+                device=self._device,
+                max_column_count=2,
+                batch_offsets=self._A.batch_offsets,
+            )
         self._current_iteration = wp.empty(1, dtype=wp.int32, device=self._device)
 
     def _run(self, A, b, x, M):

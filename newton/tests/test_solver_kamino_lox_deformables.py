@@ -52,6 +52,7 @@ _LOX_CLOTH_LINEAR_QUALITY_TESTS = (
     "test_report_preconditioner_regularization_and_failure",
     "test_reuse_factorization_and_warm_start",
     "test_select_persistent_apply_for_small_eager_cuda_system",
+    "test_select_bounded_tiled_dot_for_large_single_batch",
     "test_solve_batched_system_and_mask_inactive_world",
     "test_split_small_direct_and_large_iterative_components",
 )
