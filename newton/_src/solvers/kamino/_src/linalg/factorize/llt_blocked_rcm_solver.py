@@ -95,14 +95,15 @@ def _fixed_symbolic_data(
     dimensions: Sequence[int],
     adjacency_blocks: Sequence[Sequence[Sequence[int]]],
     block_size: int,
-) -> tuple[list[int], list[int], list[int]]:
-    """Build packed permutations and filled tile patterns from fixed adjacency."""
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Build packed permutations, filled tile patterns, and ordered solve work."""
     if len(adjacency_blocks) != len(dimensions):
         raise ValueError("symbolic_adjacency must contain one graph per matrix block.")
 
     packed_permutation = []
     packed_inverse = []
     packed_tile_pattern = []
+    packed_tile_traversal = []
     for dimension, adjacency_rows in zip(dimensions, adjacency_blocks, strict=True):
         if len(adjacency_rows) != dimension:
             raise ValueError("Each symbolic adjacency graph must match its matrix dimension.")
@@ -148,7 +149,19 @@ def _fixed_symbolic_data(
                         break
         packed_tile_pattern.extend(tile_pattern)
 
-    return packed_permutation, packed_inverse, packed_tile_pattern
+        tile_traversal = [-1] * (2 * tile_count * tile_count)
+        backward_offset = tile_count * tile_count
+        for row in range(tile_count):
+            forward = [column for column in range(row) if tile_pattern[row * tile_count + column] != 0]
+            backward = [
+                following for following in range(row + 1, tile_count) if tile_pattern[following * tile_count + row] != 0
+            ]
+            row_offset = row * tile_count
+            tile_traversal[row_offset : row_offset + len(forward)] = forward
+            tile_traversal[backward_offset + row_offset : backward_offset + row_offset + len(backward)] = backward
+        packed_tile_traversal.extend(tile_traversal)
+
+    return packed_permutation, packed_inverse, packed_tile_pattern, packed_tile_traversal
 
 
 class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
@@ -239,6 +252,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         self._P: wp.array[wp.int32] | None = None
         self._inv_P: wp.array[wp.int32] | None = None
         self._tile_pattern: wp.array[wp.int32] | None = None
+        self._tile_traversal: wp.array[wp.int32] | None = None
         self._tpo: wp.array[wp.int32] | None = None
         # Batched-RCM scratch (owned here so the recorded launches in
         # ``_reorder_callback`` never reference buffers that outlive our
@@ -267,8 +281,9 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
         # Build kernels (cached by block_size / max_dim at allocate time).
         self._factorize_kernel = make_llt_blocked_rcm_factorize_kernel(block_size)
         self._parallel_factorize_kernels = make_llt_blocked_rcm_parallel_factorize_kernels(block_size)
-        self._solve_kernel = make_llt_blocked_rcm_solve_kernel(block_size)
-        self._solve_inplace_kernel = make_llt_blocked_rcm_solve_inplace_kernel(block_size)
+        compact_traversal = symbolic_adjacency is not None
+        self._solve_kernel = make_llt_blocked_rcm_solve_kernel(block_size, compact_traversal)
+        self._solve_inplace_kernel = make_llt_blocked_rcm_solve_inplace_kernel(block_size, compact_traversal)
         # Auxiliary kernels resolved in _allocate_impl once we know max_dim.
         self._permute_vector_kernel = None
         self._fused_permute_and_tp_kernel = None
@@ -361,6 +376,10 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
             tp_offsets.append(tp_offsets[-1] + s)
         total_tp_size = tp_offsets[-1]
 
+        fixed_symbolic_data = None
+        if self._symbolic_adjacency is not None:
+            fixed_symbolic_data = _fixed_symbolic_data(dims, self._symbolic_adjacency, self._block_size)
+
         with wp.ScopedDevice(self._device):
             # Factorization + intermediate buffers.
             self._L = wp.zeros(shape=(info.total_mat_size,), dtype=self._dtype)
@@ -376,6 +395,8 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
 
             # Tile-pattern flat storage + offsets.
             self._tile_pattern = wp.zeros(shape=(total_tp_size,), dtype=wp.int32)
+            traversal_size = len(fixed_symbolic_data[3]) if fixed_symbolic_data is not None else 0
+            self._tile_traversal = wp.empty(shape=(max(1, traversal_size),), dtype=wp.int32)
             self._tpo = to_warp_int32_array(tp_offsets[:-1])
 
             # Batched-RCM scratch. Owning these here matches how the other
@@ -387,13 +408,13 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
                 device=self._device,
             )
 
-            if self._symbolic_adjacency is not None:
-                permutation, inverse, tile_pattern = _fixed_symbolic_data(
-                    dims, self._symbolic_adjacency, self._block_size
-                )
+            if fixed_symbolic_data is not None:
+                permutation, inverse, tile_pattern, tile_traversal = fixed_symbolic_data
                 self._P.assign(permutation)
                 self._inv_P.assign(inverse)
                 self._tile_pattern.assign(tile_pattern)
+                if tile_traversal:
+                    self._tile_traversal.assign(tile_traversal)
 
         # The batched-RCM launch callback (``self._reorder_callback``) is
         # (re)built lazily in ``_ensure_reorder_launches_bound`` the first
@@ -560,6 +581,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
             P=self._P,
             L=self._L,
             tile_pattern=self._tile_pattern,
+            tile_traversal=self._tile_traversal,
             b=b,
             y=self._y,
             x_hat=self._x_hat,
@@ -596,6 +618,7 @@ class LLTBlockedRCMSolver(DirectSolver[wp.float32, wp.int32]):
             tpo=self._tpo,
             L=self._L,
             tile_pattern=self._tile_pattern,
+            tile_traversal=self._tile_traversal,
             y=self._y,
             x=self._x_hat,
             num_blocks=num_blocks,
