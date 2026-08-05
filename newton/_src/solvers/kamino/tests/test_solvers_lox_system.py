@@ -9,10 +9,12 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.kamino._src.core.types import mat66f, vec6f
+from newton._src.solvers.kamino._src.linalg import LLTBlockedRCMSolver
 from newton._src.solvers.kamino._src.solvers.lox import (
     BODY_WEIGHT_STATUS_VALID,
     BatchedPrimalBodySystem,
 )
+from newton._src.solvers.kamino._src.solvers.lox.joint import BatchedStructuralJointSolver
 from newton._src.solvers.kamino._src.solvers.lox.linear import HybridLLTBlockedSolver
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
@@ -596,6 +598,90 @@ class TestLOXSystem(unittest.TestCase):
         np.testing.assert_array_equal(
             system.weight_status.numpy(), np.full(3, BODY_WEIGHT_STATUS_VALID, dtype=np.int32)
         )
+
+    def test_large_fixed_body_topology_solves_sparse_numeric_updates(self):
+        """Solve a large body chain using topology-cached symbolic analysis."""
+        body_count = 43
+        body_edges = tuple((body, body + 1) for body in range(body_count - 1))
+        system = BatchedPrimalBodySystem(
+            [body_count],
+            body_components=[tuple(range(body_count))],
+            body_edges=body_edges,
+            device=self.device,
+        )
+        self.assertIsInstance(system.linear_solver, LLTBlockedRCMSolver)
+
+        masses = np.linspace(1.0, 2.0, body_count, dtype=np.float32)
+        inertias = np.asarray(
+            [np.diag([0.2 + 0.01 * body, 0.3 + 0.01 * body, 0.4 + 0.01 * body]) for body in range(body_count)],
+            dtype=np.float32,
+        )
+        velocities = np.linspace(-0.3, 0.5, 6 * body_count, dtype=np.float32).reshape(body_count, 6)
+        system.assemble_bodies(
+            *_body_arrays(masses, inertias, velocities, device=self.device),
+            time_step=_world_dt(system, 0.01, self.device),
+        )
+
+        row_count = len(body_edges)
+        jacobian_first = np.tile(np.asarray([0.4, -0.2, 0.1, 0.3, -0.1, 0.2], dtype=np.float32), (row_count, 1))
+        jacobian_second = np.tile(np.asarray([-0.3, 0.1, -0.2, 0.2, 0.4, -0.1], dtype=np.float32), (row_count, 1))
+        row_arrays = _row_arrays(
+            np.zeros(row_count, dtype=np.int32),
+            np.arange(row_count, dtype=np.int32),
+            np.arange(1, body_count, dtype=np.int32),
+            jacobian_first,
+            jacobian_second,
+            self.device,
+        )
+        system.add_dynamic_rows(
+            *row_arrays,
+            wp.array(np.linspace(0.25, 0.65, row_count), dtype=wp.float32, device=self.device),
+            wp.array(np.linspace(-0.4, 0.7, row_count), dtype=wp.float32, device=self.device),
+        )
+        structural_solver = BatchedStructuralJointSolver(
+            body_system=system,
+            row_world=row_arrays[0],
+            body_first_global=row_arrays[1],
+            body_second_global=row_arrays[2],
+            jacobian_first=row_arrays[3],
+            jacobian_second=row_arrays[4],
+            block_row_offset=wp.array(np.arange(row_count), dtype=wp.int32, device=self.device),
+            block_row_count=wp.ones(row_count, dtype=wp.int32, device=self.device),
+            row_block=wp.array(np.arange(row_count), dtype=wp.int32, device=self.device),
+            prescribed_twist=wp.zeros(body_count, dtype=vec6f, device=self.device),
+        )
+        self.assertEqual(structural_solver.body_solve_block_size, system.linear_solver.block_size)
+        system.build_weighted_matrix()
+        system.factorize_and_solve()
+
+        matrix = system.weighted_matrix.numpy().reshape(6 * body_count, 6 * body_count)
+        right_hand_side = system.right_hand_side.numpy()
+        solution = system.solution.numpy()
+        np.testing.assert_allclose(matrix @ solution, right_hand_side, rtol=3.0e-4, atol=4.0e-5)
+
+        structural_solver.assemble_delassus()
+        joint_matrix = np.zeros((row_count, 6 * body_count), dtype=np.float32)
+        for row, (first, second) in enumerate(body_edges):
+            joint_matrix[row, 6 * first : 6 * first + 6] = jacobian_first[row]
+            joint_matrix[row, 6 * second : 6 * second + 6] = jacobian_second[row]
+        expected_delassus = joint_matrix @ np.linalg.solve(matrix, joint_matrix.T)
+        np.testing.assert_allclose(
+            structural_solver.unscaled_schur_matrix.numpy().reshape(row_count, row_count),
+            expected_delassus,
+            rtol=4.0e-4,
+            atol=5.0e-5,
+        )
+        if self.device.is_cuda:
+            with wp.ScopedCapture(device=self.device) as capture:
+                system.factorize_and_solve()
+                structural_solver.assemble_delassus()
+            wp.capture_launch(capture.graph)
+            np.testing.assert_allclose(
+                structural_solver.unscaled_schur_matrix.numpy().reshape(row_count, row_count),
+                expected_delassus,
+                rtol=4.0e-4,
+                atol=5.0e-5,
+            )
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from itertools import pairwise
 import warp as wp
 
 from ...core.types import mat66f, vec6f
-from ...linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo
+from ...linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo, LLTBlockedRCMSolver
 from .linear import HybridLLTBlockedSolver
 from .metric import METRIC_STATUS_VALID
 from .problem import compute_augmented_joint_row, compute_body_inertial_system, compute_dynamic_joint_row
@@ -33,6 +33,8 @@ from .weight import (
 __all__ = ["BatchedPrimalBodySystem"]
 
 wp.set_module_options({"enable_backward": False})
+
+_SPARSE_BODY_FACTOR_MIN_DIMENSION = 256
 
 
 @wp.kernel
@@ -894,6 +896,7 @@ class BatchedPrimalBodySystem:
         *,
         body_components: Sequence[Sequence[int]] | None = None,
         dynamic_bodies: Sequence[int] | None = None,
+        body_edges: Sequence[tuple[int, int]] | None = None,
     ):
         if len(body_counts) == 0:
             raise ValueError("At least one world is required.")
@@ -996,6 +999,11 @@ class BatchedPrimalBodySystem:
         self.body_block_host = tuple(body_block_host)
         self.body_local_host = tuple(body_local_host)
         self.body_vector_index_host = tuple(body_vector_index_host)
+        self.body_edges_host = frozenset(
+            (min(int(first), int(second)), max(int(first), int(second)))
+            for first, second in (body_edges or ())
+            if first >= 0 and second >= 0
+        )
         self.body_world = wp.array(body_world_host, dtype=wp.int32, device=self.device)
         self.body_block = wp.array(body_block_host, dtype=wp.int32, device=self.device)
         self.body_local = wp.array(body_local_host, dtype=wp.int32, device=self.device)
@@ -1005,17 +1013,88 @@ class BatchedPrimalBodySystem:
         self.block_has_unilateral = wp.ones(self.num_blocks, dtype=wp.int32, device=self.device)
         self.selective_body_weights = False
         self.operator = DenseLinearOperatorData(info=self.info, mat=self.weighted_matrix)
-        # Factorization benefits from fewer wide panels, while the repeated
-        # single-RHS solves retain the smaller tile for better occupancy.
-        self.linear_solver = HybridLLTBlockedSolver(
-            operator=self.operator,
-            factorize_block_size=64,
-            solve_block_dim=256,
-            dtype=wp.float32,
-            device=self.device,
-        )
+        if body_edges is not None and max(storage_dimensions) >= _SPARSE_BODY_FACTOR_MIN_DIMENSION:
+            symbolic_adjacency = self._build_symbolic_adjacency(body_edges)
+            self.linear_solver = LLTBlockedRCMSolver(
+                operator=self.operator,
+                block_size=32,
+                factorize_block_dim=128,
+                solve_block_dim=256,
+                parallel_factorization=True,
+                symbolic_adjacency=symbolic_adjacency,
+                dtype=wp.float32,
+                device=self.device,
+            )
+        else:
+            # Factorization benefits from fewer wide panels, while the repeated
+            # single-RHS solves retain the smaller tile for better occupancy.
+            self.linear_solver = HybridLLTBlockedSolver(
+                operator=self.operator,
+                factorize_block_size=64,
+                solve_block_dim=256,
+                dtype=wp.float32,
+                device=self.device,
+            )
         self._mass: wp.array[wp.float32] | None = None
         self._inertia_world: wp.array[wp.mat33f] | None = None
+
+    def _build_symbolic_adjacency(
+        self, body_edges: Sequence[tuple[int, int]]
+    ) -> tuple[tuple[tuple[int, ...], ...], ...]:
+        """Expand fixed body topology into scalar adjacency per factor block."""
+        adjacency_blocks = []
+        for body_count in self.block_body_counts:
+            dimension = 6 * body_count
+            adjacency = [set() for _ in range(dimension)]
+            for body_local in range(body_count):
+                start = 6 * body_local
+                for row in range(start, start + 6):
+                    adjacency[row].update(column for column in range(start, start + 6) if column != row)
+            adjacency_blocks.append(adjacency)
+
+        for first, second in body_edges:
+            if first < 0 or second < 0 or first >= self.num_bodies or second >= self.num_bodies:
+                raise ValueError("body_edges must reference packed bodies.")
+            first_block = self.body_block_host[first]
+            second_block = self.body_block_host[second]
+            if first_block < 0 or second_block < 0:
+                continue
+            if first_block != second_block:
+                raise ValueError("A body edge cannot span factor blocks.")
+            first_start = 6 * self.body_local_host[first]
+            second_start = 6 * self.body_local_host[second]
+            adjacency = adjacency_blocks[first_block]
+            for first_row in range(first_start, first_start + 6):
+                for second_row in range(second_start, second_start + 6):
+                    adjacency[first_row].add(second_row)
+                    adjacency[second_row].add(first_row)
+
+        return tuple(tuple(tuple(sorted(neighbors)) for neighbors in adjacency) for adjacency in adjacency_blocks)
+
+    def validate_body_pairs(
+        self,
+        name: str,
+        body_first: wp.array[wp.int32],
+        body_second: wp.array[wp.int32],
+    ) -> None:
+        """Verify fixed topology covers every dynamic off-diagonal assembly pair."""
+        first_values = body_first.numpy().astype(int).tolist()
+        second_values = body_second.numpy().astype(int).tolist()
+        if len(first_values) != len(second_values):
+            raise ValueError(f"{name} endpoint arrays must have identical lengths.")
+        missing = sorted(
+            {
+                (min(first, second), max(first, second))
+                for first, second in zip(first_values, second_values, strict=True)
+                if first >= 0
+                and second >= 0
+                and self.body_block_host[first] >= 0
+                and self.body_block_host[second] >= 0
+                and (min(first, second), max(first, second)) not in self.body_edges_host
+            }
+        )
+        if missing:
+            raise ValueError(f"Fixed body topology does not cover {name} pairs: {missing}.")
 
     def reset(self) -> None:
         """Clear assembled matrices, vectors, weights, and factorization state."""

@@ -48,6 +48,7 @@ from ._tile_builtins import (
 __all__ = [
     "llt_blocked_rcm_factorize",
     "llt_blocked_rcm_fused_permute_and_tp",
+    "llt_blocked_rcm_permute_matrix",
     "llt_blocked_rcm_permute_vector",
     "llt_blocked_rcm_solve",
     "llt_blocked_rcm_solve_inplace",
@@ -55,6 +56,7 @@ __all__ = [
     "make_llt_blocked_rcm_factorize_kernel",
     "make_llt_blocked_rcm_fused_permute_and_tp_kernel",
     "make_llt_blocked_rcm_parallel_factorize_kernels",
+    "make_llt_blocked_rcm_permute_matrix_kernel",
     "make_llt_blocked_rcm_permute_vector_kernel",
     "make_llt_blocked_rcm_solve_inplace_kernel",
     "make_llt_blocked_rcm_solve_kernel",
@@ -205,6 +207,44 @@ def make_llt_blocked_rcm_fused_permute_and_tp_kernel(block_size: int, max_dim: i
             wp.atomic_max(tile_pattern, tp_off + tr * n_tiles + tc, int(1))
 
     return fused_permute_and_tp_kernel
+
+
+@cache
+def make_llt_blocked_rcm_permute_matrix_kernel(max_dim: int):
+    """Build the lower triangle of ``A_hat = P A P^T`` for a fixed permutation."""
+    del max_dim
+
+    @wp.kernel
+    def permute_matrix_kernel(
+        dim: wp.array[wp.int32],
+        mio: wp.array[wp.int32],
+        vio: wp.array[wp.int32],
+        P: wp.array[wp.int32],
+        A: wp.array[wp.float32],
+        A_hat: wp.array[wp.float32],
+    ):
+        b, triangular_index = wp.tid()
+        n_i = dim[b]
+        triangular_size = n_i * (n_i + 1) // 2
+        if triangular_index >= triangular_size:
+            return
+
+        r = int((wp.sqrt(float(8 * triangular_index + 1)) - float(1)) * float(0.5))
+        row_start = r * (r + 1) // 2
+        if row_start > triangular_index:
+            r -= 1
+            row_start = r * (r + 1) // 2
+        elif (r + 1) * (r + 2) // 2 <= triangular_index:
+            r += 1
+            row_start = r * (r + 1) // 2
+        c = triangular_index - row_start
+        mat_off = mio[b]
+        vec_off = vio[b]
+        p_r = P[vec_off + r]
+        p_c = P[vec_off + c]
+        A_hat[mat_off + r * n_i + c] = A[mat_off + p_r * n_i + p_c]
+
+    return permute_matrix_kernel
 
 
 @cache
@@ -786,6 +826,27 @@ def llt_blocked_rcm_fused_permute_and_tp(
         kernel=kernel,
         dim=(num_blocks, max_dim * (max_dim + 1) // 2),
         inputs=[dim, mio, vio, tpo, float(tol), P, A, A_hat, inv_P, tile_pattern],
+        device=device,
+    )
+
+
+def llt_blocked_rcm_permute_matrix(
+    kernel,
+    dim: wp.array[wp.int32],
+    mio: wp.array[wp.int32],
+    vio: wp.array[wp.int32],
+    P: wp.array[wp.int32],
+    A: wp.array[wp.float32],
+    A_hat: wp.array[wp.float32],
+    num_blocks: int,
+    max_dim: int,
+    device: wp.DeviceLike = None,
+):
+    """Permute a batched matrix using an already initialized permutation."""
+    wp.launch(
+        kernel=kernel,
+        dim=(num_blocks, max_dim * (max_dim + 1) // 2),
+        inputs=[dim, mio, vio, P, A, A_hat],
         device=device,
     )
 

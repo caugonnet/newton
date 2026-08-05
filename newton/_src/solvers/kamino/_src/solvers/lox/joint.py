@@ -8,7 +8,7 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.types import mat66f, vec6f
-from ...linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo
+from ...linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo, LLTBlockedRCMSolver
 from .joint_factorize import make_batched_body_solve_kernel
 from .linear import HybridLLTBlockedSolver
 from .system import BatchedPrimalBodySystem
@@ -17,6 +17,50 @@ from .time import validate_world_time_step, validate_world_time_steps
 __all__ = ["BatchedStructuralJointSolver"]
 
 wp.set_module_options({"enable_backward": False})
+
+
+@wp.kernel
+def _permute_body_response_rows(
+    body_dimensions: wp.array[wp.int32],
+    body_vector_offsets: wp.array[wp.int32],
+    joint_dimensions: wp.array[wp.int32],
+    response_offsets: wp.array[wp.int32],
+    response_leading_dimensions: wp.array[wp.int32],
+    permutation: wp.array[wp.int32],
+    source: wp.array[wp.float32],
+    destination: wp.array[wp.float32],
+):
+    component, reordered_row, column = wp.tid()
+    if reordered_row >= body_dimensions[component] or column >= joint_dimensions[component]:
+        return
+    original_row = permutation[body_vector_offsets[component] + reordered_row]
+    response_offset = response_offsets[component]
+    leading_dimension = response_leading_dimensions[component]
+    destination[response_offset + reordered_row * leading_dimension + column] = source[
+        response_offset + original_row * leading_dimension + column
+    ]
+
+
+@wp.kernel
+def _unpermute_body_response_rows(
+    body_dimensions: wp.array[wp.int32],
+    body_vector_offsets: wp.array[wp.int32],
+    joint_dimensions: wp.array[wp.int32],
+    response_offsets: wp.array[wp.int32],
+    response_leading_dimensions: wp.array[wp.int32],
+    permutation: wp.array[wp.int32],
+    source: wp.array[wp.float32],
+    destination: wp.array[wp.float32],
+):
+    component, reordered_row, column = wp.tid()
+    if reordered_row >= body_dimensions[component] or column >= joint_dimensions[component]:
+        return
+    original_row = permutation[body_vector_offsets[component] + reordered_row]
+    response_offset = response_offsets[component]
+    leading_dimension = response_leading_dimensions[component]
+    destination[response_offset + original_row * leading_dimension + column] = source[
+        response_offset + reordered_row * leading_dimension + column
+    ]
 
 
 @wp.func
@@ -632,6 +676,11 @@ class BatchedStructuralJointSolver:
         self.response_leading_dimensions = wp.array(response_leading_dimensions, dtype=wp.int32, device=self.device)
         self.body_response = wp.zeros(response_offsets[-1], dtype=wp.float32, device=self.device)
         self.body_response_intermediate = wp.zeros_like(self.body_response)
+        self.body_response_permuted = (
+            wp.zeros_like(self.body_response)
+            if isinstance(body_system.linear_solver, LLTBlockedRCMSolver)
+            else self.body_response
+        )
         vector_row = [-1] * self.info.total_vec_size
         for row, vector_index in enumerate(row_vector_index):
             if vector_index >= 0:
@@ -718,6 +767,26 @@ class BatchedStructuralJointSolver:
             outputs=[self.body_response],
             device=self.device,
         )
+        if self.body_response_permuted is not self.body_response:
+            wp.launch(
+                _permute_body_response_rows,
+                dim=(
+                    self.body_system.num_blocks,
+                    self.body_system.info.max_dimension,
+                    self.info.max_dimension,
+                ),
+                inputs=[
+                    self.body_system.info.dim,
+                    self.body_system.info.vio,
+                    self.info.dim,
+                    self.response_offsets,
+                    self.response_leading_dimensions,
+                    self.body_system.linear_solver.P,
+                    self.body_response,
+                ],
+                outputs=[self.body_response_permuted],
+                device=self.device,
+            )
         wp.launch_tiled(
             self.batched_body_solve_kernel,
             dim=(self.body_system.num_blocks, self.body_solve_right_hand_side_block_count),
@@ -729,11 +798,31 @@ class BatchedStructuralJointSolver:
                 self.response_offsets,
                 self.response_leading_dimensions,
                 self.body_system.linear_solver.L,
-                self.body_response,
+                self.body_response_permuted,
             ],
             outputs=[self.body_response_intermediate],
             device=self.device,
         )
+        if self.body_response_permuted is not self.body_response:
+            wp.launch(
+                _unpermute_body_response_rows,
+                dim=(
+                    self.body_system.num_blocks,
+                    self.body_system.info.max_dimension,
+                    self.info.max_dimension,
+                ),
+                inputs=[
+                    self.body_system.info.dim,
+                    self.body_system.info.vio,
+                    self.info.dim,
+                    self.response_offsets,
+                    self.response_leading_dimensions,
+                    self.body_system.linear_solver.P,
+                    self.body_response_permuted,
+                ],
+                outputs=[self.body_response],
+                device=self.device,
+            )
         wp.launch(
             _assemble_schur_from_body_response,
             dim=(self.body_system.num_blocks, self.info.max_dimension, self.info.max_dimension),

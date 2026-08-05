@@ -1524,11 +1524,13 @@ class LOXKaminoAdapter:
         dynamic_bodies = self._classify_dynamic_bodies()
         body_mass = model.bodies.m_i.numpy()
         self.has_massless_dynamic_body = any(body_mass[body] <= 0.0 for body in dynamic_bodies)
-        body_components = self._build_body_components(dynamic_bodies)
+        body_edges = self._build_body_edges(dynamic_bodies)
+        body_components = self._build_body_components(dynamic_bodies, body_edges)
         self.system = BatchedPrimalBodySystem(
             body_counts,
             body_components=body_components,
             dynamic_bodies=dynamic_bodies,
+            body_edges=body_edges,
             device=self.device,
         )
         self.splitting = SplittingState(body_counts, device=self.device)
@@ -1548,6 +1550,16 @@ class LOXKaminoAdapter:
 
         self.cables = CableMaterialSystem(model, data)
         self._allocate_joint_rows()
+        self.system.validate_body_pairs("dynamic rows", self.dynamic_body_first_global, self.dynamic_body_second_global)
+        self.system.validate_body_pairs(
+            "structural rows", self.structural_body_first_global, self.structural_body_second_global
+        )
+        self.system.validate_body_pairs(
+            "structural blocks",
+            self.structural_block_body_first_global,
+            self.structural_block_body_second_global,
+        )
+        self.system.validate_body_pairs("smooth cable materials", self.cables.body_first, self.cables.body_second)
         self._allocate_effort_rows()
         self._allocate_joint_frictions()
         self._allocate_unilaterals()
@@ -1558,11 +1570,23 @@ class LOXKaminoAdapter:
     def _device_array(values: Sequence[int], device: wp.DeviceLike) -> wp.array[wp.int32]:
         return wp.array(values, dtype=wp.int32, device=device)
 
-    def _build_body_components(self, dynamic_bodies: Sequence[int]) -> tuple[tuple[int, ...], ...]:
+    def _build_body_edges(self, dynamic_bodies: Sequence[int]) -> tuple[tuple[int, int], ...]:
+        """Return fixed joint edges whose endpoints are both dynamic bodies."""
+        dynamic_body_set = set(dynamic_bodies)
+        joint_first = self.model.joints.bid_B.numpy().astype(int).tolist()
+        joint_second = self.model.joints.bid_F.numpy().astype(int).tolist()
+        return tuple(
+            (first, second)
+            for first, second in zip(joint_first, joint_second, strict=True)
+            if first in dynamic_body_set and second in dynamic_body_set
+        )
+
+    def _build_body_components(
+        self, dynamic_bodies: Sequence[int], body_edges: Sequence[tuple[int, int]]
+    ) -> tuple[tuple[int, ...], ...]:
         """Return joint-connected dynamic-body components without contact edges."""
         body_count = self.model.size.sum_of_num_bodies
         parent = list(range(body_count))
-        dynamic_body_set = set(dynamic_bodies)
 
         def find(body: int) -> int:
             root = body
@@ -1580,11 +1604,8 @@ class LOXKaminoAdapter:
             if first_root != second_root:
                 parent[second_root] = first_root
 
-        joint_first = self.model.joints.bid_B.numpy().astype(int).tolist()
-        joint_second = self.model.joints.bid_F.numpy().astype(int).tolist()
-        for first, second in zip(joint_first, joint_second, strict=True):
-            if first in dynamic_body_set and second in dynamic_body_set:
-                union(first, second)
+        for first, second in body_edges:
+            union(first, second)
 
         components: dict[int, list[int]] = {}
         for body in dynamic_bodies:
