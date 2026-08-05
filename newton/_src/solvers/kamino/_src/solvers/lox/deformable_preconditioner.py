@@ -36,6 +36,9 @@ parallelism crossover rather than a shared-memory capacity limit.
 _PERSISTENT_BLOCK_DIM_LIMIT = 512
 """Largest thread block used by persistent application."""
 
+_LEVEL_BLOCK_DIM = 64
+"""Thread block size used by level-scheduled triangular solves."""
+
 
 @wp.func
 def _is_finite_mat33(value: wp.mat33) -> bool:
@@ -717,6 +720,7 @@ class DeformableIncompleteLDLT:
                     x,
                 ],
                 outputs=[self.forward_solution],
+                block_dim=_LEVEL_BLOCK_DIM,
                 device=self.device,
             )
         for level in range(self.level_count - 1, -1, -1):
@@ -743,5 +747,6 @@ class DeformableIncompleteLDLT:
                     beta,
                 ],
                 outputs=[self.backward_solution, z],
+                block_dim=_LEVEL_BLOCK_DIM,
                 device=self.device,
             )

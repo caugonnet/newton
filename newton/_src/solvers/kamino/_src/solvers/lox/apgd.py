@@ -239,6 +239,38 @@ def _reconstruct_twist(
 
 
 @wp.kernel
+def _reconstruct_mixed_state(
+    particle_count: int,
+    body_count: int,
+    particle_world: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    baseline_velocity: wp.array[wp.vec3],
+    baseline_twist: wp.array[vec6f],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+    projected_velocity: wp.array[wp.vec3],
+    projected_twist: wp.array[vec6f],
+):
+    index = wp.tid()
+    if index < particle_count:
+        world = particle_world[index]
+        velocity = baseline_velocity[index]
+        if world_active[world] and projection_status[world] == PROJECTION_STATUS_VALID:
+            velocity += particle_delta[index]
+        projected_velocity[index] = velocity
+        particle_delta[index] = wp.vec3(0.0)
+    if index < body_count:
+        world = body_world[index]
+        twist = baseline_twist[index]
+        if world_active[world] and projection_status[world] == PROJECTION_STATUS_VALID:
+            twist += twist_delta[index]
+        projected_twist[index] = twist
+        twist_delta[index] = vec6f(0.0)
+
+
+@wp.kernel
 def _project_rigid_steps_fused(
     friction_capacity: int,
     contact_capacity: int,
@@ -541,6 +573,46 @@ def _scatter_rigid_reactions(adapter, world_active, inverse_weight, reaction_fie
     )
 
 
+def _reconstruct_state(
+    adapter,
+    body_world,
+    world_active,
+    body_baseline,
+    projected_twist,
+    deformable_contacts,
+    particle_baseline,
+    projected_velocity,
+) -> None:
+    if deformable_contacts is None:
+        wp.launch(
+            _reconstruct_twist,
+            dim=projected_twist.shape[0],
+            inputs=[body_world, world_active, adapter.projection_status, body_baseline],
+            outputs=[adapter.projection_twist_delta, projected_twist],
+            device=adapter.device,
+        )
+        return
+    particle_count = deformable_contacts.cloth_system.particle_count
+    wp.launch(
+        _reconstruct_mixed_state,
+        dim=max(particle_count, projected_twist.shape[0]),
+        inputs=[
+            particle_count,
+            projected_twist.shape[0],
+            deformable_contacts.cloth_system.topology.packed_world,
+            body_world,
+            world_active,
+            adapter.projection_status,
+            particle_baseline,
+            body_baseline,
+            deformable_contacts.particle_delta,
+            adapter.projection_twist_delta,
+        ],
+        outputs=[projected_velocity, projected_twist],
+        device=adapter.device,
+    )
+
+
 def project_constraints_apgd(
     projection_iterations: int,
     adapter,
@@ -626,20 +698,16 @@ def project_constraints_apgd(
                 use_trial=True,
                 projection_status=adapter.projection_status,
             )
-        wp.launch(
-            _reconstruct_twist,
-            dim=projected_twist.shape[0],
-            inputs=[body_world, world_active, adapter.projection_status, body_baseline],
-            outputs=[adapter.projection_twist_delta, projected_twist],
-            device=adapter.device,
+        _reconstruct_state(
+            adapter,
+            body_world,
+            world_active,
+            body_baseline,
+            projected_twist,
+            deformable_contacts,
+            particle_baseline,
+            projected_velocity,
         )
-        if deformable_contacts is not None:
-            deformable_contacts.reconstruct_apgd_particle_velocity(
-                world_active,
-                adapter.projection_status,
-                particle_baseline,
-                projected_velocity,
-            )
 
         if rigid_capacity > 0:
             wp.launch(
@@ -765,20 +833,16 @@ def project_constraints_apgd(
             use_trial=False,
             projection_status=adapter.projection_status,
         )
-    wp.launch(
-        _reconstruct_twist,
-        dim=projected_twist.shape[0],
-        inputs=[body_world, world_active, adapter.projection_status, body_baseline],
-        outputs=[adapter.projection_twist_delta, projected_twist],
-        device=adapter.device,
+    _reconstruct_state(
+        adapter,
+        body_world,
+        world_active,
+        body_baseline,
+        projected_twist,
+        deformable_contacts,
+        particle_baseline,
+        projected_velocity,
     )
-    if deformable_contacts is not None:
-        deformable_contacts.reconstruct_apgd_particle_velocity(
-            world_active,
-            adapter.projection_status,
-            particle_baseline,
-            projected_velocity,
-        )
 
 
 def project_deformable_constraints_apgd(

@@ -908,11 +908,23 @@ def _project_contacts(
     ):
         return
 
+    particles = wp.vec4i(
+        particle_indices[contact, 0],
+        particle_indices[contact, 1],
+        particle_indices[contact, 2],
+        particle_indices[contact, 3],
+    )
+    weights = wp.vec4(
+        coefficients[contact, 0],
+        coefficients[contact, 1],
+        coefficients[contact, 2],
+        coefficients[contact, 3],
+    )
     contact_velocity = bias[contact]
     for slot in range(4):
-        particle = particle_indices[contact, slot]
+        particle = particles[slot]
         if particle >= 0:
-            contact_velocity += coefficients[contact, slot] * projected_velocity[particle]
+            contact_velocity += weights[slot] * projected_velocity[particle]
 
     reaction_old = reaction[contact]
     free_velocity = contact_velocity - delassus[contact] * reaction_old
@@ -930,9 +942,9 @@ def _project_contacts(
 
     reaction[contact] = reaction_new
     for slot in range(4):
-        particle = particle_indices[contact, slot]
+        particle = particles[slot]
         if particle >= 0:
-            correction = inverse_weight[particle] * coefficients[contact, slot] * reaction_delta
+            correction = inverse_weight[particle] * weights[slot] * reaction_delta
             if not _is_finite_vec3(correction):
                 contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
                 wp.atomic_max(world_status, world, DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE)
@@ -1169,20 +1181,35 @@ def _project_rigid_contacts(
     ):
         return
 
+    particles = wp.vec4i(
+        particle_indices[contact, 0],
+        particle_indices[contact, 1],
+        particle_indices[contact, 2],
+        particle_indices[contact, 3],
+    )
+    weights = wp.vec4(
+        coefficients[contact, 0],
+        coefficients[contact, 1],
+        coefficients[contact, 2],
+        coefficients[contact, 3],
+    )
     contact_frame = frame[contact]
     velocity = rigid_bias[contact]
     for slot in range(4):
-        particle = particle_indices[contact, slot]
+        particle = particles[slot]
         if particle >= 0:
-            velocity += coefficients[contact, slot] * (wp.transpose(contact_frame) @ projected_velocity[particle])
+            velocity += weights[slot] * (wp.transpose(contact_frame) @ projected_velocity[particle])
     body = contact_body[contact]
+    contact_body_jacobian = mat36f(0.0)
     if body >= 0:
-        velocity += body_jacobian[contact] @ projected_twist[body]
+        contact_body_jacobian = body_jacobian[contact]
+        velocity += contact_body_jacobian @ projected_twist[body]
 
     reaction_old = reaction[contact]
-    free_velocity = velocity - delassus[contact] @ reaction_old
+    contact_block = delassus[contact]
+    free_velocity = velocity - contact_block @ reaction_old
     reaction_new = _solve_contact_coulomb_newton_normal_last(
-        delassus[contact],
+        contact_block,
         free_velocity,
         friction[contact],
     )
@@ -1199,9 +1226,9 @@ def _project_rigid_contacts(
 
     world_impulse_delta = contact_frame @ reaction_delta
     for slot in range(4):
-        particle = particle_indices[contact, slot]
+        particle = particles[slot]
         if particle >= 0:
-            particle_correction = particle_inverse_weight[particle] * coefficients[contact, slot] * world_impulse_delta
+            particle_correction = particle_inverse_weight[particle] * weights[slot] * world_impulse_delta
             if not _is_finite_vec3(particle_correction):
                 contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
                 wp.atomic_max(
@@ -1214,7 +1241,7 @@ def _project_rigid_contacts(
             wp.atomic_add(particle_delta, particle, particle_correction)
 
     if body >= 0:
-        body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ reaction_delta)
+        body_correction = body_inverse_weight[body] @ (wp.transpose(contact_body_jacobian) @ reaction_delta)
         if not _is_finite_vec6(body_correction):
             contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
             wp.atomic_max(
@@ -1536,11 +1563,11 @@ def _initialize_contacts_apgd(
         world = contact_world[contact]
         if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID or world < 0 or not world_active[world]:
             continue
-        value = particle_reaction[contact]
         if rigid_coordinates:
             value = project_contact_coulomb_cone_orthogonal(rigid_reaction[contact], friction[contact])
             rigid_reaction[contact] = value
         else:
+            value = particle_reaction[contact]
             value = _project_world_coulomb_cone(value, normal[contact], friction[contact])
             particle_reaction[contact] = value
         trial[contact] = value
@@ -1584,11 +1611,12 @@ def _scatter_contacts_apgd(
             or projection_status[world] != PROJECTION_STATUS_VALID
         ):
             continue
-        impulse = particle_reaction[contact]
-        if rigid_coordinates:
-            impulse = rigid_reaction[contact]
         if use_trial:
             impulse = trial[contact]
+        elif rigid_coordinates:
+            impulse = rigid_reaction[contact]
+        else:
+            impulse = particle_reaction[contact]
         world_impulse = impulse
         if rigid_coordinates:
             world_impulse = frame[contact] @ impulse
@@ -1649,9 +1677,10 @@ def _project_contacts_apgd(
         ):
             continue
         contact_frame = frame[contact]
-        velocity = bias[contact]
         if rigid_coordinates:
             velocity = rigid_bias[contact]
+        else:
+            velocity = bias[contact]
         for slot in range(4):
             particle = particle_indices[contact, slot]
             if particle >= 0:
@@ -1663,34 +1692,37 @@ def _project_contacts_apgd(
         if rigid_coordinates and body >= 0:
             velocity += body_jacobian[contact] @ projected_twist[body]
 
-        contact_normal = normal[contact]
         corrected = velocity
         if rigid_coordinates:
+            contact_friction = friction[contact]
             tangent_speed = wp.sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1])
-            corrected[2] += friction[contact] * tangent_speed
+            corrected[2] += contact_friction * tangent_speed
         else:
+            contact_normal = normal[contact]
+            contact_friction = friction[contact]
             normal_velocity = wp.dot(contact_normal, velocity)
             tangent_velocity = velocity - normal_velocity * contact_normal
-            corrected += friction[contact] * wp.length(tangent_velocity) * contact_normal
+            corrected += contact_friction * wp.length(tangent_velocity) * contact_normal
         if not _is_finite_vec3(corrected):
             contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
             contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
             projection_status[world] = PROJECTION_STATUS_INVALID
             continue
 
-        current = particle_reaction[contact]
         local_trial = trial[contact]
-        local_delassus = scalar_delassus[contact]
         next_value = wp.vec3(0.0)
         if rigid_coordinates:
-            free_velocity = velocity - rigid_delassus[contact] @ local_trial
+            contact_block = rigid_delassus[contact]
+            free_velocity = velocity - contact_block @ local_trial
             next_value = _solve_contact_coulomb_newton_normal_last(
-                rigid_delassus[contact],
+                contact_block,
                 free_velocity,
-                friction[contact],
+                contact_friction,
             )
             current = rigid_reaction[contact]
         else:
+            local_delassus = scalar_delassus[contact]
+            current = particle_reaction[contact]
             if not wp.isfinite(local_delassus) or local_delassus <= 0.0:
                 contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
                 contact_world_status[world] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
@@ -1699,7 +1731,7 @@ def _project_contacts_apgd(
             next_value = _project_world_coulomb_cone(
                 local_trial - corrected / local_delassus,
                 contact_normal,
-                friction[contact],
+                contact_friction,
             )
         if not _is_finite_vec3(next_value):
             contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
@@ -1707,9 +1739,10 @@ def _project_contacts_apgd(
             projection_status[world] = PROJECTION_STATUS_INVALID
             continue
         next_reaction[contact] = next_value
-        contact_velocity[contact] = velocity
         if rigid_coordinates:
             contact_velocity[contact] = contact_frame @ velocity
+        else:
+            contact_velocity[contact] = velocity
         wp.atomic_add(restart_dot, world, wp.dot(next_value - current, -corrected))
 
 

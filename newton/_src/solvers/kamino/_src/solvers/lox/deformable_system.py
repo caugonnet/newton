@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 import warp.sparse as wps
+from warp._src import sparse as _wps_internal
 from warp.optim import linear as wpl
 
 from .deformable_assembly import (
@@ -58,6 +59,7 @@ __all__ = [
 
 _PARTICLE_FLAG_ACTIVE = 1
 _PARTICLE_FLAG_PROXY = 2
+_SYSTEM_MATVEC_BLOCK_DIM = 128
 
 
 @wp.kernel
@@ -617,6 +619,7 @@ class DeformableFEMSystem:
         self.candidate_rhs = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
         self.smooth_velocity = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
         self.system_product = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
+        self._system_matvec_scalar_views: dict[int, wp.array] = {}
         self.nonlinear_rhs = wp.zeros(self.particle_count, dtype=wp.vec3, device=self.device)
         self.proximal_position_residual = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
         self.proximal_velocity_residual = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
@@ -1020,12 +1023,30 @@ class DeformableFEMSystem:
         alpha: float,
         beta: float,
     ) -> None:
-        wps.bsr_mv(
-            self.system_matrix,
-            x=x,
-            y=self.system_product,
-            alpha=1.0,
-            beta=0.0,
+        matrix = self.system_matrix
+        x_scalar = self._system_matvec_scalar_views.get(x.ptr)
+        if x_scalar is None:
+            x_scalar = _wps_internal._vec_array_view(x, wp.float32, matrix.ncol * 3)
+            self._system_matvec_scalar_views[x.ptr] = x_scalar
+        product_scalar = self._system_matvec_scalar_views.get(self.system_product.ptr)
+        if product_scalar is None:
+            product_scalar = _wps_internal._vec_array_view(self.system_product, wp.float32, matrix.nrow * 3)
+            self._system_matvec_scalar_views[self.system_product.ptr] = product_scalar
+        wp.launch(
+            kernel=_wps_internal.make_bsr_mv_kernel(block_cols=3),
+            dim=(matrix.nrow, 3),
+            inputs=[
+                wp.float32(1.0),
+                matrix.offsets,
+                matrix.row_counts,
+                matrix.columns,
+                matrix.scalar_values,
+                x_scalar,
+                wp.float32(0.0),
+                product_scalar,
+            ],
+            block_dim=_SYSTEM_MATVEC_BLOCK_DIM,
+            device=self.device,
         )
         wp.launch(
             finish_masked_system_product,

@@ -662,6 +662,32 @@ def _apply_jacobi_twist_delta(
 
 
 @wp.kernel
+def _apply_mixed_jacobi_delta(
+    particle_count: int,
+    body_count: int,
+    particle_world: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+    projected_velocity: wp.array[wp.vec3],
+    projected_twist: wp.array[vec6f],
+):
+    index = wp.tid()
+    if index < particle_count:
+        world = particle_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_velocity[index] += particle_delta[index]
+        particle_delta[index] = wp.vec3(0.0)
+    if index < body_count:
+        world = body_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_twist[index] += twist_delta[index]
+        twist_delta[index] = vec6f(0.0)
+
+
+@wp.kernel
 def _project_constraints_sequential(
     projection_iterations: wp.int32,
     world_active: wp.array[wp.bool],
@@ -1754,6 +1780,43 @@ def prepare_jacobi_projection_data(
         )
 
 
+def _apply_jacobi_delta(
+    body_world,
+    world_active,
+    world_status,
+    twist_delta,
+    projected_twist,
+    deformable_contacts,
+    deformable_projected_velocity,
+) -> None:
+    if deformable_contacts is None:
+        wp.launch(
+            _apply_jacobi_twist_delta,
+            dim=projected_twist.shape[0],
+            inputs=[body_world, world_active, world_status, twist_delta],
+            outputs=[projected_twist],
+            device=projected_twist.device,
+        )
+        return
+    particle_count = deformable_contacts.cloth_system.particle_count
+    wp.launch(
+        _apply_mixed_jacobi_delta,
+        dim=max(particle_count, projected_twist.shape[0]),
+        inputs=[
+            particle_count,
+            projected_twist.shape[0],
+            deformable_contacts.cloth_system.topology.packed_world,
+            body_world,
+            world_active,
+            world_status,
+            deformable_contacts.particle_delta,
+            twist_delta,
+        ],
+        outputs=[deformable_projected_velocity, projected_twist],
+        device=projected_twist.device,
+    )
+
+
 def project_constraints_jacobi(
     projection_iterations: int,
     world_active: wp.array[wp.bool],
@@ -1903,17 +1966,13 @@ def project_constraints_jacobi(
             world_status,
         )
     if warm_start:
-        wp.launch(
-            _apply_jacobi_twist_delta,
-            dim=projected_twist.shape[0],
-            inputs=[body_world, world_active, world_status, twist_delta],
-            outputs=[projected_twist],
-            device=projected_twist.device,
-        )
-    if warm_start and deformable_contacts is not None:
-        deformable_contacts.apply_rigid_particle_delta(
+        _apply_jacobi_delta(
+            body_world,
             world_active,
             world_status,
+            twist_delta,
+            projected_twist,
+            deformable_contacts,
             deformable_projected_velocity,
         )
 
@@ -2014,19 +2073,15 @@ def project_constraints_jacobi(
                 world_status,
                 coulomb_statistics=coulomb_statistics,
             )
-        wp.launch(
-            _apply_jacobi_twist_delta,
-            dim=projected_twist.shape[0],
-            inputs=[body_world, world_active, world_status, twist_delta],
-            outputs=[projected_twist],
-            device=projected_twist.device,
+        _apply_jacobi_delta(
+            body_world,
+            world_active,
+            world_status,
+            twist_delta,
+            projected_twist,
+            deformable_contacts,
+            deformable_projected_velocity,
         )
-        if deformable_contacts is not None:
-            deformable_contacts.apply_rigid_particle_delta(
-                world_active,
-                world_status,
-                deformable_projected_velocity,
-            )
 
 
 def project_constraints_sequential(
