@@ -176,6 +176,140 @@ class TestLOXSweep(unittest.TestCase):
         with self.assertRaises(ValueError):
             project_constraints_sequential(0, *([None] * 32))
 
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required for block synchronization")
+    def test_world_jacobi_matches_global_jacobi(self):
+        """Match the occupancy-gated world Jacobi path to the global path."""
+        device = wp.get_device("cuda:0")
+        world_count = device.sm_count * 4
+        world_ids = np.arange(world_count, dtype=np.int32)
+        zeros = np.zeros(world_count, dtype=np.int32)
+        ones = np.ones(world_count, dtype=np.int32)
+        minus_ones = -ones
+
+        body_world = wp.array(world_ids, dtype=wp.int32, device=device)
+        world_active = wp.ones(world_count, dtype=wp.bool, device=device)
+        world_offset = wp.array(world_ids, dtype=wp.int32, device=device)
+        world_count_one = wp.array(ones, dtype=wp.int32, device=device)
+        constraint_world = wp.array(world_ids, dtype=wp.int32, device=device)
+        constraint_local = wp.array(zeros, dtype=wp.int32, device=device)
+        body_first = wp.array(world_ids, dtype=wp.int32, device=device)
+        body_second = wp.array(minus_ones, dtype=wp.int32, device=device)
+
+        friction_jacobian_values = np.zeros((world_count, 6), dtype=np.float32)
+        friction_jacobian_values[:, 0] = 1.0
+        friction_jacobian_first = wp.array(friction_jacobian_values, dtype=vec6f, device=device)
+        friction_jacobian_second = wp.zeros(world_count, dtype=vec6f, device=device)
+        friction_impulse_bound = wp.full(world_count, 10.0, dtype=wp.float32, device=device)
+        friction_delassus = wp.ones(world_count, dtype=wp.float32, device=device)
+
+        contact_jacobian_values = np.zeros((world_count, 3, 6), dtype=np.float32)
+        contact_jacobian_values[:, 0, 3] = 1.0
+        contact_jacobian_values[:, 1, 4] = 1.0
+        contact_jacobian_values[:, 2, 2] = 1.0
+        contact_jacobian_first = wp.array(contact_jacobian_values, dtype=mat36f, device=device)
+        contact_jacobian_second = wp.zeros(world_count, dtype=mat36f, device=device)
+        contact_bias = wp.zeros(world_count, dtype=wp.vec3f, device=device)
+        contact_friction = wp.zeros(world_count, dtype=wp.float32, device=device)
+        contact_delassus = wp.array(
+            np.repeat(np.eye(3, dtype=np.float32)[None, :, :], world_count, axis=0),
+            dtype=wp.mat33f,
+            device=device,
+        )
+
+        limit_jacobian_values = np.zeros((world_count, 6), dtype=np.float32)
+        limit_jacobian_values[:, 1] = 1.0
+        limit_jacobian_first = wp.array(limit_jacobian_values, dtype=vec6f, device=device)
+        limit_jacobian_second = wp.zeros(world_count, dtype=vec6f, device=device)
+        limit_bias = wp.zeros(world_count, dtype=wp.float32, device=device)
+        limit_delassus = wp.ones(world_count, dtype=wp.float32, device=device)
+
+        inverse_weight = wp.array(
+            np.repeat(np.eye(6, dtype=np.float32)[None, :, :], world_count, axis=0),
+            dtype=mat66f,
+            device=device,
+        )
+        initial_twist = np.zeros((world_count, 6), dtype=np.float32)
+        initial_twist[:, :3] = [-1.0, -2.0, -3.0]
+        prepared_status = wp.full(world_count, PROJECTION_STATUS_VALID, dtype=wp.int32, device=device)
+
+        def run(use_world_projection: bool):
+            projected_twist = wp.array(initial_twist, dtype=vec6f, device=device)
+            twist_delta = wp.zeros(world_count, dtype=vec6f, device=device)
+            contact_reaction = wp.full(
+                world_count,
+                wp.vec3f(0.0, 0.0, 0.25),
+                dtype=wp.vec3f,
+                device=device,
+            )
+            limit_reaction = wp.full(world_count, 0.5, dtype=wp.float32, device=device)
+            friction_reaction = wp.full(world_count, 0.1, dtype=wp.float32, device=device)
+            world_status = wp.zeros(world_count, dtype=wp.int32, device=device)
+            offsets = {}
+            if use_world_projection:
+                offsets = {
+                    "world_body_offset": world_offset,
+                    "world_body_count": world_count_one,
+                    "world_friction_offset": world_offset,
+                    "world_contact_offset": world_offset,
+                    "world_limit_offset": world_offset,
+                }
+            project_constraints_jacobi(
+                3,
+                world_active,
+                body_world,
+                constraint_world,
+                constraint_local,
+                world_count_one,
+                body_first,
+                body_second,
+                friction_jacobian_first,
+                friction_jacobian_second,
+                friction_impulse_bound,
+                friction_delassus,
+                constraint_world,
+                constraint_local,
+                world_count_one,
+                body_first,
+                body_second,
+                contact_jacobian_first,
+                contact_jacobian_second,
+                contact_bias,
+                contact_friction,
+                contact_delassus,
+                constraint_world,
+                constraint_local,
+                world_count_one,
+                body_first,
+                body_second,
+                limit_jacobian_first,
+                limit_jacobian_second,
+                limit_bias,
+                limit_delassus,
+                inverse_weight,
+                projected_twist,
+                twist_delta,
+                contact_reaction,
+                limit_reaction,
+                friction_reaction,
+                prepared_status,
+                world_status,
+                **offsets,
+            )
+            return (
+                projected_twist.numpy(),
+                contact_reaction.numpy(),
+                limit_reaction.numpy(),
+                friction_reaction.numpy(),
+                twist_delta.numpy(),
+                world_status.numpy(),
+            )
+
+        global_result = run(False)
+        world_result = run(True)
+        for global_value, world_value in zip(global_result[:-1], world_result[:-1], strict=True):
+            np.testing.assert_allclose(world_value, global_value, rtol=0.0, atol=2.0e-6)
+        np.testing.assert_array_equal(world_result[-1], global_result[-1])
+
     def test_mass_split_jacobi_scales_body_contributions(self):
         inverse_weight = wp.array([np.eye(6, dtype=np.float32)] * 2, dtype=mat66f, device=self.device)
         projected_twist = wp.array([[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0] * 6], dtype=vec6f, device=self.device)

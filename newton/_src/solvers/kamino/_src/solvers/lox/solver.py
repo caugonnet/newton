@@ -1457,6 +1457,11 @@ class LOXSolver:
                     self.deformable_splitting.projected_velocity if self._deformable_contacts_active else None
                 ),
                 coulomb_statistics=self.coulomb_solve_statistics,
+                world_body_offset=adapter.model.info.bodies_offset,
+                world_body_count=adapter.model.info.num_bodies,
+                world_friction_offset=adapter.world_friction_offset,
+                world_contact_offset=adapter.world_contact_offset,
+                world_limit_offset=adapter.world_limit_offset,
             )
         elif self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors > 1:
             self._colored_gauss_seidel.project(

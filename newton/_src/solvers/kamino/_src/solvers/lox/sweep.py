@@ -43,6 +43,15 @@ wp.set_module_options({"enable_backward": False})
 
 _JACOBI_CONTACT_BLOCK_DIM = 128
 _JACOBI_CONTACT_PROJECTION_BLOCKS_PER_SM = 5
+_JACOBI_WORLD_BLOCK_DIM = 128
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+__syncthreads();
+#endif
+""")
+def _sync_threads(): ...
 
 
 @wp.kernel
@@ -679,6 +688,275 @@ def _project_frictions_jacobi(
     reaction[friction] = reaction_new
     _atomic_add_twist(twist_delta, first, correction_first)
     _atomic_add_twist(twist_delta, second, correction_second)
+
+
+@wp.kernel
+def _project_rigid_constraints_jacobi_by_world(
+    projection_iterations: wp.int32,
+    warm_start: wp.bool,
+    world_active: wp.array[wp.bool],
+    body_offset: wp.array[wp.int32],
+    body_count: wp.array[wp.int32],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    friction_impulse_bound: wp.array[wp.float32],
+    friction_delassus: wp.array[wp.float32],
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_delassus: wp.array[wp.mat33f],
+    contact_bias: wp.array[wp.vec3f],
+    contact_friction: wp.array[wp.float32],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    limit_bias: wp.array[wp.float32],
+    limit_delassus: wp.array[wp.float32],
+    inverse_weight: wp.array[mat66f],
+    projected_twist: wp.array[vec6f],
+    friction_reaction: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    twist_delta: wp.array[vec6f],
+    world_status: wp.array[wp.int32],
+):
+    world, lane = wp.tid()
+    if not world_active[world] or world_status[world] != PROJECTION_STATUS_VALID:
+        return
+
+    thread_count = wp.block_dim()
+    local = lane
+    while local < body_count[world]:
+        twist_delta[body_offset[world] + local] = vec6f(0.0)
+        local += thread_count
+    _sync_threads()
+
+    if warm_start:
+        local = lane
+        while local < world_friction_count[world]:
+            friction = world_friction_offset[world] + local
+            friction_first = friction_body_first[friction]
+            friction_second = friction_body_second[friction]
+            friction_impulse = friction_reaction[friction]
+            if friction_first >= 0:
+                _atomic_add_twist(
+                    twist_delta,
+                    friction_first,
+                    friction_jacobian_first[friction] * friction_impulse,
+                )
+            if friction_second >= 0:
+                _atomic_add_twist(
+                    twist_delta,
+                    friction_second,
+                    friction_jacobian_second[friction] * friction_impulse,
+                )
+            local += thread_count
+
+        local = lane
+        while local < world_contact_count[world]:
+            contact = world_contact_offset[world] + local
+            contact_first = contact_body_first[contact]
+            contact_second = contact_body_second[contact]
+            contact_impulse = contact_reaction[contact]
+            if contact_first >= 0:
+                _atomic_add_twist(
+                    twist_delta,
+                    contact_first,
+                    wp.transpose(contact_jacobian_first[contact]) @ contact_impulse,
+                )
+            if contact_second >= 0:
+                _atomic_add_twist(
+                    twist_delta,
+                    contact_second,
+                    wp.transpose(contact_jacobian_second[contact]) @ contact_impulse,
+                )
+            local += thread_count
+
+        local = lane
+        while local < world_limit_count[world]:
+            limit = world_limit_offset[world] + local
+            limit_first = limit_body_first[limit]
+            limit_second = limit_body_second[limit]
+            limit_impulse = limit_reaction[limit]
+            if limit_first >= 0:
+                _atomic_add_twist(
+                    twist_delta,
+                    limit_first,
+                    limit_jacobian_first[limit] * limit_impulse,
+                )
+            if limit_second >= 0:
+                _atomic_add_twist(
+                    twist_delta,
+                    limit_second,
+                    limit_jacobian_second[limit] * limit_impulse,
+                )
+            local += thread_count
+
+        _sync_threads()
+        local = lane
+        while local < body_count[world]:
+            body = body_offset[world] + local
+            warmstart_correction = inverse_weight[body] @ twist_delta[body]
+            if _is_finite_twist(warmstart_correction):
+                projected_twist[body] += warmstart_correction
+            else:
+                world_status[world] = PROJECTION_STATUS_INVALID
+            twist_delta[body] = vec6f(0.0)
+            local += thread_count
+        _sync_threads()
+        if world_status[world] != PROJECTION_STATUS_VALID:
+            return
+
+    for _sweep in range(projection_iterations):
+        local = lane
+        while local < world_friction_count[world]:
+            friction = world_friction_offset[world] + local
+            first = friction_body_first[friction]
+            second = friction_body_second[friction]
+            current_velocity = wp.float32(0.0)
+            if first >= 0:
+                current_velocity += wp.dot(friction_jacobian_first[friction], projected_twist[first])
+            if second >= 0:
+                current_velocity += wp.dot(friction_jacobian_second[friction], projected_twist[second])
+            reaction_old = friction_reaction[friction]
+            split_delassus = friction_delassus[friction]
+            free_velocity = current_velocity - split_delassus * reaction_old
+            reaction_new = wp.clamp(
+                -free_velocity / split_delassus,
+                -friction_impulse_bound[friction],
+                friction_impulse_bound[friction],
+            )
+            reaction_delta = reaction_new - reaction_old
+            if wp.isfinite(reaction_new) and wp.isfinite(reaction_delta):
+                correction_first = vec6f(0.0)
+                correction_second = vec6f(0.0)
+                if first >= 0:
+                    correction_first = (inverse_weight[first] @ friction_jacobian_first[friction]) * reaction_delta
+                if second >= 0:
+                    correction_second = (inverse_weight[second] @ friction_jacobian_second[friction]) * reaction_delta
+                if _is_finite_twist(correction_first) and _is_finite_twist(correction_second):
+                    friction_reaction[friction] = reaction_new
+                    _atomic_add_twist(twist_delta, first, correction_first)
+                    _atomic_add_twist(twist_delta, second, correction_second)
+                else:
+                    world_status[world] = PROJECTION_STATUS_INVALID
+            else:
+                world_status[world] = PROJECTION_STATUS_INVALID
+            local += thread_count
+
+        local = lane
+        while local < world_contact_count[world]:
+            contact = world_contact_offset[world] + local
+            first = contact_body_first[contact]
+            second = contact_body_second[contact]
+            if first < 0 and second < 0:
+                contact_reaction[contact] = wp.vec3f(0.0)
+            else:
+                twist_first = vec6f(0.0)
+                twist_second = vec6f(0.0)
+                if first >= 0:
+                    twist_first = projected_twist[first]
+                if second >= 0:
+                    twist_second = projected_twist[second]
+                contact_reaction_old = contact_reaction[contact]
+                contact_velocity_value = (
+                    contact_jacobian_first[contact] @ twist_first
+                    + contact_jacobian_second[contact] @ twist_second
+                    + contact_bias[contact]
+                )
+                contact_block = contact_delassus[contact]
+                contact_free_velocity = contact_velocity_value - contact_block @ contact_reaction_old
+                contact_reaction_new = _solve_contact_coulomb_newton_normal_last(
+                    contact_block,
+                    contact_free_velocity,
+                    contact_friction[contact],
+                )
+                contact_reaction_delta = contact_reaction_new - contact_reaction_old
+                reaction_finite = (
+                    wp.isfinite(contact_reaction_new[0])
+                    and wp.isfinite(contact_reaction_new[1])
+                    and wp.isfinite(contact_reaction_new[2])
+                    and wp.isfinite(contact_reaction_delta[0])
+                    and wp.isfinite(contact_reaction_delta[1])
+                    and wp.isfinite(contact_reaction_delta[2])
+                )
+                if reaction_finite:
+                    contact_correction_first = vec6f(0.0)
+                    contact_correction_second = vec6f(0.0)
+                    if first >= 0:
+                        contact_correction_first = inverse_weight[first] @ (
+                            wp.transpose(contact_jacobian_first[contact]) @ contact_reaction_delta
+                        )
+                    if second >= 0:
+                        contact_correction_second = inverse_weight[second] @ (
+                            wp.transpose(contact_jacobian_second[contact]) @ contact_reaction_delta
+                        )
+                    if _is_finite_twist(contact_correction_first) and _is_finite_twist(contact_correction_second):
+                        contact_reaction[contact] = contact_reaction_new
+                        _atomic_add_twist(twist_delta, first, contact_correction_first)
+                        _atomic_add_twist(twist_delta, second, contact_correction_second)
+                    else:
+                        world_status[world] = PROJECTION_STATUS_INVALID
+                else:
+                    world_status[world] = PROJECTION_STATUS_INVALID
+            local += thread_count
+
+        local = lane
+        while local < world_limit_count[world]:
+            limit = world_limit_offset[world] + local
+            first = limit_body_first[limit]
+            second = limit_body_second[limit]
+            if first < 0 and second < 0:
+                limit_reaction[limit] = 0.0
+            else:
+                current_velocity = limit_bias[limit]
+                if first >= 0:
+                    current_velocity += wp.dot(limit_jacobian_first[limit], projected_twist[first])
+                if second >= 0:
+                    current_velocity += wp.dot(limit_jacobian_second[limit], projected_twist[second])
+                reaction_old = limit_reaction[limit]
+                split_delassus = limit_delassus[limit]
+                free_velocity = current_velocity - split_delassus * reaction_old
+                reaction_new = wp.max(-free_velocity / split_delassus, 0.0)
+                reaction_delta = reaction_new - reaction_old
+                if wp.isfinite(reaction_new) and wp.isfinite(reaction_delta):
+                    correction_first = vec6f(0.0)
+                    correction_second = vec6f(0.0)
+                    if first >= 0:
+                        correction_first = (inverse_weight[first] @ limit_jacobian_first[limit]) * reaction_delta
+                    if second >= 0:
+                        correction_second = (inverse_weight[second] @ limit_jacobian_second[limit]) * reaction_delta
+                    if _is_finite_twist(correction_first) and _is_finite_twist(correction_second):
+                        limit_reaction[limit] = reaction_new
+                        _atomic_add_twist(twist_delta, first, correction_first)
+                        _atomic_add_twist(twist_delta, second, correction_second)
+                    else:
+                        world_status[world] = PROJECTION_STATUS_INVALID
+                else:
+                    world_status[world] = PROJECTION_STATUS_INVALID
+            local += thread_count
+
+        _sync_threads()
+        local = lane
+        while local < body_count[world]:
+            body = body_offset[world] + local
+            if world_status[world] == PROJECTION_STATUS_VALID:
+                projected_twist[body] += twist_delta[body]
+            twist_delta[body] = vec6f(0.0)
+            local += thread_count
+        _sync_threads()
+        if world_status[world] != PROJECTION_STATUS_VALID:
+            return
 
 
 @wp.kernel
@@ -1986,6 +2264,11 @@ def project_constraints_jacobi(
     deformable_projected_velocity: wp.array[wp.vec3] | None = None,
     warm_start: bool = True,
     coulomb_statistics: CoulombSolveStatistics | None = None,
+    world_body_offset: wp.array[wp.int32] | None = None,
+    world_body_count: wp.array[wp.int32] | None = None,
+    world_friction_offset: wp.array[wp.int32] | None = None,
+    world_contact_offset: wp.array[wp.int32] | None = None,
+    world_limit_offset: wp.array[wp.int32] | None = None,
 ) -> None:
     """Run mass-split Jacobi sweeps over all body-space unilaterals.
 
@@ -2012,6 +2295,19 @@ def project_constraints_jacobi(
     if projected_twist.device.is_cuda:
         contact_projection_max_blocks = projected_twist.device.sm_count * _JACOBI_CONTACT_PROJECTION_BLOCKS_PER_SM
 
+    world_projection_min_count = projected_twist.device.sm_count * 4 if projected_twist.device.is_cuda else 0
+    use_world_projection = (
+        projected_twist.device.is_cuda
+        and world_count >= world_projection_min_count
+        and deformable_contacts is None
+        and coulomb_statistics is None
+        and world_body_offset is not None
+        and world_body_count is not None
+        and world_friction_offset is not None
+        and world_contact_offset is not None
+        and world_limit_offset is not None
+    )
+
     if warm_start:
         wp.launch(
             _initialize_jacobi_projection_status,
@@ -2020,10 +2316,11 @@ def project_constraints_jacobi(
             outputs=[world_status],
             device=projected_twist.device,
         )
-    twist_delta.zero_()
+    if not use_world_projection:
+        twist_delta.zero_()
     if deformable_contacts is not None:
         deformable_contacts.begin_rigid_jacobi_accumulation()
-    if warm_start and contact_world.shape[0] > 0:
+    if warm_start and not use_world_projection and contact_world.shape[0] > 0:
         wp.launch(
             _warmstart_contacts_jacobi,
             dim=contact_world.shape[0],
@@ -2044,7 +2341,7 @@ def project_constraints_jacobi(
             outputs=[twist_delta],
             device=projected_twist.device,
         )
-    if warm_start and friction_world.shape[0] > 0:
+    if warm_start and not use_world_projection and friction_world.shape[0] > 0:
         wp.launch(
             _warmstart_frictions_jacobi,
             dim=friction_world.shape[0],
@@ -2065,7 +2362,7 @@ def project_constraints_jacobi(
             outputs=[twist_delta],
             device=projected_twist.device,
         )
-    if warm_start and limit_world.shape[0] > 0:
+    if warm_start and not use_world_projection and limit_world.shape[0] > 0:
         wp.launch(
             _warmstart_limits_jacobi,
             dim=limit_world.shape[0],
@@ -2098,7 +2395,7 @@ def project_constraints_jacobi(
             twist_delta,
             world_status,
         )
-    if warm_start:
+    if warm_start and not use_world_projection:
         _apply_jacobi_warmstart_delta(
             body_world,
             world_active,
@@ -2109,6 +2406,56 @@ def project_constraints_jacobi(
             deformable_contacts,
             deformable_projected_velocity,
         )
+
+    if use_world_projection:
+        wp.launch(
+            _project_rigid_constraints_jacobi_by_world,
+            dim=(world_count, _JACOBI_WORLD_BLOCK_DIM),
+            block_dim=_JACOBI_WORLD_BLOCK_DIM,
+            inputs=[
+                projection_iterations,
+                warm_start,
+                world_active,
+                world_body_offset,
+                world_body_count,
+                world_friction_offset,
+                world_friction_count,
+                friction_body_first,
+                friction_body_second,
+                friction_jacobian_first,
+                friction_jacobian_second,
+                friction_impulse_bound,
+                friction_delassus,
+                world_contact_offset,
+                world_contact_count,
+                contact_body_first,
+                contact_body_second,
+                contact_jacobian_first,
+                contact_jacobian_second,
+                contact_delassus,
+                contact_bias,
+                contact_friction,
+                world_limit_offset,
+                world_limit_count,
+                limit_body_first,
+                limit_body_second,
+                limit_jacobian_first,
+                limit_jacobian_second,
+                limit_bias,
+                limit_delassus,
+                inverse_weight,
+                projected_twist,
+            ],
+            outputs=[
+                friction_reaction,
+                contact_reaction,
+                limit_reaction,
+                twist_delta,
+                world_status,
+            ],
+            device=projected_twist.device,
+        )
+        return
 
     for _sweep in range(projection_iterations):
         if friction_world.shape[0] > 0:
