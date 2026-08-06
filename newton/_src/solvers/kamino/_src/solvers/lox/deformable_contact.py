@@ -80,6 +80,8 @@ _COEFFICIENT_TOLERANCE = 1.0e-5
 _NORMAL_EPSILON = 1.0e-12
 _APGD_BLOCK_DIM = 256
 _APGD_BLOCKS_PER_SM = 2
+# The Coulomb solve's register footprint benefits from smaller projection blocks.
+_RIGID_CONTACT_PROJECTION_BLOCK_DIM = 128
 
 
 def _bounded_apgd_worker_count(capacity: int, device) -> int:
@@ -1200,10 +1202,8 @@ def _project_rigid_contacts(
         if particle >= 0:
             velocity += weights[slot] * (wp.transpose(contact_frame) @ projected_velocity[particle])
     body = contact_body[contact]
-    contact_body_jacobian = mat36f(0.0)
     if body >= 0:
-        contact_body_jacobian = body_jacobian[contact]
-        velocity += contact_body_jacobian @ projected_twist[body]
+        velocity += body_jacobian[contact] @ projected_twist[body]
 
     reaction_old = reaction[contact]
     contact_block = delassus[contact]
@@ -1241,7 +1241,8 @@ def _project_rigid_contacts(
             wp.atomic_add(particle_delta, particle, particle_correction)
 
     if body >= 0:
-        body_correction = body_inverse_weight[body] @ (wp.transpose(contact_body_jacobian) @ reaction_delta)
+        # Reload after the local solve instead of keeping 18 Jacobian scalars live across it.
+        body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ reaction_delta)
         if not _is_finite_vec6(body_correction):
             contact_status[contact] = DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE
             wp.atomic_max(
@@ -2963,6 +2964,7 @@ class DeformableContactSystem:
                 inputs=inputs,
                 outputs=outputs,
                 device=self.device,
+                block_dim=_RIGID_CONTACT_PROJECTION_BLOCK_DIM,
             )
         else:
             wp.launch(
@@ -2977,6 +2979,7 @@ class DeformableContactSystem:
                     coulomb_statistics.failure_counts,
                 ],
                 device=self.device,
+                block_dim=_RIGID_CONTACT_PROJECTION_BLOCK_DIM,
             )
 
     def apply_rigid_particle_delta(

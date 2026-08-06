@@ -60,48 +60,67 @@ class _CoulombSolveResult:
 
 
 @wp.func
-def _solve_mat22(
+def _solve_symmetric_mat22(
     a00: wp.float32,
     a01: wp.float32,
-    a10: wp.float32,
     a11: wp.float32,
     b0: wp.float32,
     b1: wp.float32,
 ) -> wp.vec2f:
-    det = a00 * a11 - a01 * a10
+    det = a00 * a11 - a01 * a01
     inv_det = 1.0 / det
-    return wp.vec2f((a11 * b0 - a01 * b1) * inv_det, (a00 * b1 - a10 * b0) * inv_det)
+    return wp.vec2f((a11 * b0 - a01 * b1) * inv_det, (a00 * b1 - a01 * b0) * inv_det)
+
+
+@wp.func
+def _compute_sliding_root_value(
+    tangent00: wp.float32,
+    tangent01: wp.float32,
+    tangent11: wp.float32,
+    tangent_rhs: wp.vec2f,
+    friction_normal_tangent: wp.vec2f,
+    friction_normal_rhs: wp.float32,
+    alpha: wp.float32,
+) -> wp.float32:
+    shifted00 = tangent00 + alpha
+    shifted11 = tangent11 + alpha
+    s = _solve_symmetric_mat22(
+        shifted00,
+        tangent01,
+        shifted11,
+        tangent_rhs[0],
+        tangent_rhs[1],
+    )
+    return wp.length(s) - wp.dot(friction_normal_tangent, s) + friction_normal_rhs
 
 
 @wp.func
 def _compute_sliding_root_data(
     tangent00: wp.float32,
     tangent01: wp.float32,
-    tangent10: wp.float32,
     tangent11: wp.float32,
     tangent_rhs: wp.vec2f,
-    normal_tangent: wp.vec2f,
-    normal_rhs: wp.float32,
-    normal_delassus: wp.float32,
-    friction: wp.float32,
+    friction_normal_tangent: wp.vec2f,
+    friction_normal_rhs: wp.float32,
     alpha: wp.float32,
 ) -> wp.vec4f:
     shifted00 = tangent00 + alpha
     shifted11 = tangent11 + alpha
-    s = _solve_mat22(
-        shifted00,
-        tangent01,
-        tangent10,
-        shifted11,
-        tangent_rhs[0],
-        tangent_rhs[1],
+    determinant = shifted00 * shifted11 - tangent01 * tangent01
+    inverse_determinant = 1.0 / determinant
+    s = wp.vec2f(
+        (shifted11 * tangent_rhs[0] - tangent01 * tangent_rhs[1]) * inverse_determinant,
+        (shifted00 * tangent_rhs[1] - tangent01 * tangent_rhs[0]) * inverse_determinant,
     )
-    t = _solve_mat22(shifted00, tangent01, tangent10, shifted11, s[0], s[1])
+    t = wp.vec2f(
+        (shifted11 * s[0] - tangent01 * s[1]) * inverse_determinant,
+        (shifted00 * s[1] - tangent01 * s[0]) * inverse_determinant,
+    )
     s_norm = wp.length(s)
-    value = s_norm - friction * (wp.dot(normal_tangent, s) - normal_rhs) / normal_delassus
+    value = s_norm - wp.dot(friction_normal_tangent, s) + friction_normal_rhs
     derivative = wp.float32(0.0)
     if s_norm > 1.0e-30:
-        derivative = -(wp.dot(s, t)) / s_norm + friction * wp.dot(normal_tangent, t) / normal_delassus
+        derivative = -(wp.dot(s, t)) / s_norm + wp.dot(friction_normal_tangent, t)
     return wp.vec4f(value, derivative, s[0], s[1])
 
 
@@ -111,7 +130,6 @@ def _solve_contact_coulomb_newton_components(
     normal_tangent: wp.vec2f,
     tangent_delassus00: wp.float32,
     tangent_delassus01: wp.float32,
-    tangent_delassus10: wp.float32,
     tangent_delassus11: wp.float32,
     normal_rhs: wp.float32,
     tangent_rhs_raw: wp.vec2f,
@@ -125,30 +143,31 @@ def _solve_contact_coulomb_newton_components(
     if friction <= 0.0:
         return wp.vec3f(-normal_rhs / normal_delassus, 0.0, 0.0)
 
-    tangent00 = tangent_delassus00 - normal_tangent[0] * normal_tangent[0] / normal_delassus
-    tangent01 = tangent_delassus01 - normal_tangent[0] * normal_tangent[1] / normal_delassus
-    tangent10 = tangent_delassus10 - normal_tangent[1] * normal_tangent[0] / normal_delassus
-    tangent11 = tangent_delassus11 - normal_tangent[1] * normal_tangent[1] / normal_delassus
-    tangent_rhs = tangent_rhs_raw - (normal_rhs / normal_delassus) * normal_tangent
+    inverse_normal_delassus = 1.0 / normal_delassus
+    tangent00 = tangent_delassus00 - normal_tangent[0] * normal_tangent[0] * inverse_normal_delassus
+    tangent01 = tangent_delassus01 - normal_tangent[0] * normal_tangent[1] * inverse_normal_delassus
+    tangent11 = tangent_delassus11 - normal_tangent[1] * normal_tangent[1] * inverse_normal_delassus
+    tangent_rhs = tangent_rhs_raw - (normal_rhs * inverse_normal_delassus) * normal_tangent
+    friction_over_normal = friction * inverse_normal_delassus
+    friction_normal_tangent = friction_over_normal * normal_tangent
+    friction_normal_rhs = friction_over_normal * normal_rhs
 
-    unshifted = _solve_mat22(
+    unshifted = _solve_symmetric_mat22(
         tangent00,
         tangent01,
-        tangent10,
         tangent11,
         tangent_rhs[0],
         tangent_rhs[1],
     )
-    value_at_zero = wp.length(unshifted) - friction * (wp.dot(normal_tangent, unshifted) - normal_rhs) / normal_delassus
+    value_at_zero = wp.length(unshifted) - wp.dot(friction_normal_tangent, unshifted) + friction_normal_rhs
     if value_at_zero <= 1.0e-7:
         tangent_reaction = -unshifted
-        normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
+        normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) * inverse_normal_delassus
         return wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
 
     # Normalizing alpha by the Schur-complement scale keeps the fixed root
     # tolerances useful across contact blocks with different magnitudes.
     alpha_scale = wp.max(wp.abs(tangent00), wp.abs(tangent01))
-    alpha_scale = wp.max(alpha_scale, wp.abs(tangent10))
     alpha_scale = wp.max(alpha_scale, wp.abs(tangent11))
     alpha_scale = wp.max(alpha_scale, 1.0e-20)
 
@@ -156,19 +175,16 @@ def _solve_contact_coulomb_newton_components(
     upper = wp.float32(1.0)
     last_s = unshifted
     for _ in range(64):
-        upper_data = _compute_sliding_root_data(
+        upper_value = _compute_sliding_root_value(
             tangent00,
             tangent01,
-            tangent10,
             tangent11,
             tangent_rhs,
-            normal_tangent,
-            normal_rhs,
-            normal_delassus,
-            friction,
+            friction_normal_tangent,
+            friction_normal_rhs,
             upper * alpha_scale,
         )
-        if upper_data[0] <= 0.0:
+        if upper_value <= 0.0:
             break
         upper = upper * 2.0
 
@@ -177,13 +193,10 @@ def _solve_contact_coulomb_newton_components(
         root_data = _compute_sliding_root_data(
             tangent00,
             tangent01,
-            tangent10,
             tangent11,
             tangent_rhs,
-            normal_tangent,
-            normal_rhs,
-            normal_delassus,
-            friction,
+            friction_normal_tangent,
+            friction_normal_rhs,
             alpha * alpha_scale,
         )
         value = root_data[0]
@@ -211,7 +224,7 @@ def _solve_contact_coulomb_newton_components(
         alpha = next_alpha
 
     tangent_reaction = -last_s
-    normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
+    normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) * inverse_normal_delassus
     return wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
 
 
@@ -241,7 +254,6 @@ def solve_contact_coulomb_newton(
         wp.vec2f(delassus[1, 0], delassus[2, 0]),
         delassus[1, 1],
         delassus[1, 2],
-        delassus[2, 1],
         delassus[2, 2],
         free_velocity[0],
         wp.vec2f(free_velocity[1], free_velocity[2]),
@@ -260,7 +272,6 @@ def _solve_contact_coulomb_newton_normal_last(
         wp.vec2f(delassus[0, 2], delassus[1, 2]),
         delassus[0, 0],
         delassus[0, 1],
-        delassus[1, 0],
         delassus[1, 1],
         free_velocity[2],
         wp.vec2f(free_velocity[0], free_velocity[1]),
@@ -275,7 +286,6 @@ def _solve_contact_coulomb_newton_instrumented_components(
     normal_tangent: wp.vec2f,
     tangent_delassus00: wp.float32,
     tangent_delassus01: wp.float32,
-    tangent_delassus10: wp.float32,
     tangent_delassus11: wp.float32,
     normal_rhs: wp.float32,
     tangent_rhs_raw: wp.vec2f,
@@ -296,24 +306,26 @@ def _solve_contact_coulomb_newton_instrumented_components(
         result.reaction = wp.vec3f(-normal_rhs / normal_delassus, 0.0, 0.0)
         return result
 
-    tangent00 = tangent_delassus00 - normal_tangent[0] * normal_tangent[0] / normal_delassus
-    tangent01 = tangent_delassus01 - normal_tangent[0] * normal_tangent[1] / normal_delassus
-    tangent10 = tangent_delassus10 - normal_tangent[1] * normal_tangent[0] / normal_delassus
-    tangent11 = tangent_delassus11 - normal_tangent[1] * normal_tangent[1] / normal_delassus
-    tangent_rhs = tangent_rhs_raw - (normal_rhs / normal_delassus) * normal_tangent
+    inverse_normal_delassus = 1.0 / normal_delassus
+    tangent00 = tangent_delassus00 - normal_tangent[0] * normal_tangent[0] * inverse_normal_delassus
+    tangent01 = tangent_delassus01 - normal_tangent[0] * normal_tangent[1] * inverse_normal_delassus
+    tangent11 = tangent_delassus11 - normal_tangent[1] * normal_tangent[1] * inverse_normal_delassus
+    tangent_rhs = tangent_rhs_raw - (normal_rhs * inverse_normal_delassus) * normal_tangent
+    friction_over_normal = friction * inverse_normal_delassus
+    friction_normal_tangent = friction_over_normal * normal_tangent
+    friction_normal_rhs = friction_over_normal * normal_rhs
 
-    unshifted = _solve_mat22(
+    unshifted = _solve_symmetric_mat22(
         tangent00,
         tangent01,
-        tangent10,
         tangent11,
         tangent_rhs[0],
         tangent_rhs[1],
     )
-    value_at_zero = wp.length(unshifted) - friction * (wp.dot(normal_tangent, unshifted) - normal_rhs) / normal_delassus
+    value_at_zero = wp.length(unshifted) - wp.dot(friction_normal_tangent, unshifted) + friction_normal_rhs
     if value_at_zero <= 1.0e-7:
         tangent_reaction = -unshifted
-        normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
+        normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) * inverse_normal_delassus
         result.branch = wp.int32(2)
         result.reaction = wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
         return result
@@ -322,7 +334,6 @@ def _solve_contact_coulomb_newton_instrumented_components(
     result.bracketed = wp.int32(0)
     result.converged = wp.int32(0)
     alpha_scale = wp.max(wp.abs(tangent00), wp.abs(tangent01))
-    alpha_scale = wp.max(alpha_scale, wp.abs(tangent10))
     alpha_scale = wp.max(alpha_scale, wp.abs(tangent11))
     alpha_scale = wp.max(alpha_scale, 1.0e-20)
 
@@ -331,19 +342,16 @@ def _solve_contact_coulomb_newton_instrumented_components(
     last_s = unshifted
     for _ in range(64):
         result.expansion_iterations += 1
-        upper_data = _compute_sliding_root_data(
+        upper_value = _compute_sliding_root_value(
             tangent00,
             tangent01,
-            tangent10,
             tangent11,
             tangent_rhs,
-            normal_tangent,
-            normal_rhs,
-            normal_delassus,
-            friction,
+            friction_normal_tangent,
+            friction_normal_rhs,
             upper * alpha_scale,
         )
-        if upper_data[0] <= 0.0:
+        if upper_value <= 0.0:
             result.bracketed = wp.int32(1)
             break
         upper = upper * 2.0
@@ -354,13 +362,10 @@ def _solve_contact_coulomb_newton_instrumented_components(
         root_data = _compute_sliding_root_data(
             tangent00,
             tangent01,
-            tangent10,
             tangent11,
             tangent_rhs,
-            normal_tangent,
-            normal_rhs,
-            normal_delassus,
-            friction,
+            friction_normal_tangent,
+            friction_normal_rhs,
             alpha * alpha_scale,
         )
         value = root_data[0]
@@ -389,7 +394,7 @@ def _solve_contact_coulomb_newton_instrumented_components(
         alpha = next_alpha
 
     tangent_reaction = -last_s
-    normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) / normal_delassus
+    normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) * inverse_normal_delassus
     result.reaction = wp.vec3f(normal_reaction, tangent_reaction[0], tangent_reaction[1])
     return result
 
@@ -405,7 +410,6 @@ def _solve_contact_coulomb_newton_instrumented(
         wp.vec2f(delassus[1, 0], delassus[2, 0]),
         delassus[1, 1],
         delassus[1, 2],
-        delassus[2, 1],
         delassus[2, 2],
         free_velocity[0],
         wp.vec2f(free_velocity[1], free_velocity[2]),
@@ -424,7 +428,6 @@ def _solve_contact_coulomb_newton_normal_last_instrumented(
         wp.vec2f(delassus[0, 2], delassus[1, 2]),
         delassus[0, 0],
         delassus[0, 1],
-        delassus[1, 0],
         delassus[1, 1],
         free_velocity[2],
         wp.vec2f(free_velocity[0], free_velocity[1]),
