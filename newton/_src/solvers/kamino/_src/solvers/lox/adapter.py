@@ -40,6 +40,10 @@ __all__ = ["LOXKaminoAdapter"]
 
 wp.set_module_options({"enable_backward": False})
 
+_LAGGED_CONTACT_BLOCK_DIM = 256
+_LAGGED_CONTACTS_PER_THREAD = 4
+_LAGGED_CONTACT_MAX_BLOCKS_PER_WORLD = 128
+
 
 def _capacity_offsets(capacities: Sequence[int]) -> list[int]:
     offsets = [0]
@@ -152,8 +156,7 @@ def _evaluate_lagged_scalar_velocity_consistency(
 
 @wp.kernel
 def _evaluate_lagged_contact_velocity_consistency(
-    contact_world: wp.array[wp.int32],
-    contact_local: wp.array[wp.int32],
+    world_contact_offset: wp.array[wp.int32],
     world_contact_count: wp.array[wp.int32],
     body_first: wp.array[wp.int32],
     body_second: wp.array[wp.int32],
@@ -163,24 +166,50 @@ def _evaluate_lagged_contact_velocity_consistency(
     global_twist: wp.array[vec6f],
     projected_twist_previous: wp.array[vec6f],
     inverse_velocity_tolerance: wp.float32,
+    block_count: wp.int32,
     world_required: wp.array[wp.int32],
     world_residual: wp.array[wp.float32],
 ):
-    contact = wp.tid()
-    world = contact_world[contact]
-    if not world_active[world] or contact_local[contact] >= world_contact_count[world]:
+    world, block, lane = wp.tid()
+    count = wp.int32(0)
+    if world_active[world]:
+        count = world_contact_count[world]
+
+    if count <= wp.block_dim():
+        if block == 0 and lane < count:
+            contact = world_contact_offset[world] + lane
+            first = body_first[contact]
+            second = body_second[contact]
+            value = wp.vec3f(0.0)
+            if first >= 0:
+                value += jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
+            if second >= 0:
+                value += jacobian_second[contact] @ (global_twist[second] - projected_twist_previous[second])
+            if lane == 0:
+                world_required[world] = 1
+            wp.atomic_max(world_residual, world, wp.max(wp.abs(value)) * inverse_velocity_tolerance)
         return
 
-    first = body_first[contact]
-    second = body_second[contact]
-    value = wp.vec3f(0.0)
-    if first >= 0:
-        value += jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
-    if second >= 0:
-        value += jacobian_second[contact] @ (global_twist[second] - projected_twist_previous[second])
-    residual = wp.max(wp.abs(value)) * inverse_velocity_tolerance
-    wp.atomic_max(world_required, world, 1)
-    wp.atomic_max(world_residual, world, residual)
+    local = block * wp.block_dim() + lane
+    stride = block_count * wp.block_dim()
+    residual = wp.float32(0.0)
+    while local < count:
+        contact = world_contact_offset[world] + local
+        first = body_first[contact]
+        second = body_second[contact]
+        value = wp.vec3f(0.0)
+        if first >= 0:
+            value += jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
+        if second >= 0:
+            value += jacobian_second[contact] @ (global_twist[second] - projected_twist_previous[second])
+        residual = wp.max(residual, wp.max(wp.abs(value)) * inverse_velocity_tolerance)
+        local += stride
+
+    block_residual = wp.tile_max(wp.tile(residual))[0]
+    if lane == 0 and block * wp.block_dim() < count:
+        if block == 0:
+            world_required[world] = 1
+        wp.atomic_max(world_residual, world, block_residual)
 
 
 @wp.kernel
@@ -2097,6 +2126,11 @@ class LOXKaminoAdapter:
         self.contact_capacities = tuple(contact_capacities)
         self.limit_capacity = limit_offsets[-1]
         self.contact_capacity = contact_offsets[-1]
+        max_contact_capacity = max(contact_capacities, default=0)
+        contacts_per_block = _LAGGED_CONTACTS_PER_THREAD * _LAGGED_CONTACT_BLOCK_DIM
+        self._lagged_contact_block_count = min(
+            math.ceil(max_contact_capacity / contacts_per_block), _LAGGED_CONTACT_MAX_BLOCKS_PER_WORLD
+        )
         self.world_limit_capacity = self._device_array(limit_capacities, self.device)
         self.world_limit_offset = self._device_array(limit_offsets[:-1], self.device)
         self.world_limit_count = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
@@ -2997,10 +3031,10 @@ class LOXKaminoAdapter:
         if self.contact_capacity > 0:
             wp.launch(
                 _evaluate_lagged_contact_velocity_consistency,
-                dim=self.contact_capacity,
+                dim=(self.num_worlds, self._lagged_contact_block_count, _LAGGED_CONTACT_BLOCK_DIM),
+                block_dim=_LAGGED_CONTACT_BLOCK_DIM,
                 inputs=[
-                    self.contact_world,
-                    self.contact_local,
+                    self.world_contact_offset,
                     self.world_contact_count,
                     self.contact_body_first,
                     self.contact_body_second,
@@ -3010,6 +3044,7 @@ class LOXKaminoAdapter:
                     global_twist,
                     projected_twist_previous,
                     inverse_tolerance,
+                    self._lagged_contact_block_count,
                 ],
                 outputs=[self.world_lagged_velocity_required, self.world_lagged_velocity_residual],
                 device=self.device,

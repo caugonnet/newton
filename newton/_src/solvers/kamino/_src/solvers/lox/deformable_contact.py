@@ -1112,6 +1112,7 @@ def _warm_start_rigid_contacts(
     prepared_status: wp.array[wp.int32],
     particle_inverse_weight: wp.array[float],
     body_inverse_weight: wp.array[mat66f],
+    apply_inverse_weight: wp.bool,
     reaction: wp.array[wp.vec3],
     particle_delta: wp.array[wp.vec3],
     body_delta: wp.array[vec6f],
@@ -1143,11 +1144,13 @@ def _warm_start_rigid_contacts(
 
     body = contact_body[contact]
     if body >= 0:
-        body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ impulse)
-        if not _is_finite_vec6(body_correction):
+        body_wrench = wp.transpose(body_jacobian[contact]) @ impulse
+        if apply_inverse_weight:
+            body_wrench = body_inverse_weight[body] @ body_wrench
+        if not _is_finite_vec6(body_wrench):
             projection_status[world] = 0
             return
-        wp.atomic_add(body_delta, body, body_correction)
+        wp.atomic_add(body_delta, body, body_wrench)
 
 
 @wp.kernel
@@ -2889,6 +2892,7 @@ class DeformableContactSystem:
         prepared_status: wp.array[wp.int32],
         particle_inverse_weight: wp.array[float],
         body_inverse_weight: wp.array[mat66f],
+        apply_inverse_weight: bool,
         particle_velocity: wp.array[wp.vec3],
         body_twist: wp.array[vec6f],
         body_delta: wp.array[vec6f],
@@ -2911,6 +2915,7 @@ class DeformableContactSystem:
                 prepared_status,
                 particle_inverse_weight,
                 body_inverse_weight,
+                apply_inverse_weight,
                 self.rigid_reaction,
             ],
             outputs=[

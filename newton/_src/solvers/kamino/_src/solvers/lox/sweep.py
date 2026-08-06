@@ -255,6 +255,7 @@ def _warmstart_contacts_jacobi(
     contact_jacobian_first: wp.array[mat36f],
     contact_jacobian_second: wp.array[mat36f],
     inverse_weight: wp.array[mat66f],
+    apply_inverse_weight: wp.bool,
     reaction: wp.array[wp.vec3f],
     twist_delta: wp.array[vec6f],
 ):
@@ -270,17 +271,15 @@ def _warmstart_contacts_jacobi(
     second = contact_body_second[contact]
     impulse = reaction[contact]
     if first >= 0:
-        _atomic_add_twist(
-            twist_delta,
-            first,
-            inverse_weight[first] @ (wp.transpose(contact_jacobian_first[contact]) @ impulse),
-        )
+        wrench = wp.transpose(contact_jacobian_first[contact]) @ impulse
+        if apply_inverse_weight:
+            wrench = inverse_weight[first] @ wrench
+        _atomic_add_twist(twist_delta, first, wrench)
     if second >= 0:
-        _atomic_add_twist(
-            twist_delta,
-            second,
-            inverse_weight[second] @ (wp.transpose(contact_jacobian_second[contact]) @ impulse),
-        )
+        wrench = wp.transpose(contact_jacobian_second[contact]) @ impulse
+        if apply_inverse_weight:
+            wrench = inverse_weight[second] @ wrench
+        _atomic_add_twist(twist_delta, second, wrench)
 
 
 @wp.kernel
@@ -295,6 +294,7 @@ def _warmstart_limits_jacobi(
     limit_jacobian_first: wp.array[vec6f],
     limit_jacobian_second: wp.array[vec6f],
     inverse_weight: wp.array[mat66f],
+    apply_inverse_weight: wp.bool,
     reaction: wp.array[wp.float32],
     twist_delta: wp.array[vec6f],
 ):
@@ -310,9 +310,15 @@ def _warmstart_limits_jacobi(
     second = limit_body_second[limit]
     impulse = reaction[limit]
     if first >= 0:
-        _atomic_add_twist(twist_delta, first, (inverse_weight[first] @ limit_jacobian_first[limit]) * impulse)
+        wrench = limit_jacobian_first[limit] * impulse
+        if apply_inverse_weight:
+            wrench = inverse_weight[first] @ wrench
+        _atomic_add_twist(twist_delta, first, wrench)
     if second >= 0:
-        _atomic_add_twist(twist_delta, second, (inverse_weight[second] @ limit_jacobian_second[limit]) * impulse)
+        wrench = limit_jacobian_second[limit] * impulse
+        if apply_inverse_weight:
+            wrench = inverse_weight[second] @ wrench
+        _atomic_add_twist(twist_delta, second, wrench)
 
 
 @wp.kernel
@@ -327,6 +333,7 @@ def _warmstart_frictions_jacobi(
     friction_jacobian_first: wp.array[vec6f],
     friction_jacobian_second: wp.array[vec6f],
     inverse_weight: wp.array[mat66f],
+    apply_inverse_weight: wp.bool,
     reaction: wp.array[wp.float32],
     twist_delta: wp.array[vec6f],
 ):
@@ -342,9 +349,15 @@ def _warmstart_frictions_jacobi(
     second = friction_body_second[friction]
     impulse = reaction[friction]
     if first >= 0:
-        _atomic_add_twist(twist_delta, first, (inverse_weight[first] @ friction_jacobian_first[friction]) * impulse)
+        wrench = friction_jacobian_first[friction] * impulse
+        if apply_inverse_weight:
+            wrench = inverse_weight[first] @ wrench
+        _atomic_add_twist(twist_delta, first, wrench)
     if second >= 0:
-        _atomic_add_twist(twist_delta, second, (inverse_weight[second] @ friction_jacobian_second[friction]) * impulse)
+        wrench = friction_jacobian_second[friction] * impulse
+        if apply_inverse_weight:
+            wrench = inverse_weight[second] @ wrench
+        _atomic_add_twist(twist_delta, second, wrench)
 
 
 @wp.kernel
@@ -662,6 +675,26 @@ def _apply_jacobi_twist_delta(
 
 
 @wp.kernel
+def _apply_jacobi_warmstart(
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    inverse_weight: wp.array[mat66f],
+    twist_delta: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+):
+    body = wp.tid()
+    world = body_world[body]
+    if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+        correction = inverse_weight[body] @ twist_delta[body]
+        if _is_finite_twist(correction):
+            projected_twist[body] += correction
+        else:
+            world_status[world] = PROJECTION_STATUS_INVALID
+    twist_delta[body] = vec6f(0.0)
+
+
+@wp.kernel
 def _apply_mixed_jacobi_delta(
     particle_count: int,
     body_count: int,
@@ -684,6 +717,37 @@ def _apply_mixed_jacobi_delta(
         world = body_world[index]
         if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
             projected_twist[index] += twist_delta[index]
+        twist_delta[index] = vec6f(0.0)
+
+
+@wp.kernel
+def _apply_mixed_jacobi_warmstart(
+    particle_count: int,
+    body_count: int,
+    particle_world: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    inverse_weight: wp.array[mat66f],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+    projected_velocity: wp.array[wp.vec3],
+    projected_twist: wp.array[vec6f],
+):
+    index = wp.tid()
+    if index < particle_count:
+        world = particle_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_velocity[index] += particle_delta[index]
+        particle_delta[index] = wp.vec3(0.0)
+    if index < body_count:
+        world = body_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            correction = inverse_weight[index] @ twist_delta[index]
+            if _is_finite_twist(correction):
+                projected_twist[index] += correction
+            else:
+                world_status[world] = PROJECTION_STATUS_INVALID
         twist_delta[index] = vec6f(0.0)
 
 
@@ -1817,6 +1881,45 @@ def _apply_jacobi_delta(
     )
 
 
+def _apply_jacobi_warmstart_delta(
+    body_world,
+    world_active,
+    world_status,
+    inverse_weight,
+    twist_delta,
+    projected_twist,
+    deformable_contacts,
+    deformable_projected_velocity,
+) -> None:
+    if deformable_contacts is None:
+        wp.launch(
+            _apply_jacobi_warmstart,
+            dim=projected_twist.shape[0],
+            inputs=[body_world, world_active, world_status, inverse_weight, twist_delta],
+            outputs=[projected_twist],
+            device=projected_twist.device,
+        )
+        return
+    particle_count = deformable_contacts.cloth_system.particle_count
+    wp.launch(
+        _apply_mixed_jacobi_warmstart,
+        dim=max(particle_count, projected_twist.shape[0]),
+        inputs=[
+            particle_count,
+            projected_twist.shape[0],
+            deformable_contacts.cloth_system.topology.packed_world,
+            body_world,
+            world_active,
+            world_status,
+            inverse_weight,
+            deformable_contacts.particle_delta,
+            twist_delta,
+        ],
+        outputs=[deformable_projected_velocity, projected_twist],
+        device=projected_twist.device,
+    )
+
+
 def project_constraints_jacobi(
     projection_iterations: int,
     world_active: wp.array[wp.bool],
@@ -1892,28 +1995,8 @@ def project_constraints_jacobi(
             device=projected_twist.device,
         )
     twist_delta.zero_()
-    if warm_start and deformable_contacts is not None:
+    if deformable_contacts is not None:
         deformable_contacts.begin_rigid_jacobi_accumulation()
-    if warm_start and friction_world.shape[0] > 0:
-        wp.launch(
-            _warmstart_frictions_jacobi,
-            dim=friction_world.shape[0],
-            inputs=[
-                friction_world,
-                friction_local,
-                world_active,
-                prepared_status,
-                world_friction_count,
-                friction_body_first,
-                friction_body_second,
-                friction_jacobian_first,
-                friction_jacobian_second,
-                inverse_weight,
-                friction_reaction,
-            ],
-            outputs=[twist_delta],
-            device=projected_twist.device,
-        )
     if warm_start and contact_world.shape[0] > 0:
         wp.launch(
             _warmstart_contacts_jacobi,
@@ -1929,7 +2012,29 @@ def project_constraints_jacobi(
                 contact_jacobian_first,
                 contact_jacobian_second,
                 inverse_weight,
+                False,
                 contact_reaction,
+            ],
+            outputs=[twist_delta],
+            device=projected_twist.device,
+        )
+    if warm_start and friction_world.shape[0] > 0:
+        wp.launch(
+            _warmstart_frictions_jacobi,
+            dim=friction_world.shape[0],
+            inputs=[
+                friction_world,
+                friction_local,
+                world_active,
+                prepared_status,
+                world_friction_count,
+                friction_body_first,
+                friction_body_second,
+                friction_jacobian_first,
+                friction_jacobian_second,
+                inverse_weight,
+                False,
+                friction_reaction,
             ],
             outputs=[twist_delta],
             device=projected_twist.device,
@@ -1949,6 +2054,7 @@ def project_constraints_jacobi(
                 limit_jacobian_first,
                 limit_jacobian_second,
                 inverse_weight,
+                False,
                 limit_reaction,
             ],
             outputs=[twist_delta],
@@ -1960,16 +2066,18 @@ def project_constraints_jacobi(
             prepared_status,
             deformable_contacts.cloth_system.inverse_weight,
             inverse_weight,
+            False,
             deformable_projected_velocity,
             projected_twist,
             twist_delta,
             world_status,
         )
     if warm_start:
-        _apply_jacobi_delta(
+        _apply_jacobi_warmstart_delta(
             body_world,
             world_active,
             world_status,
+            inverse_weight,
             twist_delta,
             projected_twist,
             deformable_contacts,
@@ -1977,9 +2085,6 @@ def project_constraints_jacobi(
         )
 
     for _sweep in range(projection_iterations):
-        twist_delta.zero_()
-        if deformable_contacts is not None:
-            deformable_contacts.begin_rigid_jacobi_accumulation()
         if friction_world.shape[0] > 0:
             wp.launch(
                 _project_frictions_jacobi,
