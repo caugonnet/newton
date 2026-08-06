@@ -9,7 +9,7 @@ import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
 from .contact import _solve_contact_coulomb_newton_normal_last
-from .deformable_contact import DEFORMABLE_CONTACT_STATUS_VALID
+from .deformable_contact import DEFORMABLE_CONTACT_STATUS_VALID, _scatter_contact_apgd
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
@@ -168,8 +168,9 @@ def _initialize_rigid_trials(
     limit_trial[constraint] = limit_value
 
 
-@wp.kernel
-def _scatter_rigid_reactions_fused(
+@wp.func
+def _scatter_rigid_reaction(
+    constraint: int,
     friction_capacity: int,
     contact_capacity: int,
     friction_world: wp.array[wp.int32],
@@ -201,7 +202,6 @@ def _scatter_rigid_reactions_fused(
     limit_reaction: wp.array[wp.float32],
     twist_delta: wp.array[vec6f],
 ):
-    constraint = wp.tid()
     if constraint < friction_capacity:
         world = friction_world[constraint]
         if (
@@ -276,6 +276,188 @@ def _scatter_rigid_reactions_fused(
             second,
             inverse_weight[second] @ (limit_impulse * limit_jacobian_second[constraint]),
         )
+
+
+@wp.kernel
+def _scatter_rigid_reactions_fused(
+    friction_capacity: int,
+    contact_capacity: int,
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    inverse_weight: wp.array[mat66f],
+    friction_reaction: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    twist_delta: wp.array[vec6f],
+):
+    _scatter_rigid_reaction(
+        wp.tid(),
+        friction_capacity,
+        contact_capacity,
+        friction_world,
+        friction_local,
+        world_friction_count,
+        friction_body_first,
+        friction_body_second,
+        friction_jacobian_first,
+        friction_jacobian_second,
+        contact_world,
+        contact_local,
+        world_contact_count,
+        contact_body_first,
+        contact_body_second,
+        contact_jacobian_first,
+        contact_jacobian_second,
+        limit_world,
+        limit_local,
+        world_limit_count,
+        limit_body_first,
+        limit_body_second,
+        limit_jacobian_first,
+        limit_jacobian_second,
+        world_active,
+        projection_status,
+        inverse_weight,
+        friction_reaction,
+        contact_reaction,
+        limit_reaction,
+        twist_delta,
+    )
+
+
+@wp.kernel
+def _scatter_mixed_reactions_fused(
+    friction_capacity: int,
+    contact_capacity: int,
+    rigid_capacity: int,
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    deformable_launch_dim: int,
+    world_count: int,
+    deformable_world_contact_offset: wp.array[wp.int32],
+    deformable_world_contact_count: wp.array[wp.int32],
+    deformable_contact_order: wp.array[wp.int32],
+    deformable_particle_indices: wp.array2d[wp.int32],
+    deformable_coefficients: wp.array2d[float],
+    deformable_contact_world: wp.array[wp.int32],
+    deformable_contact_body: wp.array[wp.int32],
+    deformable_frame: wp.array[wp.mat33f],
+    deformable_body_jacobian: wp.array[mat36f],
+    deformable_contact_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    particle_inverse_weight: wp.array[float],
+    body_inverse_weight: wp.array[mat66f],
+    use_trial: bool,
+    friction_reaction: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    deformable_reaction: wp.array[wp.vec3],
+    deformable_trial: wp.array[wp.vec3],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+):
+    lane = wp.tid()
+    if lane < rigid_capacity:
+        _scatter_rigid_reaction(
+            lane,
+            friction_capacity,
+            contact_capacity,
+            friction_world,
+            friction_local,
+            world_friction_count,
+            friction_body_first,
+            friction_body_second,
+            friction_jacobian_first,
+            friction_jacobian_second,
+            contact_world,
+            contact_local,
+            world_contact_count,
+            contact_body_first,
+            contact_body_second,
+            contact_jacobian_first,
+            contact_jacobian_second,
+            limit_world,
+            limit_local,
+            world_limit_count,
+            limit_body_first,
+            limit_body_second,
+            limit_jacobian_first,
+            limit_jacobian_second,
+            world_active,
+            projection_status,
+            body_inverse_weight,
+            friction_reaction,
+            contact_reaction,
+            limit_reaction,
+            twist_delta,
+        )
+
+    if lane < deformable_launch_dim:
+        total = deformable_world_contact_offset[world_count - 1] + deformable_world_contact_count[world_count - 1]
+        for ordered in range(lane, total, deformable_launch_dim):
+            deformable_contact = deformable_contact_order[ordered]
+            _scatter_contact_apgd(
+                deformable_contact,
+                deformable_particle_indices,
+                deformable_coefficients,
+                deformable_contact_world,
+                deformable_contact_body,
+                deformable_frame,
+                deformable_body_jacobian,
+                deformable_contact_status,
+                world_active,
+                projection_status,
+                particle_inverse_weight,
+                body_inverse_weight,
+                True,
+                use_trial,
+                deformable_reaction,
+                deformable_reaction,
+                deformable_trial,
+                particle_delta,
+                twist_delta,
+            )
 
 
 @wp.kernel
@@ -726,6 +908,87 @@ def _scatter_rigid_reactions(adapter, world_active, inverse_weight, reaction_fie
     )
 
 
+def _scatter_reactions(
+    adapter,
+    world_active,
+    inverse_weight,
+    reaction_fields,
+    twist_delta,
+    deformable_contacts,
+    use_trial,
+) -> None:
+    rigid_capacity = adapter.friction_capacity + adapter.contact_capacity + adapter.limit_capacity
+    if deformable_contacts is not None and rigid_capacity > 0:
+        friction_reaction, contact_reaction, limit_reaction = reaction_fields
+        wp.launch(
+            _scatter_mixed_reactions_fused,
+            dim=max(rigid_capacity, deformable_contacts.apgd_worker_count),
+            inputs=[
+                adapter.friction_capacity,
+                adapter.contact_capacity,
+                rigid_capacity,
+                adapter.friction_world,
+                adapter.friction_local,
+                adapter.world_friction_count,
+                adapter.friction_body_first,
+                adapter.friction_body_second,
+                adapter.friction_jacobian_first,
+                adapter.friction_jacobian_second,
+                adapter.contact_world,
+                adapter.contact_local,
+                adapter.world_contact_count,
+                adapter.contact_body_first,
+                adapter.contact_body_second,
+                adapter.contact_jacobian_first,
+                adapter.contact_jacobian_second,
+                adapter.limit_world,
+                adapter.limit_local,
+                adapter.world_limit_count,
+                adapter.limit_body_first,
+                adapter.limit_body_second,
+                adapter.limit_jacobian_first,
+                adapter.limit_jacobian_second,
+                deformable_contacts.apgd_worker_count,
+                int(deformable_contacts.model.world_count),
+                deformable_contacts.world_contact_offset,
+                deformable_contacts.world_contact_count,
+                deformable_contacts.contact_order,
+                deformable_contacts.particle_indices,
+                deformable_contacts.coefficients,
+                deformable_contacts.contact_world,
+                deformable_contacts.body,
+                deformable_contacts.frame,
+                deformable_contacts.body_jacobian,
+                deformable_contacts.status,
+                world_active,
+                adapter.projection_status,
+                deformable_contacts.cloth_system.inverse_weight,
+                inverse_weight,
+                use_trial,
+                friction_reaction,
+                contact_reaction,
+                limit_reaction,
+                deformable_contacts.rigid_reaction,
+                deformable_contacts.apgd_trial,
+            ],
+            outputs=[deformable_contacts.particle_delta, twist_delta],
+            device=adapter.device,
+            block_dim=256,
+        )
+        return
+
+    _scatter_rigid_reactions(adapter, world_active, inverse_weight, reaction_fields, twist_delta)
+    if deformable_contacts is not None:
+        deformable_contacts.scatter_apgd(
+            world_active,
+            inverse_weight,
+            twist_delta,
+            rigid_coordinates=True,
+            use_trial=use_trial,
+            projection_status=adapter.projection_status,
+        )
+
+
 def _reconstruct_state(
     adapter,
     body_world,
@@ -861,22 +1124,15 @@ def project_constraints_apgd(
         deformable_contacts.initialize_apgd(world_active, rigid_coordinates=True)
 
     for _iteration in range(projection_iterations):
-        _scatter_rigid_reactions(
+        _scatter_reactions(
             adapter,
             world_active,
             inverse_weight,
             (adapter.friction_apgd_trial, adapter.contact_apgd_trial, adapter.limit_apgd_trial),
             adapter.projection_twist_delta,
+            deformable_contacts,
+            use_trial=True,
         )
-        if deformable_contacts is not None:
-            deformable_contacts.scatter_apgd(
-                world_active,
-                inverse_weight,
-                adapter.projection_twist_delta,
-                rigid_coordinates=True,
-                use_trial=True,
-                projection_status=adapter.projection_status,
-            )
         _reconstruct_state(
             adapter,
             body_world,
@@ -1041,22 +1297,15 @@ def project_constraints_apgd(
         if deformable_contacts is not None and rigid_capacity == 0:
             deformable_contacts.extrapolate_apgd(world_active, beta, adapter.projection_status, rigid_coordinates=True)
 
-    _scatter_rigid_reactions(
+    _scatter_reactions(
         adapter,
         world_active,
         inverse_weight,
         (adapter.friction_reaction, adapter.contact_reaction, adapter.limit_reaction),
         adapter.projection_twist_delta,
+        deformable_contacts,
+        use_trial=False,
     )
-    if deformable_contacts is not None:
-        deformable_contacts.scatter_apgd(
-            world_active,
-            inverse_weight,
-            adapter.projection_twist_delta,
-            rigid_coordinates=True,
-            use_trial=False,
-            projection_status=adapter.projection_status,
-        )
     _reconstruct_state(
         adapter,
         body_world,

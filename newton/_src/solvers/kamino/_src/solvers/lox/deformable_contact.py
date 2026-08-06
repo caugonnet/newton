@@ -1577,6 +1577,56 @@ def _initialize_contacts_apgd(
         trial[contact] = value
 
 
+@wp.func
+def _scatter_contact_apgd(
+    contact: int,
+    particle_indices: wp.array2d[wp.int32],
+    coefficients: wp.array2d[float],
+    contact_world: wp.array[wp.int32],
+    contact_body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    contact_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    particle_inverse_weight: wp.array[float],
+    body_inverse_weight: wp.array[mat66f],
+    rigid_coordinates: bool,
+    use_trial: bool,
+    particle_reaction: wp.array[wp.vec3],
+    rigid_reaction: wp.array[wp.vec3],
+    trial: wp.array[wp.vec3],
+    particle_delta: wp.array[wp.vec3],
+    body_delta: wp.array[vec6f],
+):
+    world = contact_world[contact]
+    if (
+        contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
+        or world < 0
+        or not world_active[world]
+        or projection_status[world] != PROJECTION_STATUS_VALID
+    ):
+        return
+    if use_trial:
+        impulse = trial[contact]
+    elif rigid_coordinates:
+        impulse = rigid_reaction[contact]
+    else:
+        impulse = particle_reaction[contact]
+    world_impulse = impulse
+    if rigid_coordinates:
+        world_impulse = frame[contact] @ impulse
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        if particle >= 0:
+            particle_correction = particle_inverse_weight[particle] * coefficients[contact, slot] * world_impulse
+            wp.atomic_add(particle_delta, particle, particle_correction)
+    body = contact_body[contact]
+    if rigid_coordinates and body >= 0:
+        body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ impulse)
+        wp.atomic_add(body_delta, body, body_correction)
+
+
 @wp.kernel
 def _scatter_contacts_apgd(
     launch_dim: int,
@@ -1607,32 +1657,27 @@ def _scatter_contacts_apgd(
     total = world_contact_offset[world_count - 1] + world_contact_count[world_count - 1]
     for ordered in range(lane, total, launch_dim):
         contact = contact_order[ordered]
-        world = contact_world[contact]
-        if (
-            contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID
-            or world < 0
-            or not world_active[world]
-            or projection_status[world] != PROJECTION_STATUS_VALID
-        ):
-            continue
-        if use_trial:
-            impulse = trial[contact]
-        elif rigid_coordinates:
-            impulse = rigid_reaction[contact]
-        else:
-            impulse = particle_reaction[contact]
-        world_impulse = impulse
-        if rigid_coordinates:
-            world_impulse = frame[contact] @ impulse
-        for slot in range(4):
-            particle = particle_indices[contact, slot]
-            if particle >= 0:
-                particle_correction = particle_inverse_weight[particle] * coefficients[contact, slot] * world_impulse
-                wp.atomic_add(particle_delta, particle, particle_correction)
-        body = contact_body[contact]
-        if rigid_coordinates and body >= 0:
-            body_correction = body_inverse_weight[body] @ (wp.transpose(body_jacobian[contact]) @ impulse)
-            wp.atomic_add(body_delta, body, body_correction)
+        _scatter_contact_apgd(
+            contact,
+            particle_indices,
+            coefficients,
+            contact_world,
+            contact_body,
+            frame,
+            body_jacobian,
+            contact_status,
+            world_active,
+            projection_status,
+            particle_inverse_weight,
+            body_inverse_weight,
+            rigid_coordinates,
+            use_trial,
+            particle_reaction,
+            rigid_reaction,
+            trial,
+            particle_delta,
+            body_delta,
+        )
 
 
 @wp.kernel
