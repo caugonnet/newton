@@ -210,6 +210,7 @@ class Example:
             config.use_collision_detector = False
             config.lox.max_iterations = 25
             config.lox.projection_iterations = 10
+            config.lox.deformable_preconditioner = str(getattr(args, "deformable_preconditioner", "two_level"))
             # LOX splits VBD's detection margin into contact thickness and an additional speculative gap.
             config.lox.deformable_self_contact_margin = self.particle_self_contact_radius
             config.lox.deformable_self_contact_gap = (
@@ -489,6 +490,11 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
+    parser.add_argument(
+        "--deformable-preconditioner",
+        choices=("incomplete_ldlt", "two_level", "block_jacobi", "jacobi"),
+        default="two_level",
+    )
     parser.set_defaults(num_frames=1000)
     viewer, args = newton.examples.init(parser)
 

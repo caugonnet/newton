@@ -39,6 +39,7 @@ from .deformable_linear import DeformableCRState
 from .deformable_preconditioner import DeformableIncompleteLDLT
 from .deformable_proximal import DeformableMembraneProximal
 from .deformable_tetrahedron_proximal import DeformableTetrahedronProximal
+from .deformable_two_level import DeformableTwoLevel
 from .time import validate_world_time_step
 from .weight import BODY_WEIGHT_SIGMA_DEFAULT, DEFORMABLE_WEIGHT_BETA_DEFAULT
 
@@ -389,10 +390,10 @@ class DeformableFEMSystem:
             raise ValueError(f"LOX deformable weight sigma must be in (0, 1], got {weight_sigma}.")
         if not np.isfinite(weight_beta) or weight_beta < 1.0:
             raise ValueError(f"LOX deformable weight beta must be at least one, got {weight_beta}.")
-        if preconditioner not in ("incomplete_ldlt", "block_jacobi", "jacobi"):
+        if preconditioner not in ("incomplete_ldlt", "two_level", "block_jacobi", "jacobi"):
             raise ValueError(
-                "LOX deformable preconditioner must be 'incomplete_ldlt', 'block_jacobi', "
-                f"or 'jacobi', got {preconditioner!r}."
+                "LOX deformable preconditioner must be 'incomplete_ldlt', 'two_level', "
+                f"'block_jacobi', or 'jacobi', got {preconditioner!r}."
             )
         if (
             not isinstance(direct_max_particles, int)
@@ -663,6 +664,17 @@ class DeformableFEMSystem:
                 self.topology.component_dof_offsets,
                 regularization=preconditioner_regularization,
                 fill_level=preconditioner_fill_level,
+                row_active=self.packed_iterative,
+            )
+        elif self.has_iterative_components and preconditioner == "two_level":
+            self.preconditioner = DeformableTwoLevel(
+                self.preconditioner_matrix,
+                self.diagonal_slots,
+                self.topology.packed_component,
+                self.topology.packed_world,
+                self.world_active,
+                self.topology.component_dof_offsets,
+                regularization=preconditioner_regularization,
                 row_active=self.packed_iterative,
             )
         elif self.has_iterative_components:

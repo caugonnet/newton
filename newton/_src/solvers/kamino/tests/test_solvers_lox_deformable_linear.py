@@ -20,6 +20,7 @@ from newton._src.solvers.kamino._src.solvers.lox import (
     DEFORMABLE_WEIGHT_STATUS_VALID,
     DeformableClothSystem,
     DeformableIncompleteLDLT,
+    DeformableTwoLevel,
 )
 from newton._src.solvers.kamino._src.solvers.lox import (
     deformable_linear as deformable_linear_module,
@@ -27,6 +28,7 @@ from newton._src.solvers.kamino._src.solvers.lox import (
 from newton._src.solvers.kamino._src.solvers.lox import (
     deformable_preconditioner as deformable_preconditioner_module,
 )
+from newton._src.solvers.kamino._src.solvers.lox import deformable_two_level as deformable_two_level_module
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_system import (
     _bsr_to_dense,
@@ -203,6 +205,92 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
         self.assertEqual(select(65_536, 1), 256)
         self.assertEqual(select(65_537, 1), 512)
         self.assertEqual(select(40_000, 2), 512)
+
+    def test_bound_two_level_aggregate_count_for_frontier_graph(self):
+        """Bound coarse growth for a graph with a consumed high-degree frontier."""
+        row_count = 4_097
+        component_rows = np.arange(row_count, dtype=np.int32)
+        adjacency = [list(range(1, row_count))] + [[0] for _ in range(1, row_count)]
+        target_size = max(
+            deformable_two_level_module._AGGREGATE_PARTICLE_COUNT,
+            (row_count + deformable_two_level_module._AGGREGATE_COUNT_LIMIT - 1)
+            // deformable_two_level_module._AGGREGATE_COUNT_LIMIT,
+        )
+        aggregates = deformable_two_level_module._aggregate_component(
+            component_rows,
+            adjacency,
+            target_size,
+        )
+
+        self.assertLessEqual(len(aggregates), deformable_two_level_module._AGGREGATE_COUNT_LIMIT)
+        np.testing.assert_array_equal(
+            np.sort(np.concatenate(aggregates)),
+            component_rows,
+        )
+
+    def test_apply_two_level_preconditioner_against_dense_reference(self):
+        """Match block-Jacobi plus exact aggregate coarse correction."""
+        matrix, packed_world, world_active, batch_offsets = _make_cycle_system(self.device)
+        diagonal_slots = wp.array([0, 4, 7, 11], dtype=wp.int32, device=self.device)
+        packed_component = wp.zeros(4, dtype=wp.int32, device=self.device)
+        with mock.patch.object(deformable_two_level_module, "_AGGREGATE_PARTICLE_COUNT", 2):
+            preconditioner = DeformableTwoLevel(
+                matrix,
+                diagonal_slots,
+                packed_component,
+                packed_world,
+                world_active,
+                batch_offsets,
+            )
+        preconditioner.factorize()
+        self.assertGreater(preconditioner.aggregate_count, 1)
+
+        right_hand_side_np = np.linspace(-0.8, 0.9, 12, dtype=np.float32).reshape((-1, 3))
+        right_hand_side = wp.array(right_hand_side_np, dtype=wp.vec3, device=self.device)
+        addend_np = np.linspace(0.3, -0.4, 12, dtype=np.float32).reshape((-1, 3))
+        addend = wp.array(addend_np, dtype=wp.vec3, device=self.device)
+        result = wp.empty_like(right_hand_side)
+        preconditioner.linear_operator.matvec(right_hand_side, addend, result, -0.7, 0.2)
+
+        dense_matrix = _bsr_to_dense(matrix)
+        inverse_blocks = preconditioner.fine_preconditioner.inverse_diagonal.numpy()
+        fine = np.einsum("nij,nj->ni", inverse_blocks, right_hand_side_np).reshape(-1)
+        prolongation = np.zeros((12, 3 * preconditioner.aggregate_count), dtype=np.float64)
+        aggregates = preconditioner.particle_aggregate.numpy()
+        for particle, aggregate in enumerate(aggregates):
+            prolongation[3 * particle : 3 * particle + 3, 3 * aggregate : 3 * aggregate + 3] = np.eye(3)
+        coarse_matrix = prolongation.T @ dense_matrix @ prolongation
+        coarse = prolongation @ np.linalg.solve(coarse_matrix, prolongation.T @ right_hand_side_np.reshape(-1))
+        expected = -0.7 * (fine + coarse) + 0.2 * addend_np.reshape(-1)
+        np.testing.assert_allclose(result.numpy().reshape(-1), expected, rtol=2.0e-5, atol=2.0e-5)
+
+    def test_capture_two_level_preconditioner_setup_and_apply(self):
+        """Capture numeric setup and application without allocations."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+        matrix, packed_world, world_active, batch_offsets = _make_cycle_system(self.device)
+        diagonal_slots = wp.array([0, 4, 7, 11], dtype=wp.int32, device=self.device)
+        packed_component = wp.zeros(4, dtype=wp.int32, device=self.device)
+        preconditioner = DeformableTwoLevel(
+            matrix,
+            diagonal_slots,
+            packed_component,
+            packed_world,
+            world_active,
+            batch_offsets,
+        )
+        right_hand_side = wp.ones(4, dtype=wp.vec3, device=self.device)
+        addend = wp.zeros_like(right_hand_side)
+        result = wp.empty_like(right_hand_side)
+        preconditioner.factorize()
+        preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
+        wp.synchronize_device(self.device)
+
+        with wp.ScopedCapture(device=self.device) as capture:
+            preconditioner.factorize()
+            preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
+        wp.capture_launch(capture.graph)
+        self.assertTrue(np.all(np.isfinite(result.numpy())))
 
     def test_form_scalar_consensus_weight_and_system_matrix(self):
         """Form one scalar nodal weight and add it isotropically to each diagonal."""
@@ -639,6 +727,33 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
             system.solve_candidate(center)
         wp.capture_launch(capture.graph)
 
+        self.assertTrue(np.all(np.isfinite(system.smooth_velocity.numpy())))
+        self.assertGreaterEqual(int(system.direct_solver.factorization_count.numpy()[0]), 2)
+        self.assertGreaterEqual(int(system.preconditioner.factorization_count.numpy()[0]), 2)
+
+    def test_capture_two_level_with_mixed_direct_and_iterative_components(self):
+        """Capture two-level CR alongside direct component solves."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+        model = _build_mixed_component_model(self.device)
+        state = model.state()
+        system = DeformableClothSystem(
+            model,
+            direct_max_particles=3,
+            cr_iterations=4,
+            preconditioner="two_level",
+        )
+        center = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        system.assemble(state, _world_dt(model, 0.01, self.device))
+        system.solve_candidate(center)
+
+        with wp.ScopedCapture(device=self.device) as capture:
+            system.assemble(state, _world_dt(model, 0.01, self.device))
+            system.solve_candidate(center)
+        wp.capture_launch(capture.graph)
+
+        direct_rows = system.packed_iterative.numpy() == 0
+        self.assertTrue(np.all(system.preconditioner.particle_coarse_offset.numpy()[direct_rows] == -1))
         self.assertTrue(np.all(np.isfinite(system.smooth_velocity.numpy())))
         self.assertGreaterEqual(int(system.direct_solver.factorization_count.numpy()[0]), 2)
         self.assertGreaterEqual(int(system.preconditioner.factorization_count.numpy()[0]), 2)

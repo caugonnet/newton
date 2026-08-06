@@ -45,6 +45,7 @@ from .deformable_system import (
     validate_deformable_cloth_model,
     validate_deformable_model,
 )
+from .deformable_two_level import DeformableTwoLevel
 from .integration import IntegratorLOX, accept_projected_body_state, integrate_projected_body_poses
 from .iteration import SplittingState
 from .metric import (
@@ -153,6 +154,7 @@ __all__ = [
     "DeformableJacobi",
     "DeformableSplittingState",
     "DeformableTopology",
+    "DeformableTwoLevel",
     "FrictionProjectionResult",
     "IntegratorLOX",
     "LOXKaminoAdapter",

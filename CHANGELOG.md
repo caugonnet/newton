@@ -9,6 +9,7 @@
 - Add selection of the shapes included in model shape BVHs through `Model.bvh_build_shapes(shape_flags=...)` and `ModelBuilder.default_bvh_cfg.shape_flags`, e.g. `ShapeFlags.VISIBLE | ShapeFlags.COLLIDE_SHAPES` to also include collision shapes.
 - Add a `damping` parameter to `ModelBuilder.add_joint_ball()` that applies passive angular damping to all three ball-joint DOFs; when omitted, `ModelBuilder.default_joint_cfg.damping` applies.
 - Add a full 3-by-3 block-Jacobi deformable preconditioner for `SolverKamino` LOX through `config.lox.deformable_preconditioner = "block_jacobi"`.
+- Add a shallow aggregate two-level deformable preconditioner for `SolverKamino` LOX through `config.lox.deformable_preconditioner = "two_level"`.
 - Add per-world `xforms` argument to `ModelBuilder.replicate()` for batching explicitly positioned worlds.
 - Add cubic and triplanar `SensorTiledCamera` texture projection modes for shapes without authored UVs.
 - Add the experimental `SolverKamino` LOX backend through `SolverKamino.Config(dynamics_solver="lox")`, with graph-capturable rigid, articulated, cable, cloth, and tetrahedral soft-body dynamics; joint limits, drives, damping, friction, effort limits, and warm starts; Newton rigid/soft contact and deformable self-contact; configurable projection and linear-solve strategies; convergence diagnostics and runtime topology updates; and support across compatible examples.

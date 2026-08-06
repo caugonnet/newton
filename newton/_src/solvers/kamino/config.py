@@ -1009,13 +1009,15 @@ class LOXSolverConfig:
     coordinate and multiplier while preserving the same fixed point.
     """
 
-    deformable_preconditioner: Literal["incomplete_ldlt", "block_jacobi", "jacobi"] = "incomplete_ldlt"
+    deformable_preconditioner: Literal["incomplete_ldlt", "two_level", "block_jacobi", "jacobi"] = "incomplete_ldlt"
     """Preconditioner used by the deformable candidate solve.
 
-    Block ``"block_jacobi"`` reduces setup and application cost relative to
-    ``"incomplete_ldlt"`` while retaining each particle's 3-by-3 diagonal
-    block. Scalar ``"jacobi"`` reduces storage further. Both Jacobi variants
-    generally require more :attr:`deformable_cr_iterations`.
+    ``"two_level"`` additively combines a 3-by-3 block-Jacobi fine correction
+    with an exact dense solve on graph aggregates. Block ``"block_jacobi"``
+    reduces setup and application cost relative to ``"incomplete_ldlt"``
+    while retaining each particle's diagonal block. Scalar ``"jacobi"``
+    reduces storage further. These alternatives may require more
+    :attr:`deformable_cr_iterations`.
     """
 
     deformable_preconditioner_fill_level: int = 0
@@ -1240,10 +1242,11 @@ class LOXSolverConfig:
             raise ValueError(
                 f"Invalid inertial_warmstart_fraction: {self.inertial_warmstart_fraction}. Must be in range [0, 1]."
             )
-        if self.deformable_preconditioner not in ("incomplete_ldlt", "block_jacobi", "jacobi"):
+        if self.deformable_preconditioner not in ("incomplete_ldlt", "two_level", "block_jacobi", "jacobi"):
             raise ValueError(
                 "Invalid deformable_preconditioner: "
-                f"{self.deformable_preconditioner!r}. Must be 'incomplete_ldlt', 'block_jacobi', or 'jacobi'."
+                f"{self.deformable_preconditioner!r}. Must be 'incomplete_ldlt', 'two_level', "
+                "'block_jacobi', or 'jacobi'."
             )
         if (
             not isinstance(self.deformable_preconditioner_fill_level, int)
