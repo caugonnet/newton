@@ -41,9 +41,7 @@ __all__ = ["LOXKaminoAdapter"]
 
 wp.set_module_options({"enable_backward": False})
 
-_LAGGED_CONTACT_BLOCK_DIM = 256
-_LAGGED_CONTACTS_PER_THREAD = 4
-_LAGGED_CONTACT_MAX_BLOCKS_PER_WORLD = 128
+_LAGGED_CONTACT_BLOCK_DIM = 64
 
 
 def _capacity_offsets(capacities: Sequence[int]) -> list[int]:
@@ -2197,11 +2195,7 @@ class LOXKaminoAdapter:
         self.contact_capacities = tuple(contact_capacities)
         self.limit_capacity = limit_offsets[-1]
         self.contact_capacity = contact_offsets[-1]
-        max_contact_capacity = max(contact_capacities, default=0)
-        contacts_per_block = _LAGGED_CONTACTS_PER_THREAD * _LAGGED_CONTACT_BLOCK_DIM
-        self._lagged_contact_block_count = min(
-            math.ceil(max_contact_capacity / contacts_per_block), _LAGGED_CONTACT_MAX_BLOCKS_PER_WORLD
-        )
+        self._lagged_contact_block_count = 1
         self.world_limit_capacity = self._device_array(limit_capacities, self.device)
         self.world_limit_offset = self._device_array(limit_offsets[:-1], self.device)
         self.world_limit_count = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
