@@ -155,6 +155,12 @@ class TestLOXAdapter(unittest.TestCase):
             contact_dead_zone=0.01,
             impact_velocity_threshold=0.1,
         )
+        changed_gap = contacts.gapfunc.numpy()
+        changed_gap[0, 3] = -0.5
+        contacts.gapfunc.assign(changed_gap)
+        changed_material = contacts.material.numpy()
+        changed_material[0] = [0.1, 0.9]
+        contacts.material.assign(changed_material)
         data.joints.dq_j.fill_(2.0)
         evaluation_velocity = velocity.copy()
         evaluation_velocity[1, 3:] = np.asarray([-0.4, 0.2, 0.7], dtype=np.float32)

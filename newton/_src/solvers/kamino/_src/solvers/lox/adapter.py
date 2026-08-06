@@ -2228,7 +2228,7 @@ class LOXKaminoAdapter:
         impact_velocity_threshold: float = 1.0e-3,
         contact_recoverable_response: bool = False,
     ) -> None:
-        """Cache begin-step velocities and import unilateral reaction impulses once."""
+        """Freeze unilateral data and import begin-step velocities and reactions once."""
         validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
         self._time_step = time_step
         self._inverse_time_step = inverse_time_step
@@ -2378,17 +2378,6 @@ class LOXKaminoAdapter:
             self.body_explicit_wrench,
             time_step,
         )
-        self._update_unilaterals(
-            time_step,
-            self._limit_stabilization_fraction,
-            self._contact_stabilization_fraction,
-            self._contact_dead_zone,
-            self._impact_velocity_threshold,
-            self._contact_recoverable_response,
-            import_reactions=False,
-            update_counts=False,
-        )
-
         if self.dynamic_row_count > 0:
             wp.launch(
                 _gather_dynamic_rows,
