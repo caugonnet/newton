@@ -9,6 +9,7 @@ import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
 from .contact import _solve_contact_coulomb_newton_normal_last
+from .deformable_contact import DEFORMABLE_CONTACT_STATUS_VALID
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
@@ -586,6 +587,101 @@ def _extrapolate_rigid_reactions_fused(
     limit_trial[constraint] = limit_value + beta[world] * (limit_value - limit_old)
 
 
+@wp.kernel
+def _extrapolate_mixed_reactions_fused(
+    friction_capacity: int,
+    contact_capacity: int,
+    rigid_capacity: int,
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    deformable_launch_dim: int,
+    world_count: int,
+    deformable_world_contact_offset: wp.array[wp.int32],
+    deformable_world_contact_count: wp.array[wp.int32],
+    deformable_contact_order: wp.array[wp.int32],
+    deformable_contact_world: wp.array[wp.int32],
+    deformable_contact_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    beta: wp.array[wp.float32],
+    friction_next: wp.array[wp.float32],
+    contact_next: wp.array[wp.vec3f],
+    limit_next: wp.array[wp.float32],
+    deformable_next: wp.array[wp.vec3],
+    friction_reaction: wp.array[wp.float32],
+    friction_trial: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_trial: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_trial: wp.array[wp.float32],
+    deformable_reaction: wp.array[wp.vec3],
+    deformable_trial: wp.array[wp.vec3],
+):
+    lane = wp.tid()
+    if lane < rigid_capacity:
+        constraint = lane
+        if constraint < friction_capacity:
+            world = friction_world[constraint]
+            if (
+                friction_local[constraint] < world_friction_count[world]
+                and world_active[world]
+                and projection_status[world] == PROJECTION_STATUS_VALID
+            ):
+                friction_old = friction_reaction[constraint]
+                friction_value = friction_next[constraint]
+                friction_reaction[constraint] = friction_value
+                friction_trial[constraint] = friction_value + beta[world] * (friction_value - friction_old)
+        else:
+            constraint -= friction_capacity
+            if constraint < contact_capacity:
+                world = contact_world[constraint]
+                if (
+                    contact_local[constraint] < world_contact_count[world]
+                    and world_active[world]
+                    and projection_status[world] == PROJECTION_STATUS_VALID
+                ):
+                    contact_old = contact_reaction[constraint]
+                    contact_value = contact_next[constraint]
+                    contact_reaction[constraint] = contact_value
+                    contact_trial[constraint] = contact_value + beta[world] * (contact_value - contact_old)
+            else:
+                constraint -= contact_capacity
+                world = limit_world[constraint]
+                if (
+                    limit_local[constraint] < world_limit_count[world]
+                    and world_active[world]
+                    and projection_status[world] == PROJECTION_STATUS_VALID
+                ):
+                    limit_old = limit_reaction[constraint]
+                    limit_value = limit_next[constraint]
+                    limit_reaction[constraint] = limit_value
+                    limit_trial[constraint] = limit_value + beta[world] * (limit_value - limit_old)
+
+    if lane < deformable_launch_dim:
+        total = deformable_world_contact_offset[world_count - 1] + deformable_world_contact_count[world_count - 1]
+        for ordered in range(lane, total, deformable_launch_dim):
+            deformable_contact = deformable_contact_order[ordered]
+            world = deformable_contact_world[deformable_contact]
+            if (
+                deformable_contact_status[deformable_contact] != DEFORMABLE_CONTACT_STATUS_VALID
+                or world < 0
+                or not world_active[world]
+                or projection_status[world] != PROJECTION_STATUS_VALID
+            ):
+                continue
+            deformable_old = deformable_reaction[deformable_contact]
+            deformable_value = deformable_next[deformable_contact]
+            deformable_reaction[deformable_contact] = deformable_value
+            deformable_trial[deformable_contact] = deformable_value + beta[world] * (deformable_value - deformable_old)
+
+
 def _scatter_rigid_reactions(adapter, world_active, inverse_weight, reaction_fields, twist_delta) -> None:
     friction_reaction, contact_reaction, limit_reaction = reaction_fields
     capacity = adapter.friction_capacity + adapter.contact_capacity + adapter.limit_capacity
@@ -864,7 +960,52 @@ def project_constraints_apgd(
             outputs=[restart_dot, theta, beta],
             device=adapter.device,
         )
-        if rigid_capacity > 0:
+        if rigid_capacity > 0 and deformable_contacts is not None:
+            wp.launch(
+                _extrapolate_mixed_reactions_fused,
+                dim=max(rigid_capacity, deformable_contacts.apgd_worker_count),
+                inputs=[
+                    adapter.friction_capacity,
+                    adapter.contact_capacity,
+                    rigid_capacity,
+                    adapter.friction_world,
+                    adapter.friction_local,
+                    adapter.world_friction_count,
+                    adapter.contact_world,
+                    adapter.contact_local,
+                    adapter.world_contact_count,
+                    adapter.limit_world,
+                    adapter.limit_local,
+                    adapter.world_limit_count,
+                    deformable_contacts.apgd_worker_count,
+                    int(deformable_contacts.model.world_count),
+                    deformable_contacts.world_contact_offset,
+                    deformable_contacts.world_contact_count,
+                    deformable_contacts.contact_order,
+                    deformable_contacts.contact_world,
+                    deformable_contacts.status,
+                    world_active,
+                    adapter.projection_status,
+                    beta,
+                    adapter.friction_apgd_next,
+                    adapter.contact_apgd_next,
+                    adapter.limit_apgd_next,
+                    deformable_contacts.apgd_next,
+                ],
+                outputs=[
+                    adapter.friction_reaction,
+                    adapter.friction_apgd_trial,
+                    adapter.contact_reaction,
+                    adapter.contact_apgd_trial,
+                    adapter.limit_reaction,
+                    adapter.limit_apgd_trial,
+                    deformable_contacts.rigid_reaction,
+                    deformable_contacts.apgd_trial,
+                ],
+                device=adapter.device,
+                block_dim=256,
+            )
+        elif rigid_capacity > 0:
             wp.launch(
                 _extrapolate_rigid_reactions_fused,
                 dim=rigid_capacity,
@@ -897,7 +1038,7 @@ def project_constraints_apgd(
                 ],
                 device=adapter.device,
             )
-        if deformable_contacts is not None:
+        if deformable_contacts is not None and rigid_capacity == 0:
             deformable_contacts.extrapolate_apgd(world_active, beta, adapter.projection_status, rigid_coordinates=True)
 
     _scatter_rigid_reactions(
