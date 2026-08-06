@@ -1088,11 +1088,14 @@ class SolverKaminoImpl(SolverBase):
         Updates the forward kinematics by building the system Jacobians (of actuation and
         constraints) based on the current state of the system and set of active constraints.
         """
+        jacobian_contacts = contacts
+        if self._config.dynamics_solver == "lox" and not self._config.compute_solution_metrics:
+            jacobian_contacts = None
         self._jacobians.build(
             model=self._model,
             data=self._data,
             limits=self._limits,
-            contacts=contacts,
+            contacts=jacobian_contacts,
             reset_to_zero=True,
         )
 

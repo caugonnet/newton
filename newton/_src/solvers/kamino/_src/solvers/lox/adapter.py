@@ -19,6 +19,7 @@ import warp as wp
 from ......sim import BodyFlags, JointType
 from ...core.data import DataKamino
 from ...core.joints import JointActuationType
+from ...core.math import contact_wrench_matrix_from_points
 from ...core.model import ModelKamino
 from ...core.types import mat36f, mat66f, vec6f
 from ...geometry.contacts import ContactMode, ContactsKamino
@@ -813,21 +814,17 @@ def _gather_contacts(
     source_world: wp.array[wp.int32],
     source_local: wp.array[wp.int32],
     source_bodies: wp.array[wp.vec2i],
+    source_position_a: wp.array[wp.vec3f],
+    source_position_b: wp.array[wp.vec3f],
+    source_frame: wp.array[wp.quatf],
     source_gap: wp.array[wp.vec4f],
     source_material: wp.array[wp.vec2f],
     source_reaction: wp.array[wp.vec3f],
+    body_pose: wp.array[wp.transformf],
     body_velocity_begin: wp.array[vec6f],
     world_capacity: wp.array[wp.int32],
     world_offset: wp.array[wp.int32],
-    body_offset: wp.array[wp.int32],
     body_vector_index: wp.array[wp.int32],
-    body_dofs: wp.array[wp.int32],
-    constraint_group_offset: wp.array[wp.int32],
-    jacobian_offsets: wp.array[wp.int32],
-    jacobian_data: wp.array[wp.float32],
-    sparse_jacobian: wp.bool,
-    sparse_jacobian_offsets: wp.array[wp.int32],
-    sparse_jacobian_data: wp.array[vec6f],
     time_step: wp.array[wp.float32],
     stabilization_fraction: wp.float32,
     dead_zone: wp.float32,
@@ -869,33 +866,20 @@ def _gather_contacts(
         reaction[destination] = wp.vec3f(0.0)
         velocity[destination] = wp.vec3f(0.0)
         return
-    first_local = first_global - body_offset[world] if first_global >= 0 else -1
-    second_local = second_global - body_offset[world] if second_global >= 0 else -1
     first_jacobian = mat36f(0.0)
     second_jacobian = mat36f(0.0)
-    sparse_offset = wp.int32(0)
-    dense_row = wp.int32(0)
-    if sparse_jacobian:
-        sparse_offset = sparse_jacobian_offsets[source]
-    else:
-        dense_row = constraint_group_offset[world] + 3 * local
+    rotation = wp.quat_to_matrix(source_frame[source])
+    body_position_b = wp.transform_get_translation(body_pose[second_global])
+    jacobian_transpose_b = contact_wrench_matrix_from_points(source_position_b[source], body_position_b) @ rotation
     for component in range(3):
-        first_row = vec6f(0.0)
-        second_row = vec6f(0.0)
-        if sparse_jacobian:
-            first_sparse_index = sparse_offset + 3 + component if first_global >= 0 else -1
-            first_row = _load_sparse_jacobian_row(first_sparse_index, sparse_jacobian_data)
-            second_row = _load_sparse_jacobian_row(sparse_offset + component, sparse_jacobian_data)
-        else:
-            first_row = _load_dense_jacobian_row(
-                world, dense_row + component, first_local, body_dofs, jacobian_offsets, jacobian_data
-            )
-            second_row = _load_dense_jacobian_row(
-                world, dense_row + component, second_local, body_dofs, jacobian_offsets, jacobian_data
-            )
         for dof in range(6):
-            first_jacobian[component, dof] = first_row[dof]
-            second_jacobian[component, dof] = second_row[dof]
+            second_jacobian[component, dof] = jacobian_transpose_b[dof, component]
+    if first_global >= 0:
+        body_position_a = wp.transform_get_translation(body_pose[first_global])
+        jacobian_transpose_a = -contact_wrench_matrix_from_points(source_position_a[source], body_position_a) @ rotation
+        for component in range(3):
+            for dof in range(6):
+                first_jacobian[component, dof] = jacobian_transpose_a[dof, component]
 
     velocity_previous = wp.vec3f(0.0)
     if first_global >= 0:
@@ -2671,21 +2655,17 @@ class LOXKaminoAdapter:
                     self.contacts.wid,
                     self.contacts.cid,
                     self.contacts.bid_AB,
+                    self.contacts.position_A,
+                    self.contacts.position_B,
+                    self.contacts.frame,
                     self.contacts.gapfunc,
                     self.contacts.material,
                     self.contacts.reaction,
+                    self.data.bodies.q_i,
                     self.body_velocity_begin,
                     self.world_contact_capacity,
                     self.world_contact_offset,
-                    self.model.info.bodies_offset,
                     self.system.body_vector_index,
-                    self.model.info.num_body_dofs,
-                    self.data.info.contact_cts_group_offset,
-                    self._dense_jacobian_offsets,
-                    self._dense_jacobian_data,
-                    self.sparse_jacobian,
-                    self._sparse_contact_offsets,
-                    self._sparse_jacobian_data,
                     time_step,
                     contact_stabilization_fraction,
                     contact_dead_zone,
