@@ -29,6 +29,23 @@ def _is_finite_vec3(value: wp.vec3f) -> wp.bool:
     return wp.isfinite(value[0]) and wp.isfinite(value[1]) and wp.isfinite(value[2])
 
 
+@wp.func
+def _initialize_active_world(
+    world: int,
+    world_active: wp.array[wp.bool],
+    prepared_status: wp.array[wp.int32],
+    theta: wp.array[wp.float32],
+    beta: wp.array[wp.float32],
+    restart_dot: wp.array[wp.float32],
+    projection_status: wp.array[wp.int32],
+):
+    if world_active[world]:
+        theta[world] = 1.0
+        beta[world] = 0.0
+        restart_dot[world] = 0.0
+        projection_status[world] = prepared_status[world]
+
+
 @wp.kernel
 def _initialize_world_state(
     world_active: wp.array[wp.bool],
@@ -39,12 +56,52 @@ def _initialize_world_state(
     projection_status: wp.array[wp.int32],
 ):
     world = wp.tid()
-    if not world_active[world]:
-        return
-    theta[world] = 1.0
-    beta[world] = 0.0
-    restart_dot[world] = 0.0
-    projection_status[world] = prepared_status[world]
+    _initialize_active_world(
+        world,
+        world_active,
+        prepared_status,
+        theta,
+        beta,
+        restart_dot,
+        projection_status,
+    )
+
+
+@wp.kernel
+def _initialize_mixed_state(
+    particle_count: int,
+    body_count: int,
+    world_count: int,
+    world_active: wp.array[wp.bool],
+    prepared_status: wp.array[wp.int32],
+    projected_velocity: wp.array[wp.vec3],
+    projected_twist: wp.array[vec6f],
+    theta: wp.array[wp.float32],
+    beta: wp.array[wp.float32],
+    restart_dot: wp.array[wp.float32],
+    projection_status: wp.array[wp.int32],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+    particle_baseline: wp.array[wp.vec3],
+    body_baseline: wp.array[vec6f],
+):
+    index = wp.tid()
+    if index < world_count:
+        _initialize_active_world(
+            index,
+            world_active,
+            prepared_status,
+            theta,
+            beta,
+            restart_dot,
+            projection_status,
+        )
+    if index < particle_count:
+        particle_delta[index] = wp.vec3(0.0)
+        particle_baseline[index] = projected_velocity[index]
+    if index < body_count:
+        twist_delta[index] = vec6f(0.0)
+        body_baseline[index] = projected_twist[index]
 
 
 @wp.kernel
@@ -633,18 +690,44 @@ def project_constraints_apgd(
         raise ValueError("APGD deformable contacts and projected velocity must be supplied together.")
     if deformable_contacts is not None and particle_baseline is None:
         raise ValueError("APGD deformable projection requires a particle baseline.")
-    wp.copy(body_baseline, projected_twist)
-    adapter.projection_twist_delta.zero_()
-    if deformable_contacts is not None:
-        wp.copy(particle_baseline, projected_velocity)
-        deformable_contacts.begin_apgd_scatter()
-    wp.launch(
-        _initialize_world_state,
-        dim=world_active.shape[0],
-        inputs=[world_active, adapter.world_jacobi_projection_status],
-        outputs=[theta, beta, restart_dot, adapter.projection_status],
-        device=adapter.device,
-    )
+    body_count = projected_twist.shape[0]
+    world_count = world_active.shape[0]
+    if deformable_contacts is None:
+        wp.copy(body_baseline, projected_twist)
+        adapter.projection_twist_delta.zero_()
+        wp.launch(
+            _initialize_world_state,
+            dim=world_count,
+            inputs=[world_active, adapter.world_jacobi_projection_status],
+            outputs=[theta, beta, restart_dot, adapter.projection_status],
+            device=adapter.device,
+        )
+    else:
+        particle_count = deformable_contacts.cloth_system.particle_count
+        wp.launch(
+            _initialize_mixed_state,
+            dim=max(particle_count, body_count, world_count),
+            inputs=[
+                particle_count,
+                body_count,
+                world_count,
+                world_active,
+                adapter.world_jacobi_projection_status,
+                projected_velocity,
+                projected_twist,
+            ],
+            outputs=[
+                theta,
+                beta,
+                restart_dot,
+                adapter.projection_status,
+                deformable_contacts.particle_delta,
+                adapter.projection_twist_delta,
+                particle_baseline,
+                body_baseline,
+            ],
+            device=adapter.device,
+        )
     rigid_capacity = adapter.friction_capacity + adapter.contact_capacity + adapter.limit_capacity
     if rigid_capacity > 0:
         wp.launch(

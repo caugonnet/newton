@@ -1640,8 +1640,7 @@ class LOXSolver:
         deformable_splitting = self.deformable_splitting
         if deformable_system is None or deformable_splitting is None:
             return
-        deformable_splitting.copy_world_active(self.world_active)
-        center = deformable_splitting.build_consensus_center()
+        center = deformable_splitting.build_consensus_center(self.world_active)
         deformable_system.solve_candidate(center)
         deformable_system.update_proximal(time_step)
         deformable_splitting.prepare_projection(deformable_system.smooth_velocity)

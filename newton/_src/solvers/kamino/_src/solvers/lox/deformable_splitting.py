@@ -18,15 +18,6 @@ wp.set_module_options({"enable_backward": False})
 
 
 @wp.kernel
-def _copy_world_active(
-    source: wp.array[wp.bool],
-    destination: wp.array[wp.int32],
-):
-    world = wp.tid()
-    destination[world] = wp.where(source[world], 1, 0)
-
-
-@wp.kernel
 def _gather_state_dual_impulse(
     packed_to_newton: wp.array[wp.int32],
     state_dual_impulse: wp.array[wp.vec3],
@@ -145,12 +136,19 @@ def _reset_worlds_masked(
 
 @wp.kernel
 def _build_consensus_center(
+    particle_count: int,
+    world_count: int,
+    shared_world_active: wp.array[wp.bool],
     projected_velocity: wp.array[wp.vec3],
     dual: wp.array[wp.vec3],
+    deformable_world_active: wp.array[wp.int32],
     consensus_center: wp.array[wp.vec3],
 ):
-    particle = wp.tid()
-    consensus_center[particle] = projected_velocity[particle] + dual[particle]
+    index = wp.tid()
+    if index < world_count:
+        deformable_world_active[index] = wp.where(shared_world_active[index], 1, 0)
+    if index < particle_count:
+        consensus_center[index] = projected_velocity[index] + dual[index]
 
 
 @wp.kernel
@@ -275,55 +273,57 @@ def _finalize_worlds(
     cloth_converged: wp.array[wp.bool],
     cloth_failed: wp.array[wp.bool],
     cloth_residual: wp.array[float],
-):
-    world = wp.tid()
-    cloth_converged[world] = True
-    cloth_failed[world] = False
-    cloth_residual[world] = 0.0
-    if world_has_particles[world] == 0:
-        return
-
-    contact_failed = contact_global_status[0] > 1 or contact_world_status[world] > 1
-    failed = (
-        iteration_failed[world] != 0
-        or preconditioner_status[world] == DEFORMABLE_PRECONDITIONER_STATUS_FAILED
-        or proximal_failed[world] != 0
-        or contact_failed
-    )
-    cloth_failed[world] = failed
-    if failed:
-        cloth_converged[world] = False
-        return
-
-    residual = wp.max(
-        consensus_residual[world] / velocity_tolerance,
-        iterate_residual[world] / velocity_tolerance,
-    )
-    residual = wp.max(residual, displacement_residual[world] / position_tolerance)
-    residual = wp.max(residual, proximal_position_residual[world] / position_tolerance)
-    residual = wp.max(residual, proximal_velocity_residual[world] / velocity_tolerance)
-    residual = wp.max(residual, contact_residual[world] / velocity_tolerance)
-    cloth_residual[world] = residual
-    cloth_converged[world] = residual <= 1.0
-
-
-@wp.kernel
-def _combine_worlds(
-    cloth_converged: wp.array[wp.bool],
-    cloth_failed: wp.array[wp.bool],
-    cloth_residual: wp.array[float],
     world_active: wp.array[wp.bool],
     world_converged: wp.array[wp.bool],
     world_failed: wp.array[wp.bool],
     residual_total: wp.array[float],
 ):
     world = wp.tid()
-    failed = world_failed[world] or cloth_failed[world]
-    converged = world_converged[world] and cloth_converged[world] and not failed
+    deformable_converged = wp.bool(True)
+    deformable_failed = wp.bool(False)
+    deformable_residual = wp.float32(0.0)
+    if world_has_particles[world] != 0:
+        contact_failed = contact_global_status[0] > 1 or contact_world_status[world] > 1
+        deformable_failed = (
+            iteration_failed[world] != 0
+            or preconditioner_status[world] == DEFORMABLE_PRECONDITIONER_STATUS_FAILED
+            or proximal_failed[world] != 0
+            or contact_failed
+        )
+        if deformable_failed:
+            deformable_converged = False
+        else:
+            deformable_residual = wp.max(
+                consensus_residual[world] / velocity_tolerance,
+                iterate_residual[world] / velocity_tolerance,
+            )
+            deformable_residual = wp.max(
+                deformable_residual,
+                displacement_residual[world] / position_tolerance,
+            )
+            deformable_residual = wp.max(
+                deformable_residual,
+                proximal_position_residual[world] / position_tolerance,
+            )
+            deformable_residual = wp.max(
+                deformable_residual,
+                proximal_velocity_residual[world] / velocity_tolerance,
+            )
+            deformable_residual = wp.max(
+                deformable_residual,
+                contact_residual[world] / velocity_tolerance,
+            )
+            deformable_converged = deformable_residual <= 1.0
+
+    cloth_converged[world] = deformable_converged
+    cloth_failed[world] = deformable_failed
+    cloth_residual[world] = deformable_residual
+    failed = world_failed[world] or deformable_failed
+    converged = world_converged[world] and deformable_converged and not failed
     world_failed[world] = failed
     world_converged[world] = converged
     world_active[world] = not failed and not converged
-    residual_total[world] = wp.max(residual_total[world], cloth_residual[world])
+    residual_total[world] = wp.max(residual_total[world], deformable_residual)
 
 
 @wp.kernel
@@ -594,26 +594,22 @@ class DeformableSplittingState:
         wp.copy(self.accepted_velocity, self.cloth_system.velocity_start)
         self.outer_accepted.zero_()
 
-    def build_consensus_center(self) -> wp.array[wp.vec3]:
-        """Form the current nodal center ``p + lambda``."""
+    def build_consensus_center(self, shared_world_active: wp.array[wp.bool]) -> wp.array[wp.vec3]:
+        """Copy the active mask and form the current nodal center ``p + lambda``."""
         wp.launch(
             _build_consensus_center,
-            dim=self.particle_count,
-            inputs=[self.projected_velocity, self.dual],
-            outputs=[self.consensus_center],
+            dim=max(self.particle_count, self.num_worlds),
+            inputs=[
+                self.particle_count,
+                self.num_worlds,
+                shared_world_active,
+                self.projected_velocity,
+                self.dual,
+            ],
+            outputs=[self.world_active, self.consensus_center],
             device=self.device,
         )
         return self.consensus_center
-
-    def copy_world_active(self, world_active: wp.array[wp.bool]) -> None:
-        """Copy the shared boolean active mask to the cloth integer mask."""
-        wp.launch(
-            _copy_world_active,
-            dim=self.num_worlds,
-            inputs=[world_active],
-            outputs=[self.world_active],
-            device=self.device,
-        )
 
     def prepare_projection(self, candidate_velocity: wp.array[wp.vec3]) -> None:
         """Store the smooth candidate and initialize ``p = v - lambda``."""
@@ -725,14 +721,11 @@ class DeformableSplittingState:
                 self.cloth_converged,
                 self.cloth_failed,
                 self.cloth_residual,
+                world_active,
+                world_converged,
+                world_failed,
+                residual_total,
             ],
-            device=self.device,
-        )
-        wp.launch(
-            _combine_worlds,
-            dim=self.num_worlds,
-            inputs=[self.cloth_converged, self.cloth_failed, self.cloth_residual],
-            outputs=[world_active, world_converged, world_failed, residual_total],
             device=self.device,
         )
 
