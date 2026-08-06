@@ -36,7 +36,7 @@ parallelism crossover rather than a shared-memory capacity limit.
 _PERSISTENT_BLOCK_DIM_LIMIT = 512
 """Largest thread block used by persistent application."""
 
-_LEVEL_BLOCK_DIM = 64
+_LEVEL_BLOCK_DIM = 32
 """Thread block size used by level-scheduled triangular solves."""
 
 

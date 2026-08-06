@@ -724,29 +724,6 @@ def add_consensus_weight(
 
 
 @wp.kernel
-def finish_masked_system_product(
-    system_product: wp.array[wp.vec3],
-    x: wp.array[wp.vec3],
-    y: wp.array[wp.vec3],
-    packed_world: wp.array[wp.int32],
-    packed_iterative: wp.array[wp.int32],
-    world_active: wp.array[wp.int32],
-    alpha: float,
-    beta: float,
-    result: wp.array[wp.vec3],
-):
-    """Apply active system or inactive identity products with BLAS scaling."""
-    particle = wp.tid()
-    value = x[particle]
-    if packed_iterative[particle] != 0 and world_active[packed_world[particle]] != 0:
-        value = system_product[particle]
-    value *= alpha
-    if beta != 0.0:
-        value += beta * y[particle]
-    result[particle] = value
-
-
-@wp.kernel
 def prepare_candidate_rhs(
     smooth_rhs: wp.array[wp.vec3],
     nonlinear_rhs: wp.array[wp.vec3],

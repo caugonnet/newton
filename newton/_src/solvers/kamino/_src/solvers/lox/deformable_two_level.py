@@ -25,6 +25,9 @@ _AGGREGATE_PARTICLE_COUNT = 64
 _AGGREGATE_COUNT_LIMIT = 128
 """Largest coarse vertex count allocated for one iterative component."""
 
+_AGGREGATE_BLOCK_DIM = 64
+"""Thread count used to restrict one graph aggregate."""
+
 
 def _aggregate_component(
     component_rows: np.ndarray,
@@ -68,22 +71,32 @@ def _assemble_coarse_matrix(
 
 
 @wp.kernel
-def _restrict_residual(
+def _restrict_residual_by_aggregate(
     right_hand_side: wp.array[wp.vec3],
-    particle_coarse_offset: wp.array[wp.int32],
-    packed_world: wp.array[wp.int32],
+    aggregate_offsets: wp.array[wp.int32],
+    aggregate_particles: wp.array[wp.int32],
+    aggregate_coarse_offset: wp.array[wp.int32],
+    aggregate_world: wp.array[wp.int32],
     world_active: wp.array[wp.int32],
     world_status: wp.array[wp.int32],
     coarse_right_hand_side: wp.array[wp.float32],
 ):
-    particle = wp.tid()
-    coarse_offset = particle_coarse_offset[particle]
-    world = packed_world[particle]
-    if coarse_offset < 0 or world_active[world] == 0 or world_status[world] == DEFORMABLE_PRECONDITIONER_STATUS_FAILED:
-        return
-    value = right_hand_side[particle]
-    for axis in range(3):
-        wp.atomic_add(coarse_right_hand_side, coarse_offset + axis, value[axis])
+    thread = wp.tid()
+    aggregate = thread // _AGGREGATE_BLOCK_DIM
+    lane = thread - aggregate * _AGGREGATE_BLOCK_DIM
+    value = wp.vec3(0.0)
+    world = aggregate_world[aggregate]
+    if world_active[world] != 0 and world_status[world] != DEFORMABLE_PRECONDITIONER_STATUS_FAILED:
+        slot = wp.int32(aggregate_offsets[aggregate] + lane)
+        slot_end = aggregate_offsets[aggregate + 1]
+        while slot < slot_end:
+            value += right_hand_side[aggregate_particles[slot]]
+            slot += _AGGREGATE_BLOCK_DIM
+    value = wp.tile_reduce(wp.add, wp.tile(value, preserve_type=True))[0]
+    if lane == 0:
+        coarse_offset = aggregate_coarse_offset[aggregate]
+        for axis in range(3):
+            coarse_right_hand_side[coarse_offset + axis] = value[axis]
 
 
 @wp.kernel
@@ -195,6 +208,8 @@ class DeformableTwoLevel:
         particle_aggregate = np.full(row_count, -1, dtype=np.int32)
         iterative_components: list[int] = []
         aggregate_counts: list[int] = []
+        aggregate_offsets = [0]
+        aggregate_particles: list[int] = []
         next_aggregate = 0
         for component_index in range(int(np.max(component)) + 1):
             rows = np.flatnonzero((component == component_index) & active).astype(np.int32)
@@ -207,6 +222,8 @@ class DeformableTwoLevel:
             aggregates = _aggregate_component(rows, adjacency, target_size)
             for local_aggregate, aggregate_rows in enumerate(aggregates):
                 particle_aggregate[aggregate_rows] = next_aggregate + local_aggregate
+                aggregate_particles.extend(aggregate_rows)
+                aggregate_offsets.append(len(aggregate_particles))
             iterative_components.append(component_index)
             aggregate_counts.append(len(aggregates))
             next_aggregate += len(aggregates)
@@ -243,6 +260,12 @@ class DeformableTwoLevel:
             block = component_to_coarse_block[int(component[particle])]
             particle_coarse_offset[particle] = int(vector_offsets[block]) + 3 * int(aggregate_local[aggregate])
 
+        aggregate_offsets_np = np.asarray(aggregate_offsets, dtype=np.int32)
+        aggregate_particles_np = np.asarray(aggregate_particles, dtype=np.int32)
+        aggregate_first_particles = aggregate_particles_np[aggregate_offsets_np[:-1]]
+        aggregate_coarse_offset = particle_coarse_offset[aggregate_first_particles]
+        aggregate_world = packed_world.numpy().astype(np.int32, copy=False)[aggregate_first_particles]
+
         coarse_slot_base = np.full(columns.shape[0], -1, dtype=np.int32)
         coarse_slot_dimension = np.zeros(columns.shape[0], dtype=np.int32)
         for slot, (row, column) in enumerate(zip(slot_rows, columns, strict=True)):
@@ -263,6 +286,10 @@ class DeformableTwoLevel:
 
         self.particle_aggregate = wp.array(particle_aggregate, dtype=wp.int32, device=self.device)
         self.particle_coarse_offset = wp.array(particle_coarse_offset, dtype=wp.int32, device=self.device)
+        self.aggregate_offsets = wp.array(aggregate_offsets_np, dtype=wp.int32, device=self.device)
+        self.aggregate_particles = wp.array(aggregate_particles_np, dtype=wp.int32, device=self.device)
+        self.aggregate_coarse_offset = wp.array(aggregate_coarse_offset, dtype=wp.int32, device=self.device)
+        self.aggregate_world = wp.array(aggregate_world, dtype=wp.int32, device=self.device)
         self.coarse_slot_base = wp.array(coarse_slot_base, dtype=wp.int32, device=self.device)
         self.coarse_slot_dimension = wp.array(coarse_slot_dimension, dtype=wp.int32, device=self.device)
         self.coarse_matrix = wp.zeros(self.info.total_mat_size, dtype=wp.float32, device=self.device)
@@ -310,18 +337,20 @@ class DeformableTwoLevel:
         alpha: float,
         beta: float,
     ) -> None:
-        self.coarse_right_hand_side.zero_()
         wp.launch(
-            _restrict_residual,
-            dim=self.row_count,
+            _restrict_residual_by_aggregate,
+            dim=self.aggregate_count * _AGGREGATE_BLOCK_DIM,
             inputs=[
                 x,
-                self.particle_coarse_offset,
-                self.packed_world,
+                self.aggregate_offsets,
+                self.aggregate_particles,
+                self.aggregate_coarse_offset,
+                self.aggregate_world,
                 self.world_active,
                 self.world_status,
             ],
             outputs=[self.coarse_right_hand_side],
+            block_dim=_AGGREGATE_BLOCK_DIM,
             device=self.device,
         )
         self.coarse_solver.solve(self.coarse_right_hand_side, self.coarse_solution)

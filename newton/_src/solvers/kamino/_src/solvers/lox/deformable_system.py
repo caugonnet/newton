@@ -24,7 +24,6 @@ from .deformable_assembly import (
     assemble_tetrahedron_system,
     assemble_triangle_system,
     compute_consensus_weight,
-    finish_masked_system_product,
     finish_smooth_rhs,
     gather_particle_state,
     prepare_candidate_rhs,
@@ -60,7 +59,7 @@ __all__ = [
 
 _PARTICLE_FLAG_ACTIVE = 1
 _PARTICLE_FLAG_PROXY = 2
-_SYSTEM_MATVEC_BLOCK_DIM = 128
+_SYSTEM_MATVEC_BLOCK_DIM = 64
 
 
 @wp.kernel
@@ -69,6 +68,38 @@ def _increment_counter(
     counter: wp.array[wp.int32],
 ):
     counter[0] += amount
+
+
+@wp.kernel
+def _masked_system_matvec(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array3d[wp.float32],
+    x: wp.array[wp.float32],
+    y: wp.array[wp.float32],
+    packed_world: wp.array[wp.int32],
+    packed_iterative: wp.array[wp.int32],
+    world_active: wp.array[wp.int32],
+    alpha: float,
+    beta: float,
+    result: wp.array[wp.float32],
+):
+    row, subrow = wp.tid()
+    scalar_row = 3 * row + subrow
+    value = x[scalar_row]
+    if packed_iterative[row] != 0 and world_active[packed_world[row]] != 0:
+        value = wp.float32(0.0)
+        slot = wp.int32(offsets[row])
+        slot_end = wp.int32(offsets[row + 1])
+        while slot < slot_end:
+            scalar_column = 3 * columns[slot]
+            for column in range(3):
+                value += values[slot, subrow, column] * x[scalar_column + column]
+            slot += 1
+    value *= alpha
+    if beta != 0.0:
+        value += beta * y[scalar_row]
+    result[scalar_row] = value
 
 
 def _require_array(model: Model, name: str, expected_shape: tuple[int, ...]) -> np.ndarray:
@@ -619,7 +650,6 @@ class DeformableFEMSystem:
         self.world_active = wp.ones(model.world_count, dtype=wp.int32, device=self.device)
         self.candidate_rhs = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
         self.smooth_velocity = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
-        self.system_product = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
         self._system_matvec_scalar_views: dict[int, wp.array] = {}
         self.nonlinear_rhs = wp.zeros(self.particle_count, dtype=wp.vec3, device=self.device)
         self.proximal_position_residual = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
@@ -1040,40 +1070,31 @@ class DeformableFEMSystem:
         if x_scalar is None:
             x_scalar = _wps_internal._vec_array_view(x, wp.float32, matrix.ncol * 3)
             self._system_matvec_scalar_views[x.ptr] = x_scalar
-        product_scalar = self._system_matvec_scalar_views.get(self.system_product.ptr)
-        if product_scalar is None:
-            product_scalar = _wps_internal._vec_array_view(self.system_product, wp.float32, matrix.nrow * 3)
-            self._system_matvec_scalar_views[self.system_product.ptr] = product_scalar
+        y_scalar = self._system_matvec_scalar_views.get(y.ptr)
+        if y_scalar is None:
+            y_scalar = _wps_internal._vec_array_view(y, wp.float32, matrix.nrow * 3)
+            self._system_matvec_scalar_views[y.ptr] = y_scalar
+        z_scalar = self._system_matvec_scalar_views.get(z.ptr)
+        if z_scalar is None:
+            z_scalar = _wps_internal._vec_array_view(z, wp.float32, matrix.nrow * 3)
+            self._system_matvec_scalar_views[z.ptr] = z_scalar
         wp.launch(
-            kernel=_wps_internal.make_bsr_mv_kernel(block_cols=3),
+            kernel=_masked_system_matvec,
             dim=(matrix.nrow, 3),
             inputs=[
-                wp.float32(1.0),
                 matrix.offsets,
-                matrix.row_counts,
                 matrix.columns,
                 matrix.scalar_values,
                 x_scalar,
-                wp.float32(0.0),
-                product_scalar,
-            ],
-            block_dim=_SYSTEM_MATVEC_BLOCK_DIM,
-            device=self.device,
-        )
-        wp.launch(
-            finish_masked_system_product,
-            dim=self.particle_count,
-            inputs=[
-                self.system_product,
-                x,
-                y,
+                y_scalar,
                 self.topology.packed_world,
                 self.packed_iterative,
                 self.world_active,
                 alpha,
                 beta,
             ],
-            outputs=[z],
+            outputs=[z_scalar],
+            block_dim=_SYSTEM_MATVEC_BLOCK_DIM,
             device=self.device,
         )
 
