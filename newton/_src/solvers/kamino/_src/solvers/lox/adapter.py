@@ -157,12 +157,36 @@ def _evaluate_lagged_scalar_velocity_consistency(
 
 @wp.kernel
 def _evaluate_lagged_contact_velocity_consistency(
+    world_dynamic_offset: wp.array[wp.int32],
+    world_dynamic_count: wp.array[wp.int32],
+    dynamic_body_first: wp.array[wp.int32],
+    dynamic_body_second: wp.array[wp.int32],
+    dynamic_jacobian_first: wp.array[vec6f],
+    dynamic_jacobian_second: wp.array[vec6f],
+    world_structural_offset: wp.array[wp.int32],
+    world_structural_count: wp.array[wp.int32],
+    structural_body_first: wp.array[wp.int32],
+    structural_body_second: wp.array[wp.int32],
+    structural_jacobian_first: wp.array[vec6f],
+    structural_jacobian_second: wp.array[vec6f],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
     world_contact_offset: wp.array[wp.int32],
     world_contact_count: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[mat36f],
-    jacobian_second: wp.array[mat36f],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
     world_active: wp.array[wp.bool],
     global_twist: wp.array[vec6f],
     projected_twist_previous: wp.array[vec6f],
@@ -172,45 +196,104 @@ def _evaluate_lagged_contact_velocity_consistency(
     world_residual: wp.array[wp.float32],
 ):
     world, block, lane = wp.tid()
-    count = wp.int32(0)
-    if world_active[world]:
-        count = world_contact_count[world]
-
-    if count <= wp.block_dim():
-        if block == 0 and lane < count:
-            contact = world_contact_offset[world] + lane
-            first = body_first[contact]
-            second = body_second[contact]
-            value = wp.vec3f(0.0)
-            if first >= 0:
-                value += jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
-            if second >= 0:
-                value += jacobian_second[contact] @ (global_twist[second] - projected_twist_previous[second])
-            if lane == 0:
-                world_required[world] = 1
-            wp.atomic_max(world_residual, world, wp.max(wp.abs(value)) * inverse_velocity_tolerance)
+    if not world_active[world]:
         return
 
+    residual = wp.float32(0.0)
+    if block == 0:
+        scalar_local = lane
+        while scalar_local < world_dynamic_count[world]:
+            row = world_dynamic_offset[world] + scalar_local
+            first = dynamic_body_first[row]
+            second = dynamic_body_second[row]
+            scalar_value = wp.float32(0.0)
+            if first >= 0:
+                scalar_value += wp.dot(
+                    dynamic_jacobian_first[row], global_twist[first] - projected_twist_previous[first]
+                )
+            if second >= 0:
+                scalar_value += wp.dot(
+                    dynamic_jacobian_second[row], global_twist[second] - projected_twist_previous[second]
+                )
+            residual = wp.max(residual, wp.abs(scalar_value) * inverse_velocity_tolerance)
+            scalar_local += wp.block_dim()
+        scalar_local = lane
+        while scalar_local < world_structural_count[world]:
+            row = world_structural_offset[world] + scalar_local
+            first = structural_body_first[row]
+            second = structural_body_second[row]
+            scalar_value = wp.float32(0.0)
+            if first >= 0:
+                scalar_value += wp.dot(
+                    structural_jacobian_first[row], global_twist[first] - projected_twist_previous[first]
+                )
+            if second >= 0:
+                scalar_value += wp.dot(
+                    structural_jacobian_second[row], global_twist[second] - projected_twist_previous[second]
+                )
+            residual = wp.max(residual, wp.abs(scalar_value) * inverse_velocity_tolerance)
+            scalar_local += wp.block_dim()
+        scalar_local = lane
+        while scalar_local < world_friction_count[world]:
+            row = world_friction_offset[world] + scalar_local
+            first = friction_body_first[row]
+            second = friction_body_second[row]
+            scalar_value = wp.float32(0.0)
+            if first >= 0:
+                scalar_value += wp.dot(
+                    friction_jacobian_first[row], global_twist[first] - projected_twist_previous[first]
+                )
+            if second >= 0:
+                scalar_value += wp.dot(
+                    friction_jacobian_second[row], global_twist[second] - projected_twist_previous[second]
+                )
+            residual = wp.max(residual, wp.abs(scalar_value) * inverse_velocity_tolerance)
+            scalar_local += wp.block_dim()
+        scalar_local = lane
+        while scalar_local < world_limit_count[world]:
+            row = world_limit_offset[world] + scalar_local
+            first = limit_body_first[row]
+            second = limit_body_second[row]
+            scalar_value = wp.float32(0.0)
+            if first >= 0:
+                scalar_value += wp.dot(limit_jacobian_first[row], global_twist[first] - projected_twist_previous[first])
+            if second >= 0:
+                scalar_value += wp.dot(
+                    limit_jacobian_second[row], global_twist[second] - projected_twist_previous[second]
+                )
+            residual = wp.max(residual, wp.abs(scalar_value) * inverse_velocity_tolerance)
+            scalar_local += wp.block_dim()
+
+    contact_count = world_contact_count[world]
     local = block * wp.block_dim() + lane
     stride = block_count * wp.block_dim()
-    residual = wp.float32(0.0)
-    while local < count:
+    while local < contact_count:
         contact = world_contact_offset[world] + local
-        first = body_first[contact]
-        second = body_second[contact]
-        value = wp.vec3f(0.0)
+        first = contact_body_first[contact]
+        second = contact_body_second[contact]
+        contact_value = wp.vec3f(0.0)
         if first >= 0:
-            value += jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
+            contact_value += contact_jacobian_first[contact] @ (global_twist[first] - projected_twist_previous[first])
         if second >= 0:
-            value += jacobian_second[contact] @ (global_twist[second] - projected_twist_previous[second])
-        residual = wp.max(residual, wp.max(wp.abs(value)) * inverse_velocity_tolerance)
+            contact_value += contact_jacobian_second[contact] @ (
+                global_twist[second] - projected_twist_previous[second]
+            )
+        residual = wp.max(residual, wp.max(wp.abs(contact_value)) * inverse_velocity_tolerance)
         local += stride
 
     block_residual = wp.tile_max(wp.tile(residual))[0]
-    if lane == 0 and block * wp.block_dim() < count:
+    if lane == 0:
         if block == 0:
-            world_required[world] = 1
-        wp.atomic_max(world_residual, world, block_residual)
+            scalar_count = (
+                world_dynamic_count[world]
+                + world_structural_count[world]
+                + world_friction_count[world]
+                + world_limit_count[world]
+            )
+            if scalar_count + contact_count > 0:
+                world_required[world] = 1
+        if block * wp.block_dim() < contact_count or block == 0:
+            wp.atomic_max(world_residual, world, block_residual)
 
 
 @wp.kernel
@@ -823,6 +906,7 @@ def _gather_contacts(
     body_pose: wp.array[wp.transformf],
     body_velocity_begin: wp.array[vec6f],
     world_capacity: wp.array[wp.int32],
+    world_count: wp.array[wp.int32],
     world_offset: wp.array[wp.int32],
     body_vector_index: wp.array[wp.int32],
     time_step: wp.array[wp.float32],
@@ -831,6 +915,8 @@ def _gather_contacts(
     impact_velocity_threshold: wp.float32,
     recoverable_response: wp.bool,
     import_reactions: wp.bool,
+    compact_contacts: wp.bool,
+    source_to_internal: wp.array[wp.int32],
     body_first: wp.array[wp.int32],
     body_second: wp.array[wp.int32],
     jacobian_first: wp.array[mat36f],
@@ -848,24 +934,18 @@ def _gather_contacts(
     if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
         return
 
-    destination = world_offset[world] + local
     bodies = source_bodies[source]
     first_global = bodies[0]
     second_global = bodies[1]
     first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
     second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
     if not first_dynamic and not second_dynamic:
-        # Contacts between two prescribed bodies cannot change the state. Keep
-        # the slot stable for reaction export, but mark it as a projection no-op.
-        body_first[destination] = -1
-        body_second[destination] = -1
-        jacobian_first[destination] = mat36f(0.0)
-        jacobian_second[destination] = mat36f(0.0)
-        bias[destination] = wp.vec3f(0.0)
-        friction[destination] = 0.0
-        reaction[destination] = wp.vec3f(0.0)
-        velocity[destination] = wp.vec3f(0.0)
+        source_to_internal[source] = -1
         return
+    destination = source_to_internal[source]
+    if compact_contacts:
+        destination = world_offset[world] + wp.atomic_add(world_count, world, 1)
+        source_to_internal[source] = destination
     first_jacobian = mat36f(0.0)
     second_jacobian = mat36f(0.0)
     rotation = wp.quat_to_matrix(source_frame[source])
@@ -1451,9 +1531,7 @@ def _write_contact_outputs(
     source_active: wp.array[wp.int32],
     source_capacity: wp.int32,
     source_world: wp.array[wp.int32],
-    source_local: wp.array[wp.int32],
-    world_capacity: wp.array[wp.int32],
-    world_offset: wp.array[wp.int32],
+    source_to_internal: wp.array[wp.int32],
     inverse_time_step: wp.array[wp.float32],
     reaction: wp.array[wp.vec3f],
     velocity: wp.array[wp.vec3f],
@@ -1464,11 +1542,14 @@ def _write_contact_outputs(
     source = wp.tid()
     if source >= wp.min(source_active[0], source_capacity):
         return
-    world = source_world[source]
-    local = source_local[source]
-    if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
+    internal = source_to_internal[source]
+    if internal < 0:
+        zero_velocity = wp.vec3f(0.0)
+        destination_reaction[source] = wp.vec3f(0.0)
+        destination_velocity[source] = zero_velocity
+        destination_mode[source] = wp.static(ContactMode.make_compute_mode_func())(zero_velocity)
         return
-    internal = world_offset[world] + local
+    world = source_world[source]
     destination_reaction[source] = inverse_time_step[world] * reaction[internal]
     destination_velocity[source] = velocity[internal]
     destination_mode[source] = wp.static(ContactMode.make_compute_mode_func())(velocity[internal])
@@ -1826,6 +1907,9 @@ class LOXKaminoAdapter:
                 structural_row_block.append(block)
 
         self.dynamic_row_count = len(dynamic_world)
+        dynamic_row_offsets = _capacity_offsets([int(count) for count in world_dynamic_count])
+        self.world_dynamic_row_offset = self._device_array(dynamic_row_offsets[:-1], self.device)
+        self.world_dynamic_row_count = self._device_array(world_dynamic_count, self.device)
         self.dynamic_row_world = self._device_array(dynamic_world, self.device)
         self.dynamic_row_joint = self._device_array(dynamic_joint, self.device)
         self.dynamic_jacobian_row = self._device_array(dynamic_dense_row, self.device)
@@ -1845,6 +1929,9 @@ class LOXKaminoAdapter:
         self.dynamic_velocity_begin = wp.zeros(self.dynamic_row_count, dtype=wp.float32, device=self.device)
 
         self.structural_row_count = len(structural_world)
+        structural_row_offsets = _capacity_offsets(world_structural_count)
+        self.world_structural_row_offset = self._device_array(structural_row_offsets[:-1], self.device)
+        self.world_structural_row_count = self._device_array(world_structural_count, self.device)
         self.structural_row_world = self._device_array(structural_world, self.device)
         self.structural_row_counts = tuple(world_structural_count)
         self.structural_vector_index = self._device_array(structural_vector_index, self.device)
@@ -2155,6 +2242,7 @@ class LOXKaminoAdapter:
         self.contact_friction = wp.zeros(self.contact_capacity, dtype=wp.float32, device=self.device)
         self.contact_reaction = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
         self.contact_velocity = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
+        self.contact_source_to_internal = wp.full(self.contact_capacity, -1, dtype=wp.int32, device=self.device)
         self.contact_residual = wp.zeros(self.contact_capacity, dtype=wp.float32, device=self.device)
         self.contact_projection_delassus = wp.zeros(self.contact_capacity, dtype=wp.mat33f, device=self.device)
         self.contact_apgd_trial = wp.zeros(self.contact_capacity, dtype=wp.vec3f, device=self.device)
@@ -2639,13 +2727,7 @@ class LOXKaminoAdapter:
 
         if self.contact_capacity > 0 and self.contacts is not None:
             if update_counts:
-                wp.launch(
-                    _copy_clamped_world_counts,
-                    dim=self.num_worlds,
-                    inputs=[self.contacts.world_active_contacts, self.world_contact_capacity],
-                    outputs=[self.world_contact_count],
-                    device=self.device,
-                )
+                self.world_contact_count.zero_()
             wp.launch(
                 _gather_contacts,
                 dim=self.contacts.model_max_contacts_host,
@@ -2664,6 +2746,7 @@ class LOXKaminoAdapter:
                     self.data.bodies.q_i,
                     self.body_velocity_begin,
                     self.world_contact_capacity,
+                    self.world_contact_count,
                     self.world_contact_offset,
                     self.system.body_vector_index,
                     time_step,
@@ -2672,6 +2755,8 @@ class LOXKaminoAdapter:
                     impact_velocity_threshold,
                     contact_recoverable_response,
                     import_reactions,
+                    update_counts,
+                    self.contact_source_to_internal,
                 ],
                 outputs=[
                     self.contact_body_first,
@@ -2978,8 +3063,10 @@ class LOXKaminoAdapter:
                 self.limit_jacobian_second,
             ),
         )
-        for row_count, row_world, body_first, body_second, jacobian_first, jacobian_second in scalar_rows:
-            if row_count > 0:
+        if self.contact_capacity == 0:
+            for row_count, row_world, body_first, body_second, jacobian_first, jacobian_second in scalar_rows:
+                if row_count <= 0:
+                    continue
                 wp.launch(
                     _evaluate_lagged_scalar_velocity_consistency,
                     dim=row_count,
@@ -3003,6 +3090,30 @@ class LOXKaminoAdapter:
                 dim=(self.num_worlds, self._lagged_contact_block_count, _LAGGED_CONTACT_BLOCK_DIM),
                 block_dim=_LAGGED_CONTACT_BLOCK_DIM,
                 inputs=[
+                    self.world_dynamic_row_offset,
+                    self.world_dynamic_row_count,
+                    self.dynamic_body_first_global,
+                    self.dynamic_body_second_global,
+                    self.dynamic_jacobian_first,
+                    self.dynamic_jacobian_second,
+                    self.world_structural_row_offset,
+                    self.world_structural_row_count,
+                    self.structural_body_first_global,
+                    self.structural_body_second_global,
+                    self.structural_jacobian_first,
+                    self.structural_jacobian_second,
+                    self.world_friction_offset,
+                    self.world_friction_count,
+                    self.friction_body_first,
+                    self.friction_body_second,
+                    self.friction_jacobian_first,
+                    self.friction_jacobian_second,
+                    self.world_limit_offset,
+                    self.world_limit_count,
+                    self.limit_body_first,
+                    self.limit_body_second,
+                    self.limit_jacobian_first,
+                    self.limit_jacobian_second,
                     self.world_contact_offset,
                     self.world_contact_count,
                     self.contact_body_first,
@@ -3290,9 +3401,7 @@ class LOXKaminoAdapter:
                     self.contacts.model_active_contacts,
                     self.contacts.model_max_contacts_host,
                     self.contacts.wid,
-                    self.contacts.cid,
-                    self.world_contact_capacity,
-                    self.world_contact_offset,
+                    self.contact_source_to_internal,
                     inverse_time_step,
                     self.contact_reaction,
                     self.contact_velocity,
