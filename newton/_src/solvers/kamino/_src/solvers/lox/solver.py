@@ -519,6 +519,7 @@ class LOXSolver:
             adapter=adapter,
             max_iterations=config.max_iterations,
             use_graph_conditionals=config.use_graph_conditionals,
+            fixed_iterations=config.fixed_iterations,
             projection_iterations=config.projection_iterations,
             projection_method=config.projection_method,
             gauss_seidel_max_colors=config.gauss_seidel_max_colors,
@@ -566,6 +567,7 @@ class LOXSolver:
         adapter: LOXKaminoAdapter | None,
         max_iterations: int = 25,
         use_graph_conditionals: bool = True,
+        fixed_iterations: bool = False,
         projection_iterations: int = 3,
         projection_method: str = "jacobi",
         gauss_seidel_max_colors: int = 0,
@@ -609,6 +611,8 @@ class LOXSolver:
         _validate_fixed_iteration_count("projection_iterations", projection_iterations)
         if not isinstance(use_graph_conditionals, bool):
             raise ValueError("use_graph_conditionals must be a bool.")
+        if not isinstance(fixed_iterations, bool):
+            raise ValueError("fixed_iterations must be a bool.")
         if projection_method not in ("jacobi", "gauss_seidel", "apgd", "avbd"):
             raise ValueError("projection_method must be 'jacobi', 'gauss_seidel', 'apgd', or 'avbd'.")
         if (
@@ -699,6 +703,7 @@ class LOXSolver:
         self.has_rigid = adapter is not None
         self.max_iterations = max_iterations
         self.use_graph_conditionals = use_graph_conditionals
+        self.fixed_iterations = fixed_iterations
         self.projection_iterations = projection_iterations
         self.projection_method = projection_method
         self.gauss_seidel_max_colors = gauss_seidel_max_colors
@@ -790,6 +795,8 @@ class LOXSolver:
         )
         self._deformable_normal_cone_filtering_min_distance = float(deformable_normal_cone_filtering_min_distance)
         if deformable_model is not None and deformable_model.particle_count > 0:
+            if fixed_iterations:
+                raise ValueError("fixed_iterations is not supported for deformable LOX simulations.")
             self.deformable_system = DeformableFEMSystem(
                 deformable_model,
                 cr_iterations=deformable_cr_iterations,
@@ -1891,23 +1898,26 @@ class LOXSolver:
                 splitting.projected_twist,
                 splitting.world_active,
             )
-        adapter.evaluate_lagged_velocity_consistency(
-            self.velocity_tolerance,
-            splitting.global_twist,
-            splitting.projected_twist_previous,
-            splitting.world_active,
-        )
-        splitting.finish_iteration(
-            adapter.projection_status,
-            time_step,
-            self.position_tolerance,
-            self.rotation_tolerance,
-            self.velocity_tolerance,
-            structural_residual=adapter.world_structural_residual,
-            projected_structural_residual=adapter.world_projected_structural_residual,
-            lagged_velocity_residual=adapter.world_lagged_velocity_residual,
-            lagged_velocity_required=adapter.world_lagged_velocity_required,
-        )
+        if not self.fixed_iterations:
+            adapter.evaluate_lagged_velocity_consistency(
+                self.velocity_tolerance,
+                splitting.global_twist,
+                splitting.projected_twist_previous,
+                splitting.world_active,
+            )
+            splitting.finish_iteration(
+                adapter.projection_status,
+                time_step,
+                self.position_tolerance,
+                self.rotation_tolerance,
+                self.velocity_tolerance,
+                structural_residual=adapter.world_structural_residual,
+                projected_structural_residual=adapter.world_projected_structural_residual,
+                lagged_velocity_residual=adapter.world_lagged_velocity_residual,
+                lagged_velocity_required=adapter.world_lagged_velocity_required,
+            )
+        else:
+            splitting.finish_fixed_iteration(adapter.projection_status)
 
     def _finish_body_space_iteration_with_effort(
         self,
@@ -1960,24 +1970,27 @@ class LOXSolver:
             splitting.projected_twist,
             splitting.world_active,
         )
-        adapter.evaluate_lagged_velocity_consistency(
-            self.velocity_tolerance,
-            splitting.global_twist,
-            splitting.projected_twist_previous,
-            splitting.world_active,
-        )
-        splitting.finish_iteration_with_effort(
-            adapter.projection_status,
-            time_step,
-            self.position_tolerance,
-            self.rotation_tolerance,
-            self.velocity_tolerance,
-            adapter.world_effort_residual_max,
-            structural_residual=adapter.world_structural_residual,
-            projected_structural_residual=adapter.world_projected_structural_residual,
-            lagged_velocity_residual=adapter.world_lagged_velocity_residual,
-            lagged_velocity_required=adapter.world_lagged_velocity_required,
-        )
+        if not self.fixed_iterations:
+            adapter.evaluate_lagged_velocity_consistency(
+                self.velocity_tolerance,
+                splitting.global_twist,
+                splitting.projected_twist_previous,
+                splitting.world_active,
+            )
+            splitting.finish_iteration_with_effort(
+                adapter.projection_status,
+                time_step,
+                self.position_tolerance,
+                self.rotation_tolerance,
+                self.velocity_tolerance,
+                adapter.world_effort_residual_max,
+                structural_residual=adapter.world_structural_residual,
+                projected_structural_residual=adapter.world_projected_structural_residual,
+                lagged_velocity_residual=adapter.world_lagged_velocity_residual,
+                lagged_velocity_required=adapter.world_lagged_velocity_required,
+            )
+        else:
+            splitting.finish_fixed_iteration(adapter.projection_status)
 
     def _body_space_iteration(
         self,
@@ -2078,8 +2091,10 @@ class LOXSolver:
                 self.structural_joint_solver.factorize()
                 self.structural_joint_solver.warmstart(time_step, adapter.structural_multiplier)
 
-        use_conditional_loop = self.use_graph_conditionals and (
-            not self.device.is_cuda or not self.device.is_capturing or wp.is_conditional_graph_supported()
+        use_conditional_loop = (
+            not self.fixed_iterations
+            and self.use_graph_conditionals
+            and (not self.device.is_cuda or not self.device.is_capturing or wp.is_conditional_graph_supported())
         )
         if use_conditional_loop:
             self._iteration_condition.fill_(1)

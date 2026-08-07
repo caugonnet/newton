@@ -951,6 +951,14 @@ class LOXSolverConfig:
     :attr:`max_iterations` iterations instead.
     """
 
+    fixed_iterations: bool = False
+    """Whether to skip convergence checks and run exactly :attr:`max_iterations`.
+
+    This reduces per-iteration synchronization for throughput-oriented rigid
+    simulations. Failed projections still deactivate their worlds. Deformable
+    simulations do not currently support this mode.
+    """
+
     eliminate_fixed_world_islands: bool = True
     """Whether to eliminate fixed-joint tree islands attached to the world.
 
@@ -1190,6 +1198,8 @@ class LOXSolverConfig:
                 raise ValueError(f"Invalid {name}: {value}. Must be an integer greater than or equal to one.")
         if not isinstance(self.use_graph_conditionals, bool):
             raise ValueError(f"Invalid use_graph_conditionals: {self.use_graph_conditionals}. Must be a boolean.")
+        if not isinstance(self.fixed_iterations, bool):
+            raise ValueError(f"Invalid fixed_iterations: {self.fixed_iterations}. Must be a boolean.")
         if not isinstance(self.eliminate_fixed_world_islands, bool):
             raise ValueError(
                 f"Invalid eliminate_fixed_world_islands: {self.eliminate_fixed_world_islands}. Must be a boolean."

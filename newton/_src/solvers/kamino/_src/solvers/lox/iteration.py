@@ -249,6 +249,48 @@ def _finish_iteration(
 
 
 @wp.kernel
+def _begin_fixed_iteration(
+    projection_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    iteration_count: wp.array[wp.int32],
+):
+    world = wp.tid()
+    if not world_active[world]:
+        return
+    iteration_count[world] += 1
+    if projection_status[world] != PROJECTION_STATUS_VALID:
+        world_active[world] = False
+        world_failed[world] = True
+
+
+@wp.kernel
+def _finish_fixed_iteration(
+    body_world: wp.array[wp.int32],
+    global_twist: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    splitting_dual: wp.array[vec6f],
+):
+    body = wp.tid()
+    world = body_world[body]
+    if not world_active[world]:
+        return
+    current = global_twist[body]
+    projected = projected_twist[body]
+    dual = splitting_dual[body]
+    finite = wp.bool(True)
+    for axis in range(6):
+        finite = finite and wp.isfinite(current[axis]) and wp.isfinite(projected[axis]) and wp.isfinite(dual[axis])
+    if finite:
+        splitting_dual[body] = dual + projected - current
+    else:
+        world_active[world] = False
+        world_failed[world] = True
+
+
+@wp.kernel
 def _finalize_finish_iteration(
     structural_residual: wp.array[wp.float32],
     projected_structural_residual: wp.array[wp.float32],
@@ -656,6 +698,25 @@ class SplittingState:
                 self.residual_lagged_velocity,
                 self.residual_total,
             ],
+            device=self.device,
+        )
+
+    def finish_fixed_iteration(self, projection_status: wp.array[wp.int32]) -> None:
+        """Update the dual state and failures for a fixed-count iteration."""
+        if projection_status.shape[0] != self.num_worlds:
+            raise ValueError("projection_status must contain one entry per world.")
+        wp.launch(
+            _begin_fixed_iteration,
+            dim=self.num_worlds,
+            inputs=[projection_status],
+            outputs=[self.world_active, self.world_failed, self.iteration_count],
+            device=self.device,
+        )
+        wp.launch(
+            _finish_fixed_iteration,
+            dim=self.num_bodies,
+            inputs=[self.body_world, self.global_twist, self.projected_twist],
+            outputs=[self.world_active, self.world_failed, self.splitting_dual],
             device=self.device,
         )
 

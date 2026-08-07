@@ -117,6 +117,31 @@ class TestLOXSolver(unittest.TestCase):
 
         capture_while.assert_not_called()
 
+    def test_eager_solve_can_run_fixed_iterations(self):
+        """Run the requested rigid iteration count without convergence checks."""
+        model = build_box_on_plane(ground=False).finalize(device=self.device)
+        data = model.data()
+        update_body_inertias(model.bodies, data.bodies)
+        compute_joints_data(model, data, q_j_p=wp.zeros_like(data.joints.q_j))
+        jacobians = DenseSystemJacobians(model=model)
+        jacobians.build(model=model, data=data)
+        adapter = LOXKaminoAdapter(model, data, jacobians)
+        solver = LOXSolver(
+            adapter,
+            max_iterations=3,
+            fixed_iterations=True,
+            inertial_warmstart_fraction=1.0,
+        )
+
+        self.begin_time_step(solver, model, 0.01, reset_dual=True)
+        with patch.object(wp, "capture_while", wraps=wp.capture_while) as capture_while:
+            solver.solve(LOXProblem())
+
+        capture_while.assert_not_called()
+        np.testing.assert_array_equal(solver.iteration_count.numpy(), [solver.max_iterations])
+        np.testing.assert_array_equal(solver.world_converged.numpy(), [False])
+        np.testing.assert_array_equal(solver.world_iteration_limit.numpy(), [True])
+
     def test_initialize_rigid_inertial_warmstart_fraction(self):
         """Pre-apply a fraction of State wrench and gravity to the rigid initial guess."""
         model = build_box_on_plane(ground=False).finalize(device=self.device)
@@ -614,6 +639,8 @@ class TestLOXSolver(unittest.TestCase):
         for color_count in (-1, 1.0, True):
             with self.assertRaisesRegex(ValueError, "gauss_seidel_max_colors"):
                 LOXSolver(adapter, gauss_seidel_max_colors=color_count)
+        with self.assertRaisesRegex(ValueError, "fixed_iterations"):
+            LOXSolver(adapter, fixed_iterations=1)
         self.assertEqual(LOXSolver(adapter, projection_method="gauss_seidel").projection_method, "gauss_seidel")
         self.assertEqual(LOXSolver(adapter, projection_method="apgd").projection_method, "apgd")
         self.assertEqual(LOXSolver(adapter, projection_method="avbd").projection_method, "avbd")
