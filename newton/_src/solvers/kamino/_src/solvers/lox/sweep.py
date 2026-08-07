@@ -41,6 +41,9 @@ __all__ = [
 
 wp.set_module_options({"enable_backward": False})
 
+_JACOBI_CONTACT_BLOCK_DIM = 128
+_JACOBI_CONTACT_PROJECTION_BLOCKS_PER_SM = 5
+
 
 @wp.kernel
 def _prepare_contact_projection_data(
@@ -98,6 +101,29 @@ def _is_finite_twist(value: vec6f) -> wp.bool:
     for index in range(6):
         result = result and wp.isfinite(value[index])
     return result
+
+
+@wp.func
+def _is_zero_vec3(value: wp.vec3f) -> wp.bool:
+    return value[0] == 0.0 and value[1] == 0.0 and value[2] == 0.0
+
+
+@wp.func
+def _compute_contact_velocity(
+    contact: wp.int32,
+    first: wp.int32,
+    second: wp.int32,
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_bias: wp.array[wp.vec3f],
+    projected_twist: wp.array[vec6f],
+) -> wp.vec3f:
+    velocity = contact_bias[contact]
+    if first >= 0:
+        velocity += contact_jacobian_first[contact] @ projected_twist[first]
+    if second >= 0:
+        velocity += contact_jacobian_second[contact] @ projected_twist[second]
+    return velocity
 
 
 @wp.kernel
@@ -270,16 +296,17 @@ def _warmstart_contacts_jacobi(
     first = contact_body_first[contact]
     second = contact_body_second[contact]
     impulse = reaction[contact]
-    if first >= 0:
-        wrench = wp.transpose(contact_jacobian_first[contact]) @ impulse
-        if apply_inverse_weight:
-            wrench = inverse_weight[first] @ wrench
-        _atomic_add_twist(twist_delta, first, wrench)
-    if second >= 0:
-        wrench = wp.transpose(contact_jacobian_second[contact]) @ impulse
-        if apply_inverse_weight:
-            wrench = inverse_weight[second] @ wrench
-        _atomic_add_twist(twist_delta, second, wrench)
+    if not _is_zero_vec3(impulse):
+        if first >= 0:
+            wrench = wp.transpose(contact_jacobian_first[contact]) @ impulse
+            if apply_inverse_weight:
+                wrench = inverse_weight[first] @ wrench
+            _atomic_add_twist(twist_delta, first, wrench)
+        if second >= 0:
+            wrench = wp.transpose(contact_jacobian_second[contact]) @ impulse
+            if apply_inverse_weight:
+                wrench = inverse_weight[second] @ wrench
+            _atomic_add_twist(twist_delta, second, wrench)
 
 
 @wp.kernel
@@ -393,22 +420,18 @@ def _project_contacts_jacobi(
     if first < 0 and second < 0:
         reaction[contact] = wp.vec3f(0.0)
         return
-    twist_first = vec6f(0.0)
-    twist_second = vec6f(0.0)
-    inverse_weight_first = mat66f(0.0)
-    inverse_weight_second = mat66f(0.0)
-    if first >= 0:
-        twist_first = projected_twist[first]
-        inverse_weight_first = inverse_weight[first]
-    if second >= 0:
-        twist_second = projected_twist[second]
-        inverse_weight_second = inverse_weight[second]
     reaction_old = reaction[contact]
-    current_velocity = (
-        contact_jacobian_first[contact] @ twist_first
-        + contact_jacobian_second[contact] @ twist_second
-        + contact_bias[contact]
+    current_velocity = _compute_contact_velocity(
+        contact,
+        first,
+        second,
+        contact_jacobian_first,
+        contact_jacobian_second,
+        contact_bias,
+        projected_twist,
     )
+    if _is_zero_vec3(reaction_old) and current_velocity[2] >= 0.0:
+        return
     contact_block = contact_delassus[contact]
     free_velocity = current_velocity - contact_block @ reaction_old
     reaction_new = _solve_contact_coulomb_newton_normal_last(
@@ -428,19 +451,24 @@ def _project_contacts_jacobi(
         world_status[world] = PROJECTION_STATUS_INVALID
         return
 
-    correction_first = vec6f(0.0)
-    correction_second = vec6f(0.0)
-    if first >= 0:
-        correction_first = inverse_weight_first @ (wp.transpose(contact_jacobian_first[contact]) @ reaction_delta)
-    if second >= 0:
-        correction_second = inverse_weight_second @ (wp.transpose(contact_jacobian_second[contact]) @ reaction_delta)
-    if not _is_finite_twist(correction_first) or not _is_finite_twist(correction_second):
-        world_status[world] = PROJECTION_STATUS_INVALID
-        return
+    if _is_zero_vec3(reaction_delta):
+        reaction[contact] = reaction_new
+    else:
+        correction_first = vec6f(0.0)
+        correction_second = vec6f(0.0)
+        if first >= 0:
+            correction_first = inverse_weight[first] @ (wp.transpose(contact_jacobian_first[contact]) @ reaction_delta)
+        if second >= 0:
+            correction_second = inverse_weight[second] @ (
+                wp.transpose(contact_jacobian_second[contact]) @ reaction_delta
+            )
+        if not _is_finite_twist(correction_first) or not _is_finite_twist(correction_second):
+            world_status[world] = PROJECTION_STATUS_INVALID
+            return
 
-    reaction[contact] = reaction_new
-    _atomic_add_twist(twist_delta, first, correction_first)
-    _atomic_add_twist(twist_delta, second, correction_second)
+        reaction[contact] = reaction_new
+        _atomic_add_twist(twist_delta, first, correction_first)
+        _atomic_add_twist(twist_delta, second, correction_second)
 
 
 @wp.kernel
@@ -480,21 +508,15 @@ def _project_contacts_jacobi_instrumented(
     if first < 0 and second < 0:
         reaction[contact] = wp.vec3f(0.0)
         return
-    twist_first = vec6f(0.0)
-    twist_second = vec6f(0.0)
-    inverse_weight_first = mat66f(0.0)
-    inverse_weight_second = mat66f(0.0)
-    if first >= 0:
-        twist_first = projected_twist[first]
-        inverse_weight_first = inverse_weight[first]
-    if second >= 0:
-        twist_second = projected_twist[second]
-        inverse_weight_second = inverse_weight[second]
     reaction_old = reaction[contact]
-    current_velocity = (
-        contact_jacobian_first[contact] @ twist_first
-        + contact_jacobian_second[contact] @ twist_second
-        + contact_bias[contact]
+    current_velocity = _compute_contact_velocity(
+        contact,
+        first,
+        second,
+        contact_jacobian_first,
+        contact_jacobian_second,
+        contact_bias,
+        projected_twist,
     )
     contact_block = contact_delassus[contact]
     free_velocity = current_velocity - contact_block @ reaction_old
@@ -527,9 +549,9 @@ def _project_contacts_jacobi_instrumented(
     correction_first = vec6f(0.0)
     correction_second = vec6f(0.0)
     if first >= 0:
-        correction_first = inverse_weight_first @ (wp.transpose(contact_jacobian_first[contact]) @ reaction_delta)
+        correction_first = inverse_weight[first] @ (wp.transpose(contact_jacobian_first[contact]) @ reaction_delta)
     if second >= 0:
-        correction_second = inverse_weight_second @ (wp.transpose(contact_jacobian_second[contact]) @ reaction_delta)
+        correction_second = inverse_weight[second] @ (wp.transpose(contact_jacobian_second[contact]) @ reaction_delta)
     if not _is_finite_twist(correction_first) or not _is_finite_twist(correction_second):
         world_status[world] = PROJECTION_STATUS_INVALID
         return
@@ -1986,6 +2008,10 @@ def project_constraints_jacobi(
     if not isinstance(warm_start, bool):
         raise ValueError("warm_start must be a boolean.")
 
+    contact_projection_max_blocks = 0
+    if projected_twist.device.is_cuda:
+        contact_projection_max_blocks = projected_twist.device.sm_count * _JACOBI_CONTACT_PROJECTION_BLOCKS_PER_SM
+
     if warm_start:
         wp.launch(
             _initialize_jacobi_projection_status,
@@ -2129,6 +2155,8 @@ def project_constraints_jacobi(
                     inputs=contact_inputs,
                     outputs=[contact_reaction, twist_delta, world_status],
                     device=projected_twist.device,
+                    max_blocks=contact_projection_max_blocks,
+                    block_dim=_JACOBI_CONTACT_BLOCK_DIM,
                 )
             else:
                 wp.launch(
@@ -2145,6 +2173,8 @@ def project_constraints_jacobi(
                         coulomb_statistics.failure_counts,
                     ],
                     device=projected_twist.device,
+                    max_blocks=contact_projection_max_blocks,
+                    block_dim=_JACOBI_CONTACT_BLOCK_DIM,
                 )
         if limit_world.shape[0] > 0:
             wp.launch(
