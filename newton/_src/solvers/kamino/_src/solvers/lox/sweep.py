@@ -18,6 +18,7 @@ from .contact import (
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
+    _can_fuse_rigid_projection_by_world,
     compute_contact_delassus,
     compute_limit_delassus,
     convert_contact_matrix_normal_last_to_first,
@@ -2295,17 +2296,18 @@ def project_constraints_jacobi(
     if projected_twist.device.is_cuda:
         contact_projection_max_blocks = projected_twist.device.sm_count * _JACOBI_CONTACT_PROJECTION_BLOCKS_PER_SM
 
-    world_projection_min_count = projected_twist.device.sm_count * 4 if projected_twist.device.is_cuda else 0
-    use_world_projection = (
-        projected_twist.device.is_cuda
-        and world_count >= world_projection_min_count
-        and deformable_contacts is None
-        and coulomb_statistics is None
-        and world_body_offset is not None
-        and world_body_count is not None
-        and world_friction_offset is not None
-        and world_contact_offset is not None
-        and world_limit_offset is not None
+    use_world_projection = _can_fuse_rigid_projection_by_world(
+        projected_twist.device,
+        world_count,
+        has_deformable_contacts=deformable_contacts is not None,
+        has_coulomb_statistics=coulomb_statistics is not None,
+        required_world_arrays=(
+            world_body_offset,
+            world_body_count,
+            world_friction_offset,
+            world_contact_offset,
+            world_limit_offset,
+        ),
     )
 
     if warm_start:

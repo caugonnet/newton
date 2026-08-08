@@ -13,6 +13,7 @@ from .deformable_contact import DEFORMABLE_CONTACT_STATUS_VALID, _scatter_contac
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
+    _can_fuse_rigid_projection_by_world,
     apply_contact_desaxce_correction,
     project_contact_coulomb_cone_orthogonal,
 )
@@ -23,6 +24,35 @@ __all__ = [
 ]
 
 wp.set_module_options({"enable_backward": False})
+
+_APGD_WORLD_BLOCK_DIM = 128
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+__syncthreads();
+#endif
+""")
+def _sync_threads(): ...
+
+
+@wp.func
+def _world_rigid_constraint(
+    world: int,
+    local: int,
+    friction_capacity: int,
+    contact_capacity: int,
+    friction_count: int,
+    contact_count: int,
+    world_friction_offset: wp.array[wp.int32],
+    world_contact_offset: wp.array[wp.int32],
+    world_limit_offset: wp.array[wp.int32],
+) -> int:
+    if local < friction_count:
+        return world_friction_offset[world] + local
+    if local < friction_count + contact_count:
+        return friction_capacity + world_contact_offset[world] + local - friction_count
+    return friction_capacity + contact_capacity + world_limit_offset[world] + local - friction_count - contact_count
 
 
 @wp.func
@@ -105,8 +135,9 @@ def _initialize_mixed_state(
         body_baseline[index] = projected_twist[index]
 
 
-@wp.kernel
-def _initialize_rigid_trials(
+@wp.func
+def _initialize_rigid_trial(
+    constraint: int,
     friction_capacity: int,
     contact_capacity: int,
     friction_world: wp.array[wp.int32],
@@ -130,7 +161,6 @@ def _initialize_rigid_trials(
     limit_reaction: wp.array[wp.float32],
     limit_trial: wp.array[wp.float32],
 ):
-    constraint = wp.tid()
     if constraint < friction_capacity:
         world = friction_world[constraint]
         if friction_local[constraint] >= world_friction_count[world] or not world_active[world]:
@@ -166,6 +196,58 @@ def _initialize_rigid_trials(
     limit_value = wp.max(0.0, limit_reaction[constraint])
     limit_reaction[constraint] = limit_value
     limit_trial[constraint] = limit_value
+
+
+@wp.kernel
+def _initialize_rigid_trials(
+    friction_capacity: int,
+    contact_capacity: int,
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_bound: wp.array[wp.float32],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_friction: wp.array[wp.float32],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    friction_reaction: wp.array[wp.float32],
+    friction_trial: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_trial: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_trial: wp.array[wp.float32],
+):
+    _initialize_rigid_trial(
+        wp.tid(),
+        friction_capacity,
+        contact_capacity,
+        friction_world,
+        friction_local,
+        world_friction_count,
+        friction_bound,
+        contact_world,
+        contact_local,
+        world_contact_count,
+        contact_body_first,
+        contact_body_second,
+        contact_friction,
+        limit_world,
+        limit_local,
+        world_limit_count,
+        world_active,
+        friction_reaction,
+        friction_trial,
+        contact_reaction,
+        contact_trial,
+        limit_reaction,
+        limit_trial,
+    )
 
 
 @wp.func
@@ -510,8 +592,9 @@ def _reconstruct_mixed_state(
         twist_delta[index] = vec6f(0.0)
 
 
-@wp.kernel
-def _project_rigid_steps_fused(
+@wp.func
+def _project_rigid_step(
+    constraint: int,
     friction_capacity: int,
     contact_capacity: int,
     friction_world: wp.array[wp.int32],
@@ -559,7 +642,6 @@ def _project_rigid_steps_fused(
     restart_dot: wp.array[wp.float32],
     projection_status: wp.array[wp.int32],
 ):
-    constraint = wp.tid()
     if constraint < friction_capacity:
         world = friction_world[constraint]
         if (
@@ -671,14 +753,114 @@ def _project_rigid_steps_fused(
 
 
 @wp.kernel
-def _finalize_acceleration(
+def _project_rigid_steps_fused(
+    friction_capacity: int,
+    contact_capacity: int,
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    friction_bound: wp.array[wp.float32],
+    friction_preconditioner: wp.array[wp.float32],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_bias: wp.array[wp.vec3f],
+    contact_friction: wp.array[wp.float32],
+    contact_delassus: wp.array[wp.mat33f],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    limit_bias: wp.array[wp.float32],
+    limit_preconditioner: wp.array[wp.float32],
+    world_active: wp.array[wp.bool],
+    projected_twist: wp.array[vec6f],
+    friction_reaction: wp.array[wp.float32],
+    friction_trial: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_trial: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_trial: wp.array[wp.float32],
+    friction_next: wp.array[wp.float32],
+    friction_velocity: wp.array[wp.float32],
+    contact_next: wp.array[wp.vec3f],
+    contact_velocity: wp.array[wp.vec3f],
+    limit_next: wp.array[wp.float32],
+    limit_velocity: wp.array[wp.float32],
+    restart_dot: wp.array[wp.float32],
+    projection_status: wp.array[wp.int32],
+):
+    _project_rigid_step(
+        wp.tid(),
+        friction_capacity,
+        contact_capacity,
+        friction_world,
+        friction_local,
+        world_friction_count,
+        friction_body_first,
+        friction_body_second,
+        friction_jacobian_first,
+        friction_jacobian_second,
+        friction_bound,
+        friction_preconditioner,
+        contact_world,
+        contact_local,
+        world_contact_count,
+        contact_body_first,
+        contact_body_second,
+        contact_jacobian_first,
+        contact_jacobian_second,
+        contact_bias,
+        contact_friction,
+        contact_delassus,
+        limit_world,
+        limit_local,
+        world_limit_count,
+        limit_body_first,
+        limit_body_second,
+        limit_jacobian_first,
+        limit_jacobian_second,
+        limit_bias,
+        limit_preconditioner,
+        world_active,
+        projected_twist,
+        friction_reaction,
+        friction_trial,
+        contact_reaction,
+        contact_trial,
+        limit_reaction,
+        limit_trial,
+        friction_next,
+        friction_velocity,
+        contact_next,
+        contact_velocity,
+        limit_next,
+        limit_velocity,
+        restart_dot,
+        projection_status,
+    )
+
+
+@wp.func
+def _finalize_acceleration_world(
+    world: int,
     world_active: wp.array[wp.bool],
     projection_status: wp.array[wp.int32],
     restart_dot: wp.array[wp.float32],
     theta: wp.array[wp.float32],
     beta: wp.array[wp.float32],
 ):
-    world = wp.tid()
     if not world_active[world]:
         return
     value = restart_dot[world]
@@ -700,7 +882,19 @@ def _finalize_acceleration(
 
 
 @wp.kernel
-def _extrapolate_rigid_reactions_fused(
+def _finalize_acceleration(
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    restart_dot: wp.array[wp.float32],
+    theta: wp.array[wp.float32],
+    beta: wp.array[wp.float32],
+):
+    _finalize_acceleration_world(wp.tid(), world_active, projection_status, restart_dot, theta, beta)
+
+
+@wp.func
+def _extrapolate_rigid_reaction(
+    constraint: int,
     friction_capacity: int,
     contact_capacity: int,
     friction_world: wp.array[wp.int32],
@@ -725,7 +919,6 @@ def _extrapolate_rigid_reactions_fused(
     limit_reaction: wp.array[wp.float32],
     limit_trial: wp.array[wp.float32],
 ):
-    constraint = wp.tid()
     if constraint < friction_capacity:
         world = friction_world[constraint]
         if (
@@ -767,6 +960,419 @@ def _extrapolate_rigid_reactions_fused(
     limit_value = limit_next[constraint]
     limit_reaction[constraint] = limit_value
     limit_trial[constraint] = limit_value + beta[world] * (limit_value - limit_old)
+
+
+@wp.kernel
+def _extrapolate_rigid_reactions_fused(
+    friction_capacity: int,
+    contact_capacity: int,
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    beta: wp.array[wp.float32],
+    friction_next: wp.array[wp.float32],
+    contact_next: wp.array[wp.vec3f],
+    limit_next: wp.array[wp.float32],
+    friction_reaction: wp.array[wp.float32],
+    friction_trial: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_trial: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_trial: wp.array[wp.float32],
+):
+    _extrapolate_rigid_reaction(
+        wp.tid(),
+        friction_capacity,
+        contact_capacity,
+        friction_world,
+        friction_local,
+        world_friction_count,
+        contact_world,
+        contact_local,
+        world_contact_count,
+        limit_world,
+        limit_local,
+        world_limit_count,
+        world_active,
+        projection_status,
+        beta,
+        friction_next,
+        contact_next,
+        limit_next,
+        friction_reaction,
+        friction_trial,
+        contact_reaction,
+        contact_trial,
+        limit_reaction,
+        limit_trial,
+    )
+
+
+@wp.kernel
+def _project_rigid_constraints_apgd_by_world(
+    projection_iterations: int,
+    friction_capacity: int,
+    contact_capacity: int,
+    world_active: wp.array[wp.bool],
+    prepared_status: wp.array[wp.int32],
+    world_body_offset: wp.array[wp.int32],
+    world_body_count: wp.array[wp.int32],
+    world_friction_offset: wp.array[wp.int32],
+    world_friction_count: wp.array[wp.int32],
+    friction_world: wp.array[wp.int32],
+    friction_local: wp.array[wp.int32],
+    friction_body_first: wp.array[wp.int32],
+    friction_body_second: wp.array[wp.int32],
+    friction_jacobian_first: wp.array[vec6f],
+    friction_jacobian_second: wp.array[vec6f],
+    friction_bound: wp.array[wp.float32],
+    friction_preconditioner: wp.array[wp.float32],
+    world_contact_offset: wp.array[wp.int32],
+    world_contact_count: wp.array[wp.int32],
+    contact_world: wp.array[wp.int32],
+    contact_local: wp.array[wp.int32],
+    contact_body_first: wp.array[wp.int32],
+    contact_body_second: wp.array[wp.int32],
+    contact_jacobian_first: wp.array[mat36f],
+    contact_jacobian_second: wp.array[mat36f],
+    contact_bias: wp.array[wp.vec3f],
+    contact_friction: wp.array[wp.float32],
+    contact_delassus: wp.array[wp.mat33f],
+    world_limit_offset: wp.array[wp.int32],
+    world_limit_count: wp.array[wp.int32],
+    limit_world: wp.array[wp.int32],
+    limit_local: wp.array[wp.int32],
+    limit_body_first: wp.array[wp.int32],
+    limit_body_second: wp.array[wp.int32],
+    limit_jacobian_first: wp.array[vec6f],
+    limit_jacobian_second: wp.array[vec6f],
+    limit_bias: wp.array[wp.float32],
+    limit_preconditioner: wp.array[wp.float32],
+    inverse_weight: wp.array[mat66f],
+    body_baseline: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+    twist_delta: wp.array[vec6f],
+    theta: wp.array[wp.float32],
+    beta: wp.array[wp.float32],
+    restart_dot: wp.array[wp.float32],
+    projection_status: wp.array[wp.int32],
+    friction_reaction: wp.array[wp.float32],
+    friction_trial: wp.array[wp.float32],
+    friction_next: wp.array[wp.float32],
+    friction_velocity: wp.array[wp.float32],
+    contact_reaction: wp.array[wp.vec3f],
+    contact_trial: wp.array[wp.vec3f],
+    contact_next: wp.array[wp.vec3f],
+    contact_velocity: wp.array[wp.vec3f],
+    limit_reaction: wp.array[wp.float32],
+    limit_trial: wp.array[wp.float32],
+    limit_next: wp.array[wp.float32],
+    limit_velocity: wp.array[wp.float32],
+):
+    world, lane = wp.tid()
+    thread_count = wp.block_dim()
+
+    local = lane
+    while local < world_body_count[world]:
+        body = world_body_offset[world] + local
+        body_baseline[body] = projected_twist[body]
+        twist_delta[body] = vec6f(0.0)
+        local += thread_count
+
+    active = world_active[world]
+    if lane == 0 and active:
+        theta[world] = 1.0
+        beta[world] = 0.0
+        restart_dot[world] = 0.0
+        projection_status[world] = prepared_status[world]
+
+    friction_count = world_friction_count[world]
+    contact_count = world_contact_count[world]
+    limit_count = world_limit_count[world]
+    constraint_count = friction_count + contact_count + limit_count
+    local = lane
+    while local < constraint_count:
+        constraint = _world_rigid_constraint(
+            world,
+            local,
+            friction_capacity,
+            contact_capacity,
+            friction_count,
+            contact_count,
+            world_friction_offset,
+            world_contact_offset,
+            world_limit_offset,
+        )
+        _initialize_rigid_trial(
+            constraint,
+            friction_capacity,
+            contact_capacity,
+            friction_world,
+            friction_local,
+            world_friction_count,
+            friction_bound,
+            contact_world,
+            contact_local,
+            world_contact_count,
+            contact_body_first,
+            contact_body_second,
+            contact_friction,
+            limit_world,
+            limit_local,
+            world_limit_count,
+            world_active,
+            friction_reaction,
+            friction_trial,
+            contact_reaction,
+            contact_trial,
+            limit_reaction,
+            limit_trial,
+        )
+        local += thread_count
+    _sync_threads()
+
+    if not active or projection_status[world] != PROJECTION_STATUS_VALID:
+        return
+
+    for _iteration in range(projection_iterations):
+        local = lane
+        while local < constraint_count:
+            constraint = _world_rigid_constraint(
+                world,
+                local,
+                friction_capacity,
+                contact_capacity,
+                friction_count,
+                contact_count,
+                world_friction_offset,
+                world_contact_offset,
+                world_limit_offset,
+            )
+            _scatter_rigid_reaction(
+                constraint,
+                friction_capacity,
+                contact_capacity,
+                friction_world,
+                friction_local,
+                world_friction_count,
+                friction_body_first,
+                friction_body_second,
+                friction_jacobian_first,
+                friction_jacobian_second,
+                contact_world,
+                contact_local,
+                world_contact_count,
+                contact_body_first,
+                contact_body_second,
+                contact_jacobian_first,
+                contact_jacobian_second,
+                limit_world,
+                limit_local,
+                world_limit_count,
+                limit_body_first,
+                limit_body_second,
+                limit_jacobian_first,
+                limit_jacobian_second,
+                world_active,
+                projection_status,
+                inverse_weight,
+                friction_trial,
+                contact_trial,
+                limit_trial,
+                twist_delta,
+            )
+            local += thread_count
+        _sync_threads()
+
+        local = lane
+        while local < world_body_count[world]:
+            body = world_body_offset[world] + local
+            projected_twist[body] = body_baseline[body] + twist_delta[body]
+            twist_delta[body] = vec6f(0.0)
+            local += thread_count
+        _sync_threads()
+
+        local = lane
+        while local < constraint_count:
+            constraint = _world_rigid_constraint(
+                world,
+                local,
+                friction_capacity,
+                contact_capacity,
+                friction_count,
+                contact_count,
+                world_friction_offset,
+                world_contact_offset,
+                world_limit_offset,
+            )
+            _project_rigid_step(
+                constraint,
+                friction_capacity,
+                contact_capacity,
+                friction_world,
+                friction_local,
+                world_friction_count,
+                friction_body_first,
+                friction_body_second,
+                friction_jacobian_first,
+                friction_jacobian_second,
+                friction_bound,
+                friction_preconditioner,
+                contact_world,
+                contact_local,
+                world_contact_count,
+                contact_body_first,
+                contact_body_second,
+                contact_jacobian_first,
+                contact_jacobian_second,
+                contact_bias,
+                contact_friction,
+                contact_delassus,
+                limit_world,
+                limit_local,
+                world_limit_count,
+                limit_body_first,
+                limit_body_second,
+                limit_jacobian_first,
+                limit_jacobian_second,
+                limit_bias,
+                limit_preconditioner,
+                world_active,
+                projected_twist,
+                friction_reaction,
+                friction_trial,
+                contact_reaction,
+                contact_trial,
+                limit_reaction,
+                limit_trial,
+                friction_next,
+                friction_velocity,
+                contact_next,
+                contact_velocity,
+                limit_next,
+                limit_velocity,
+                restart_dot,
+                projection_status,
+            )
+            local += thread_count
+        _sync_threads()
+
+        if lane == 0:
+            _finalize_acceleration_world(
+                world,
+                world_active,
+                projection_status,
+                restart_dot,
+                theta,
+                beta,
+            )
+        _sync_threads()
+
+        local = lane
+        while local < constraint_count:
+            constraint = _world_rigid_constraint(
+                world,
+                local,
+                friction_capacity,
+                contact_capacity,
+                friction_count,
+                contact_count,
+                world_friction_offset,
+                world_contact_offset,
+                world_limit_offset,
+            )
+            _extrapolate_rigid_reaction(
+                constraint,
+                friction_capacity,
+                contact_capacity,
+                friction_world,
+                friction_local,
+                world_friction_count,
+                contact_world,
+                contact_local,
+                world_contact_count,
+                limit_world,
+                limit_local,
+                world_limit_count,
+                world_active,
+                projection_status,
+                beta,
+                friction_next,
+                contact_next,
+                limit_next,
+                friction_reaction,
+                friction_trial,
+                contact_reaction,
+                contact_trial,
+                limit_reaction,
+                limit_trial,
+            )
+            local += thread_count
+        _sync_threads()
+
+    local = lane
+    while local < constraint_count:
+        constraint = _world_rigid_constraint(
+            world,
+            local,
+            friction_capacity,
+            contact_capacity,
+            friction_count,
+            contact_count,
+            world_friction_offset,
+            world_contact_offset,
+            world_limit_offset,
+        )
+        _scatter_rigid_reaction(
+            constraint,
+            friction_capacity,
+            contact_capacity,
+            friction_world,
+            friction_local,
+            world_friction_count,
+            friction_body_first,
+            friction_body_second,
+            friction_jacobian_first,
+            friction_jacobian_second,
+            contact_world,
+            contact_local,
+            world_contact_count,
+            contact_body_first,
+            contact_body_second,
+            contact_jacobian_first,
+            contact_jacobian_second,
+            limit_world,
+            limit_local,
+            world_limit_count,
+            limit_body_first,
+            limit_body_second,
+            limit_jacobian_first,
+            limit_jacobian_second,
+            world_active,
+            projection_status,
+            inverse_weight,
+            friction_reaction,
+            contact_reaction,
+            limit_reaction,
+            twist_delta,
+        )
+        local += thread_count
+    _sync_threads()
+
+    local = lane
+    while local < world_body_count[world]:
+        body = world_body_offset[world] + local
+        projected_twist[body] = body_baseline[body] + twist_delta[body]
+        twist_delta[body] = vec6f(0.0)
+        local += thread_count
 
 
 @wp.kernel
@@ -1043,6 +1649,11 @@ def project_constraints_apgd(
     deformable_contacts=None,
     particle_baseline: wp.array[wp.vec3] | None = None,
     projected_velocity: wp.array[wp.vec3] | None = None,
+    world_body_offset: wp.array[wp.int32] | None = None,
+    world_body_count: wp.array[wp.int32] | None = None,
+    world_friction_offset: wp.array[wp.int32] | None = None,
+    world_contact_offset: wp.array[wp.int32] | None = None,
+    world_limit_offset: wp.array[wp.int32] | None = None,
 ) -> None:
     """Run fixed-count matrix-free APGD and return its final feasible iterate."""
     if (deformable_contacts is None) != (projected_velocity is None):
@@ -1051,6 +1662,91 @@ def project_constraints_apgd(
         raise ValueError("APGD deformable projection requires a particle baseline.")
     body_count = projected_twist.shape[0]
     world_count = world_active.shape[0]
+    rigid_capacity = adapter.friction_capacity + adapter.contact_capacity + adapter.limit_capacity
+    use_world_projection = _can_fuse_rigid_projection_by_world(
+        projected_twist.device,
+        world_count,
+        has_deformable_contacts=deformable_contacts is not None,
+        has_coulomb_statistics=False,
+        required_world_arrays=(
+            world_body_offset,
+            world_body_count,
+            world_friction_offset,
+            world_contact_offset,
+            world_limit_offset,
+        ),
+    )
+    if use_world_projection:
+        wp.launch(
+            _project_rigid_constraints_apgd_by_world,
+            dim=(world_count, _APGD_WORLD_BLOCK_DIM),
+            block_dim=_APGD_WORLD_BLOCK_DIM,
+            inputs=[
+                projection_iterations,
+                adapter.friction_capacity,
+                adapter.contact_capacity,
+                world_active,
+                adapter.world_jacobi_projection_status,
+                world_body_offset,
+                world_body_count,
+                world_friction_offset,
+                adapter.world_friction_count,
+                adapter.friction_world,
+                adapter.friction_local,
+                adapter.friction_body_first,
+                adapter.friction_body_second,
+                adapter.friction_jacobian_first,
+                adapter.friction_jacobian_second,
+                adapter.friction_impulse_bound,
+                adapter.friction_projection_delassus,
+                world_contact_offset,
+                adapter.world_contact_count,
+                adapter.contact_world,
+                adapter.contact_local,
+                adapter.contact_body_first,
+                adapter.contact_body_second,
+                adapter.contact_jacobian_first,
+                adapter.contact_jacobian_second,
+                adapter.contact_bias,
+                adapter.contact_friction,
+                adapter.contact_projection_delassus,
+                world_limit_offset,
+                adapter.world_limit_count,
+                adapter.limit_world,
+                adapter.limit_local,
+                adapter.limit_body_first,
+                adapter.limit_body_second,
+                adapter.limit_jacobian_first,
+                adapter.limit_jacobian_second,
+                adapter.limit_bias,
+                adapter.limit_projection_delassus,
+                inverse_weight,
+            ],
+            outputs=[
+                body_baseline,
+                projected_twist,
+                adapter.projection_twist_delta,
+                theta,
+                beta,
+                restart_dot,
+                adapter.projection_status,
+                adapter.friction_reaction,
+                adapter.friction_apgd_trial,
+                adapter.friction_apgd_next,
+                adapter.friction_velocity,
+                adapter.contact_reaction,
+                adapter.contact_apgd_trial,
+                adapter.contact_apgd_next,
+                adapter.contact_velocity,
+                adapter.limit_reaction,
+                adapter.limit_apgd_trial,
+                adapter.limit_apgd_next,
+                adapter.limit_velocity,
+            ],
+            device=adapter.device,
+        )
+        return
+
     if deformable_contacts is None:
         wp.copy(body_baseline, projected_twist)
         adapter.projection_twist_delta.zero_()
@@ -1087,7 +1783,6 @@ def project_constraints_apgd(
             ],
             device=adapter.device,
         )
-    rigid_capacity = adapter.friction_capacity + adapter.contact_capacity + adapter.limit_capacity
     if rigid_capacity > 0:
         wp.launch(
             _initialize_rigid_trials,

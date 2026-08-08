@@ -10,6 +10,8 @@ Kamino's linear-first 6D convention.
 
 from __future__ import annotations
 
+from typing import Any
+
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
@@ -46,6 +48,26 @@ PROJECTION_STATUS_REGULARIZED = 2
 """The contact update used a numerically regularized Delassus block."""
 
 wp.set_module_options({"enable_backward": False})
+
+_FUSED_RIGID_WORLD_MIN_BLOCKS_PER_SM = 4
+
+
+def _can_fuse_rigid_projection_by_world(
+    device: wp.Device,
+    world_count: int,
+    *,
+    has_deformable_contacts: bool,
+    has_coulomb_statistics: bool,
+    required_world_arrays: tuple[wp.array[Any] | None, ...],
+) -> bool:
+    """Return whether a rigid projection can occupy one CUDA block per world."""
+    return (
+        device.is_cuda
+        and world_count >= device.sm_count * _FUSED_RIGID_WORLD_MIN_BLOCKS_PER_SM
+        and not has_deformable_contacts
+        and not has_coulomb_statistics
+        and all(array is not None for array in required_world_arrays)
+    )
 
 
 @wp.struct
