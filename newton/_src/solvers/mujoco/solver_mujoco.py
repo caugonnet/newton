@@ -5881,7 +5881,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjc_tendon_to_newton_tendon = wp.array(mjc_tendon_to_newton_tendon_np, dtype=wp.int32)
 
             # set mjwarp-only settings
-            self.mjw_model.opt.ls_parallel = ls_parallel
+            # (ls_parallel was removed in MuJoCo Warp 3.9.1; keep compatibility
+            # with both pins while this branch's requirement floats)
+            try:
+                self.mjw_model.opt.ls_parallel = ls_parallel
+            except AttributeError:
+                pass
 
             if separate_worlds:
                 nworld = model.world_count

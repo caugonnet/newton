@@ -1811,22 +1811,32 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self._require_collision_space_fields(scratch, last_step_data)
         self._require_velocity_space_fields(scratch, mpm_model.has_compliant_particles)
 
-        # Rasterize colliders to discrete space
-        self._rasterize_colliders(state_in, dt, last_step_data, scratch, inv_cell_volume)
+        stf_ctx_factory = self._stf_fanin_context_factory()
+        if stf_ctx_factory is not None:
+            # Schedule-only STF fan-in of the independent assembly phases.
+            # DAG: rasterize -> {rigidity, plasticity}; velocity and
+            # elasticity are free. Field allocation stays host-side, ahead.
+            self._require_strain_space_fields(scratch, last_step_data)
+            rigidity_operator = self._step_assembly_stf_fanin(
+                stf_ctx_factory, state_in, dt, pic, scratch, last_step_data, inv_cell_volume, cell_volume
+            )
+        else:
+            # Rasterize colliders to discrete space
+            self._rasterize_colliders(state_in, dt, last_step_data, scratch, inv_cell_volume)
 
-        # Velocity right-hand side and inverse mass matrix
-        self._compute_unconstrained_velocity(state_in, dt, pic, scratch, inv_cell_volume)
+            # Velocity right-hand side and inverse mass matrix
+            self._compute_unconstrained_velocity(state_in, dt, pic, scratch, inv_cell_volume)
 
-        # Build collider rigidity matrix
-        rigidity_operator = self._build_collider_rigidity_operator(state_in, scratch, cell_volume)
+            # Build collider rigidity matrix
+            rigidity_operator = self._build_collider_rigidity_operator(state_in, scratch, cell_volume)
 
-        self._require_strain_space_fields(scratch, last_step_data)
+            self._require_strain_space_fields(scratch, last_step_data)
 
-        # Build elasticity compliance matrix and right-hand-side
-        self._build_elasticity_system(state_in, dt, pic, scratch, inv_cell_volume)
+            # Build elasticity compliance matrix and right-hand-side
+            self._build_elasticity_system(state_in, dt, pic, scratch, inv_cell_volume)
 
-        # Build strain matrix and offset, setup yield surface parameters
-        self._build_plasticity_system(state_in, dt, pic, scratch, inv_cell_volume)
+            # Build strain matrix and offset, setup yield surface parameters
+            self._build_plasticity_system(state_in, dt, pic, scratch, inv_cell_volume)
 
         # Solve implicit system
         self._load_warmstart(state_in, last_step_data, scratch, pic, inv_cell_volume)
@@ -1842,6 +1852,90 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         # Save data for next step or further processing
         self._save_data(state_in, scratch, last_step_data, state_out)
+
+
+    def _stf_fanin_context_factory(self):
+        """Return a callable creating an eager STF context, or None when disabled.
+
+        Gated by MPM_STF_FANIN=1. Schedule-only: the assembly phases are
+        unchanged; they are recorded as tasks on a stream-bound CUDASTF
+        context so independent phases execute on concurrent streams.
+        """
+        import os  # noqa: PLC0415
+
+        if not os.environ.get("MPM_STF_FANIN"):
+            return None
+        if not wp.get_device().is_cuda:
+            return None
+        try:
+            import warp.stf_experimental as wp_stf  # noqa: PLC0415
+        except ImportError:
+            return None
+        if not wp_stf.is_available():
+            return None
+        if not getattr(self, "_stf_fanin_warmed", False):
+            wp_stf.warmup(device=wp.get_device())
+            self._stf_fanin_warmed = True
+        return lambda: wp_stf.context(stream=wp.get_stream())
+
+    def _step_assembly_stf_fanin(
+        self, ctx_factory, state_in, dt, pic, scratch, last_step_data, inv_cell_volume, cell_volume
+    ):
+        """Run the assembly phases as STF tasks (see _step_impl for the DAG).
+
+        Each concurrent task uses its own fem.TemporaryStore so in-flight
+        temporaries are never recycled across streams -- a scheduling
+        enabler, not an algorithm change.
+        """
+        stores = getattr(self, "_stf_fanin_stores", None)
+        if stores is None:
+            stores = [fem.TemporaryStore() for _ in range(4)]
+            self._stf_fanin_stores = stores
+        main_store = self.temporary_store
+        rigidity_box = []
+
+        def run_with_store(index, fn):
+            self.temporary_store = stores[index]
+            try:
+                return fn()
+            finally:
+                self.temporary_store = main_store
+
+        import os  # noqa: PLC0415
+
+        serial = bool(os.environ.get("MPM_STF_FANIN_SERIAL"))
+
+        with ctx_factory() as ctx:
+            tok_collider = ctx.token()
+            chain = ctx.token() if serial else None
+
+            def deps(*extra, write=None):
+                d = list(extra)
+                if serial:
+                    d.append(chain.rw())
+                if write is not None:
+                    d.append(write)
+                return d
+
+            with ctx.task(*deps(write=tok_collider.write()), symbol="mpm_rasterize_colliders"):
+                run_with_store(0, lambda: self._rasterize_colliders(state_in, dt, last_step_data, scratch, inv_cell_volume))
+
+            with ctx.task(*deps(write=ctx.token().write()), symbol="mpm_unconstrained_velocity"):
+                run_with_store(1, lambda: self._compute_unconstrained_velocity(state_in, dt, pic, scratch, inv_cell_volume))
+
+            with ctx.task(*deps(tok_collider.read(), write=ctx.token().write()), symbol="mpm_collider_rigidity"):
+                rigidity_box.append(
+                    run_with_store(0, lambda: self._build_collider_rigidity_operator(state_in, scratch, cell_volume))
+                )
+
+            with ctx.task(*deps(write=ctx.token().write()), symbol="mpm_elasticity"):
+                run_with_store(2, lambda: self._build_elasticity_system(state_in, dt, pic, scratch, inv_cell_volume))
+
+            with ctx.task(*deps(tok_collider.read(), write=ctx.token().write()), symbol="mpm_plasticity"):
+                run_with_store(3, lambda: self._build_plasticity_system(state_in, dt, pic, scratch, inv_cell_volume))
+
+        # context exit joins all task streams back onto the current stream
+        return rigidity_box[0]
 
     def _compute_unconstrained_velocity(
         self,
