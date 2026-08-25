@@ -448,8 +448,8 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
         self.assertFalse(oversized.uses_persistent_apply)
         self.assertEqual(oversized._persistent_block_dim, 512)
 
-    def test_capture_persistent_eligible_apply_as_levels(self):
-        """Record level-scheduled kernels for a persistent-eligible CUDA preconditioner."""
+    def test_capture_persistent_eligible_apply(self):
+        """Capture the fused persistent kernel for an eligible CUDA preconditioner."""
         if not self.device.is_cuda:
             self.skipTest("CUDA graph capture requires a CUDA device.")
         matrix, packed_world, world_active, batch_offsets = _make_cycle_system(self.device)
@@ -461,6 +461,8 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
 
         preconditioner.uses_persistent_apply = False
         preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
+        wp.synchronize_device(self.device)
+        expected = result.numpy()
         preconditioner.uses_persistent_apply = True
         preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
         wp.synchronize_device(self.device)
@@ -476,11 +478,9 @@ class TestLOXDeformableLinearSolve(unittest.TestCase):
             with wp.ScopedCapture(device=self.device) as capture:
                 preconditioner.linear_operator.matvec(right_hand_side, addend, result, 1.0, 0.0)
 
-        self.assertNotIn(deformable_preconditioner_module._persistent_apply, launches)
-        self.assertEqual(launches.count(deformable_preconditioner_module._forward_level), preconditioner.level_count)
-        self.assertEqual(launches.count(deformable_preconditioner_module._backward_level), preconditioner.level_count)
+        self.assertEqual(launches, [deformable_preconditioner_module._persistent_apply])
         wp.capture_launch(capture.graph)
-        self.assertTrue(np.all(np.isfinite(result.numpy())))
+        np.testing.assert_array_equal(result.numpy(), expected)
 
     def test_match_persistent_and_level_incomplete_ldlt_apply(self):
         """Match persistent and level-scheduled applications on one factorization."""

@@ -674,7 +674,7 @@ class DeformableIncompleteLDLT:
         alpha: float,
         beta: float,
     ) -> None:
-        if self.uses_persistent_apply and not self.device.is_capturing:
+        if self.uses_persistent_apply:
             wp.launch(
                 _persistent_apply,
                 dim=self.world_active.shape[0] * self._persistent_block_dim,
