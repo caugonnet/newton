@@ -951,6 +951,14 @@ class LOXSolverConfig:
     :attr:`max_iterations` iterations instead.
     """
 
+    use_stf: bool = False
+    """Whether to schedule independent rigid and deformable candidates with CUDASTF.
+
+    This experimental path replaces LOX's manual secondary stream and event
+    join while preserving the existing fixed-count deformable CR solve. It
+    requires a mixed rigid-deformable model on CUDA.
+    """
+
     fixed_iterations: bool = False
     """Whether to skip convergence checks and run exactly :attr:`max_iterations`.
 
@@ -1198,6 +1206,8 @@ class LOXSolverConfig:
                 raise ValueError(f"Invalid {name}: {value}. Must be an integer greater than or equal to one.")
         if not isinstance(self.use_graph_conditionals, bool):
             raise ValueError(f"Invalid use_graph_conditionals: {self.use_graph_conditionals}. Must be a boolean.")
+        if not isinstance(self.use_stf, bool):
+            raise ValueError(f"Invalid use_stf: {self.use_stf}. Must be a boolean.")
         if not isinstance(self.fixed_iterations, bool):
             raise ValueError(f"Invalid fixed_iterations: {self.fixed_iterations}. Must be a boolean.")
         if not isinstance(self.eliminate_fixed_world_islands, bool):

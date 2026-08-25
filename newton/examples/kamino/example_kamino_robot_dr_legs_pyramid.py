@@ -477,6 +477,7 @@ class Example:
             solver_config.integrator = "euler"
             solver_config.lox.max_iterations = args.max_iterations
             solver_config.lox.projection_iterations = args.projection_iterations
+            solver_config.lox.use_stf = args.use_stf
             solver_config.lox.joint_solve_direct = args.direct_structural
             solver_config.lox.deformable_preconditioner = args.deformable_preconditioner
             solver_config.lox.deformable_cr_iterations = args.deformable_cr_iterations
@@ -847,6 +848,11 @@ class Example:
             type=int,
             default=4,
             help="Fixed CR iterations per LOX cloth candidate solve.",
+        )
+        parser.add_argument(
+            "--use-stf",
+            action="store_true",
+            help="Schedule independent LOX rigid and deformable candidates with CUDASTF.",
         )
         parser.add_argument(
             "--direct-structural",

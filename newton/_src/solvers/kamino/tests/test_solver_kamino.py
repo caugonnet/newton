@@ -418,6 +418,7 @@ class TestSolverKaminoConfig(unittest.TestCase):
             {"nonlinear_iterations": 0},
             {"max_iterations": 0},
             {"use_graph_conditionals": 1},
+            {"use_stf": 1},
             {"fixed_iterations": 1},
             {"projection_iterations": 0},
             {"position_tolerance": 0.0},

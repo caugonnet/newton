@@ -639,6 +639,8 @@ class TestLOXSolver(unittest.TestCase):
         for color_count in (-1, 1.0, True):
             with self.assertRaisesRegex(ValueError, "gauss_seidel_max_colors"):
                 LOXSolver(adapter, gauss_seidel_max_colors=color_count)
+        with self.assertRaisesRegex(ValueError, "use_stf"):
+            LOXSolver(adapter, use_stf=1)
         with self.assertRaisesRegex(ValueError, "fixed_iterations"):
             LOXSolver(adapter, fixed_iterations=1)
         self.assertEqual(LOXSolver(adapter, projection_method="gauss_seidel").projection_method, "gauss_seidel")

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import warp as wp
@@ -310,14 +311,48 @@ class IntegratorLOX(IntegratorBase):
         wp.copy(self.pose_begin, state_in.q_i)
         wp.copy(self.joint_position_begin, data.joints.q_j)
 
-        forward(
-            state_in=state_in,
-            state_out=state_out,
-            control=control,
-            limits=limits,
-            contacts=contacts,
-            detector=detector,
-        )
+        use_stf_preparation = solver.use_stf and solver.deformable_system is not None and adapter is not None
+        if use_stf_preparation:
+            wp_stf = solver._wp_stf
+            if wp_stf is None:
+                raise RuntimeError("LOX STF scheduling was not initialized.")
+
+            @contextmanager
+            def concurrent_preparation():
+                main_stream = wp.get_stream(model.device)
+                with wp_stf.context(stream=main_stream) as ctx:
+                    deformable_ready = ctx.token()
+                    rigid_ready = ctx.token()
+                    with ctx.task(deformable_ready.write(), symbol="LOX deformable assembly"):
+                        self.problem.begin_newton_deformable_time_step(time_step, inverse_time_step)
+                    with ctx.task(rigid_ready.write(), symbol="LOX rigid preparation"):
+                        yield
+                    with ctx.task(
+                        deformable_ready.read(),
+                        rigid_ready.read(),
+                        symbol="LOX preparation join",
+                    ):
+                        pass
+
+            forward(
+                state_in=state_in,
+                state_out=state_out,
+                control=control,
+                limits=limits,
+                contacts=contacts,
+                detector=detector,
+                post_detection_task=concurrent_preparation,
+            )
+        else:
+            forward(
+                state_in=state_in,
+                state_out=state_out,
+                control=control,
+                limits=limits,
+                contacts=contacts,
+                detector=detector,
+            )
+            self.problem.begin_newton_deformable_time_step(time_step, inverse_time_step)
 
         if self.warmstarter_limits is not None:
             self.warmstarter_limits.warmstart(limits)
@@ -355,7 +390,6 @@ class IntegratorLOX(IntegratorBase):
                 device=model.device,
             )
 
-        self.problem.begin_newton_deformable_time_step(time_step, inverse_time_step)
         solver.warmstart(problem=self.problem, model=model, data=data, limits=limits, contacts=contacts)
         wp.copy(self.pose_accepted, self.pose_begin)
         if adapter is not None:

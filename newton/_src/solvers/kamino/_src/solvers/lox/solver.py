@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 from typing import TYPE_CHECKING
 
@@ -519,6 +520,7 @@ class LOXSolver:
             adapter=adapter,
             max_iterations=config.max_iterations,
             use_graph_conditionals=config.use_graph_conditionals,
+            use_stf=config.use_stf,
             fixed_iterations=config.fixed_iterations,
             projection_iterations=config.projection_iterations,
             projection_method=config.projection_method,
@@ -567,6 +569,7 @@ class LOXSolver:
         adapter: LOXKaminoAdapter | None,
         max_iterations: int = 25,
         use_graph_conditionals: bool = True,
+        use_stf: bool = False,
         fixed_iterations: bool = False,
         projection_iterations: int = 3,
         projection_method: str = "jacobi",
@@ -611,6 +614,8 @@ class LOXSolver:
         _validate_fixed_iteration_count("projection_iterations", projection_iterations)
         if not isinstance(use_graph_conditionals, bool):
             raise ValueError("use_graph_conditionals must be a bool.")
+        if not isinstance(use_stf, bool):
+            raise ValueError("use_stf must be a bool.")
         if not isinstance(fixed_iterations, bool):
             raise ValueError("fixed_iterations must be a bool.")
         if projection_method not in ("jacobi", "gauss_seidel", "apgd", "avbd"):
@@ -700,9 +705,22 @@ class LOXSolver:
         self.num_worlds = adapter.num_worlds if adapter is not None else int(deformable_model.world_count)
         if deformable_model is not None and int(deformable_model.world_count) != self.num_worlds:
             raise ValueError("Rigid and deformable LOX systems must contain the same number of worlds.")
+        self._wp_stf = None
+        if use_stf:
+            if not self.device.is_cuda or adapter is None or deformable_model is None or deformable_model.particle_count < 1:
+                raise ValueError("use_stf requires a mixed rigid-deformable LOX model on a CUDA device.")
+            try:
+                wp_stf = importlib.import_module("warp.stf_experimental")
+            except ImportError as error:
+                raise RuntimeError("LOX use_stf requires a Warp build with stf_experimental support.") from error
+            if not wp_stf.is_available():
+                raise RuntimeError("LOX use_stf requires the cuda-stf Python package.")
+            wp_stf.warmup(device=self.device)
+            self._wp_stf = wp_stf
         self.has_rigid = adapter is not None
         self.max_iterations = max_iterations
         self.use_graph_conditionals = use_graph_conditionals
+        self.use_stf = use_stf
         self.fixed_iterations = fixed_iterations
         self.projection_iterations = projection_iterations
         self.projection_method = projection_method
@@ -847,13 +865,16 @@ class LOXSolver:
                     self.deformable_system.inverse_weight,
                     deformable_penetration_free_contact_relaxation,
                 )
-        use_parallel_candidates = self.device.is_cuda and adapter is not None and self.deformable_system is not None
+        use_parallel_candidates = (
+            self.device.is_cuda and adapter is not None and self.deformable_system is not None and not self.use_stf
+        )
         self._deformable_stream = wp.Stream(self.device) if use_parallel_candidates else None
         self._deformable_start_event = wp.Event(self.device) if use_parallel_candidates else None
         self._deformable_complete_event = wp.Event(self.device) if use_parallel_candidates else None
         self.deformable_contacts = None
         self._deformable_contacts_active = False
         self._deformable_prepared = False
+        self._deformable_consensus_pending = False
         self.structural_joint_solver: BatchedStructuralJointSolver | None = None
         # The Schur path factors unconstrained body inertia before applying joints,
         # so a massless dynamic frame requires the maximal-coordinate ALM path.
@@ -1052,6 +1073,7 @@ class LOXSolver:
             )
         self._initial_twist.zero_()
         self._deformable_prepared = False
+        self._deformable_consensus_pending = False
         self._time_step_prepared = False
         self._coldstart_requested = False
 
@@ -1238,6 +1260,7 @@ class LOXSolver:
             self.deformable_self_contact_detector.detect(state.particle_q)
         if self.deformable_penetration_free_limiter is not None:
             self.deformable_penetration_free_limiter.begin_time_step(state.particle_q)
+        defer_consensus = self.use_stf and self.adapter is not None
         if self._deformable_contacts_active:
             capacities_changed = self.deformable_contacts is not None and (
                 self.deformable_contacts.rigid_contact_capacity != rigid_contact_capacity
@@ -1271,7 +1294,10 @@ class LOXSolver:
                 ),
                 body_pose=body_pose,
             )
-            self.deformable_system.set_unilateral_incidence(self.deformable_contacts.particle_multiplicity)
+            self.deformable_system.set_unilateral_incidence(
+                self.deformable_contacts.particle_multiplicity,
+                finalize_consensus=not defer_consensus,
+            )
             self.deformable_contacts.update_weight_metric()
             if self.projection_method == "gauss_seidel" and self.adapter is None:
                 if self.gauss_seidel_max_colors == 0:
@@ -1281,10 +1307,23 @@ class LOXSolver:
             elif self.projection_method == "apgd" and self.adapter is None:
                 self.deformable_contacts.prepare_apgd_projection(rigid_coordinates=False)
         else:
-            self.deformable_system.set_unilateral_incidence(None)
+            self.deformable_system.set_unilateral_incidence(None, finalize_consensus=not defer_consensus)
+        if defer_consensus:
+            self._deformable_consensus_pending = True
+        else:
+            self.deformable_splitting.begin_time_step(time_step, self.inertial_warmstart_fraction)
+            wp.copy(self.deformable_system.smooth_velocity, self.deformable_splitting.projected_velocity)
+            self._deformable_consensus_pending = False
+        self._deformable_prepared = True
+
+    def _finalize_deformable_preparation(self, time_step: wp.array[wp.float32]) -> None:
+        """Factor deferred deformable consensus data and initialize splitting."""
+        if not self._deformable_consensus_pending:
+            return
+        self.deformable_system.finalize_consensus_system()
         self.deformable_splitting.begin_time_step(time_step, self.inertial_warmstart_fraction)
         wp.copy(self.deformable_system.smooth_velocity, self.deformable_splitting.projected_velocity)
-        self._deformable_prepared = True
+        self._deformable_consensus_pending = False
 
     def prepare_deformable_nonlinear_iteration(
         self,
@@ -1754,7 +1793,9 @@ class LOXSolver:
         linearization_twist: wp.array[vec6f] | None,
         conditional: bool,
     ) -> None:
-        if self._deformable_stream is None:
+        if self.use_stf and self.adapter is not None:
+            self._prepare_combined_candidates_stf(time_step, linearization_twist)
+        elif self._deformable_stream is None:
             self._deformable_candidate_projection(time_step)
             if self.adapter is not None:
                 self._prepare_body_space_iteration(time_step, linearization_twist)
@@ -1775,6 +1816,34 @@ class LOXSolver:
         self._finish_deformable_iteration(time_step)
         if conditional:
             self._update_conditional_iteration()
+
+    def _prepare_combined_candidates_stf(
+        self,
+        time_step: wp.array[wp.float32],
+        linearization_twist: wp.array[vec6f],
+    ) -> None:
+        """Schedule the independent candidates and their projection join with CUDASTF."""
+        wp_stf = self._wp_stf
+        if wp_stf is None:
+            raise RuntimeError("LOX STF scheduling was not initialized.")
+
+        main_stream = wp.get_stream(self.device)
+        with wp_stf.context(stream=main_stream) as ctx:
+            deformable_candidate = ctx.token()
+            rigid_candidate = ctx.token()
+
+            with ctx.task(deformable_candidate.write(), symbol="LOX deformable candidate"):
+                self._deformable_candidate_projection(time_step)
+
+            with ctx.task(rigid_candidate.write(), symbol="LOX rigid candidate"):
+                self._prepare_body_space_candidate(time_step, linearization_twist)
+
+            with ctx.task(
+                deformable_candidate.read(),
+                rigid_candidate.read(),
+                symbol="LOX coupled projection",
+            ):
+                self._project_body_space_constraints()
 
     def _prepare_body_space_candidate(
         self, time_step: wp.array[wp.float32], linearization_twist: wp.array[vec6f]
@@ -2008,6 +2077,57 @@ class LOXSolver:
         if conditional:
             self._update_conditional_iteration()
 
+    def _prepare_rigid_linearization(
+        self,
+        time_step: wp.array[wp.float32],
+        linearization_twist: wp.array[vec6f],
+    ) -> None:
+        """Assemble and factor the rigid weighted system for one linearization."""
+        adapter = self.adapter
+        system = self.system
+        splitting = self.splitting
+        use_structural_schur = self._joint_solve_mode == _JOINT_SOLVE_SCHUR_DIRECT
+        adapter.update(
+            time_step,
+            joint_penalty_scale=self.joint_penalty_scale,
+            linearization_twist=linearization_twist,
+            block_joint_metrics=not use_structural_schur and self._joint_metric_mode != _JOINT_METRIC_SIMPLE,
+            mass_split_joint_metrics=not use_structural_schur
+            and self._joint_metric_mode == _JOINT_METRIC_MASS_SPLIT,
+            assemble_structural_penalty=not use_structural_schur,
+        )
+        weight_metric = None
+        if use_structural_schur:
+            weight_metric = system.build_simple_joint_aware_weight_metric(
+                adapter.structural_row_world,
+                adapter.structural_body_first_global,
+                adapter.structural_body_second_global,
+                adapter.structural_jacobian_first,
+                adapter.structural_jacobian_second,
+                adapter.structural_effective_mass,
+                joint_metric_scale=self.joint_penalty_scale,
+            )
+        if self._body_weight_mode == _BODY_WEIGHT_MASS_PROPORTIONAL:
+            system.build_weighted_matrix(
+                metric_matrix=weight_metric,
+                body_has_unilateral=adapter.body_has_unilateral,
+                sigma=self.weight_sigma,
+                beta=self.weight_beta,
+            )
+        else:
+            system.build_anisotropic_weighted_matrix(
+                metric_matrix=weight_metric,
+                body_has_unilateral=adapter.body_has_unilateral,
+                sigma=self.weight_sigma,
+                beta=self.weight_beta,
+            )
+        splitting.restore_dual_from_impulse(system.inverse_weight, adapter.body_has_unilateral)
+        system.factorize()
+        self._prepare_body_space_projection()
+        if self.structural_joint_solver is not None:
+            self.structural_joint_solver.factorize()
+            self.structural_joint_solver.warmstart(time_step, adapter.structural_multiplier)
+
     def solve(self, problem: LOXProblem) -> None:
         """Assemble and solve one frozen-contact smooth linearization.
 
@@ -2052,49 +2172,29 @@ class LOXSolver:
         system = self.system
         splitting = self.splitting
         if adapter is not None:
-            use_structural_schur = self._joint_solve_mode == _JOINT_SOLVE_SCHUR_DIRECT
-            adapter.update(
-                time_step,
-                joint_penalty_scale=self.joint_penalty_scale,
-                linearization_twist=linearization_twist,
-                block_joint_metrics=not use_structural_schur and self._joint_metric_mode != _JOINT_METRIC_SIMPLE,
-                mass_split_joint_metrics=not use_structural_schur
-                and self._joint_metric_mode == _JOINT_METRIC_MASS_SPLIT,
-                assemble_structural_penalty=not use_structural_schur,
-            )
             if linearization_twist is None:
                 linearization_twist = adapter.body_linearization_twist
-            weight_metric = None
-            if use_structural_schur:
-                weight_metric = system.build_simple_joint_aware_weight_metric(
-                    adapter.structural_row_world,
-                    adapter.structural_body_first_global,
-                    adapter.structural_body_second_global,
-                    adapter.structural_jacobian_first,
-                    adapter.structural_jacobian_second,
-                    adapter.structural_effective_mass,
-                    joint_metric_scale=self.joint_penalty_scale,
-                )
-            if self._body_weight_mode == _BODY_WEIGHT_MASS_PROPORTIONAL:
-                system.build_weighted_matrix(
-                    metric_matrix=weight_metric,
-                    body_has_unilateral=adapter.body_has_unilateral,
-                    sigma=self.weight_sigma,
-                    beta=self.weight_beta,
-                )
+            if self.use_stf and self._deformable_consensus_pending:
+                wp_stf = self._wp_stf
+                if wp_stf is None:
+                    raise RuntimeError("LOX STF scheduling was not initialized.")
+                main_stream = wp.get_stream(self.device)
+                with wp_stf.context(stream=main_stream) as ctx:
+                    deformable_ready = ctx.token()
+                    rigid_ready = ctx.token()
+                    with ctx.task(deformable_ready.write(), symbol="LOX deformable factorization"):
+                        self._finalize_deformable_preparation(time_step)
+                    with ctx.task(rigid_ready.write(), symbol="LOX rigid assembly"):
+                        self._prepare_rigid_linearization(time_step, linearization_twist)
+                    with ctx.task(
+                        deformable_ready.read(),
+                        rigid_ready.read(),
+                        symbol="LOX linearization join",
+                    ):
+                        pass
             else:
-                system.build_anisotropic_weighted_matrix(
-                    metric_matrix=weight_metric,
-                    body_has_unilateral=adapter.body_has_unilateral,
-                    sigma=self.weight_sigma,
-                    beta=self.weight_beta,
-                )
-            splitting.restore_dual_from_impulse(system.inverse_weight, adapter.body_has_unilateral)
-            system.factorize()
-            self._prepare_body_space_projection()
-            if self.structural_joint_solver is not None:
-                self.structural_joint_solver.factorize()
-                self.structural_joint_solver.warmstart(time_step, adapter.structural_multiplier)
+                self._finalize_deformable_preparation(time_step)
+                self._prepare_rigid_linearization(time_step, linearization_twist)
 
         use_conditional_loop = (
             not self.fixed_iterations

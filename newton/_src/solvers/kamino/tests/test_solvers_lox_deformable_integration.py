@@ -3,6 +3,7 @@
 
 """End-to-end tests for cloth in the SolverKamino LOX backend."""
 
+import importlib
 import unittest
 
 import numpy as np
@@ -1394,6 +1395,145 @@ class TestLOXDeformableIntegration(unittest.TestCase):
             int(solver._solver_kamino._solver_fd.world_status.numpy()[0]),
             LOX_STATUS_CONVERGED,
         )
+
+    def test_step_mixed_rigid_and_cloth_with_stf(self):
+        """Schedule the independent mixed candidates through the opt-in STF path."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDASTF requires a CUDA device.")
+        try:
+            wp_stf = importlib.import_module("warp.stf_experimental")
+        except ImportError:
+            self.skipTest("Warp stf_experimental is not available.")
+        if not wp_stf.is_available():
+            self.skipTest("CUDASTF is not available.")
+
+        model, _, _ = _build_contact_model(device=self.device, collider="dynamic")
+        state_in = model.state()
+        state_out = model.state()
+        solver = newton.solvers.SolverKamino(
+            model,
+            config=_make_lox_config(use_stf=True, deformable_direct_max_particles=0),
+        )
+
+        solver.step(state_in, state_out, None, None, 0.01)
+
+        lox = solver._solver_kamino._solver_fd
+        self.assertTrue(lox.use_stf)
+        self.assertIsNone(lox._deformable_stream)
+        self.assertTrue(np.all(np.isfinite(state_out.body_qd.numpy())))
+        self.assertTrue(np.all(np.isfinite(state_out.particle_qd.numpy())))
+        self.assertEqual(int(lox.world_status.numpy()[0]), LOX_STATUS_CONVERGED)
+
+    def test_stf_matches_manual_mixed_preparation_and_candidates(self):
+        """Preserve mixed LOX results while widening STF overlap to preparation."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDASTF requires a CUDA device.")
+        try:
+            wp_stf = importlib.import_module("warp.stf_experimental")
+        except ImportError:
+            self.skipTest("Warp stf_experimental is not available.")
+        if not wp_stf.is_available():
+            self.skipTest("CUDASTF is not available.")
+
+        results = {}
+        for use_stf in (False, True):
+            model, _, _ = _build_contact_model(device=self.device, collider="dynamic")
+            state_in = model.state()
+            state_in.particle_qd.fill_((0.25, -0.5, 0.75))
+            state_out = model.state()
+            solver = newton.solvers.SolverKamino(
+                model,
+                config=_make_lox_config(
+                    use_stf=use_stf,
+                    deformable_direct_max_particles=0,
+                    deformable_cr_iterations=6,
+                ),
+            )
+
+            solver.step(state_in, state_out, None, None, 0.01)
+            wp.synchronize_device(self.device)
+            lox = solver._solver_kamino._solver_fd
+            results[use_stf] = {
+                "body_q": state_out.body_q.numpy(),
+                "body_qd": state_out.body_qd.numpy(),
+                "particle_q": state_out.particle_q.numpy(),
+                "particle_qd": state_out.particle_qd.numpy(),
+                "body_dual": state_out.body_lox_dual_impulse.numpy(),
+                "particle_dual": state_out.particle_lox_dual_impulse.numpy(),
+                "smooth_velocity": lox.deformable_system.smooth_velocity.numpy(),
+                "world_status": lox.world_status.numpy(),
+                "iteration_count": lox.iteration_count.numpy(),
+            }
+
+        for name, baseline in results[False].items():
+            np.testing.assert_array_equal(results[True][name], baseline, err_msg=name)
+
+    def test_capture_mixed_rigid_and_cloth_with_stf(self):
+        """Capture and replay the STF candidates inside LOX's conditional loop."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDASTF requires a CUDA device.")
+        try:
+            wp_stf = importlib.import_module("warp.stf_experimental")
+        except ImportError:
+            self.skipTest("Warp stf_experimental is not available.")
+        if not wp_stf.is_available():
+            self.skipTest("CUDASTF is not available.")
+
+        model, _, _ = _build_contact_model(device=self.device, collider="dynamic")
+        state_in = model.state()
+        state_out = model.state()
+        solver = newton.solvers.SolverKamino(
+            model,
+            config=_make_lox_config(use_stf=True, deformable_direct_max_particles=0),
+        )
+        solver.step(state_in, state_out, None, None, 0.01)
+        state_in, state_out = state_out, state_in
+
+        with wp.ScopedCapture(device=self.device) as capture:
+            solver.step(state_in, state_out, None, None, 0.01)
+        wp.capture_launch(capture.graph)
+
+        self.assertTrue(np.all(np.isfinite(state_out.body_qd.numpy())))
+        self.assertTrue(np.all(np.isfinite(state_out.particle_qd.numpy())))
+        self.assertEqual(
+            int(solver._solver_kamino._solver_fd.world_status.numpy()[0]),
+            LOX_STATUS_CONVERGED,
+        )
+
+    def test_capture_dynamic_rigid_cloth_contact_with_stf(self):
+        """Capture widened STF preparation with two-way rigid-cloth contact."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDASTF requires a CUDA device.")
+        try:
+            wp_stf = importlib.import_module("warp.stf_experimental")
+        except ImportError:
+            self.skipTest("Warp stf_experimental is not available.")
+        if not wp_stf.is_available():
+            self.skipTest("CUDASTF is not available.")
+
+        model, shapes, _ = _build_contact_model(device=self.device, collider="dynamic")
+        state_in = model.state()
+        state_out = model.state()
+        state_in.particle_qd.fill_((0.0, 0.0, -1.0))
+        contacts = _make_particle_contact(model, state_in, shapes[0], gap=0.0)
+        solver = newton.solvers.SolverKamino(
+            model,
+            config=_make_lox_config(
+                use_stf=True,
+                nonlinear_iterations=2,
+                deformable_direct_max_particles=0,
+            ),
+        )
+        solver.step(state_in, state_out, None, contacts, 0.01)
+        state_in, state_out = state_out, state_in
+
+        with wp.ScopedCapture(device=self.device) as capture:
+            solver.step(state_in, state_out, None, contacts, 0.01)
+        wp.capture_launch(capture.graph)
+
+        self.assertTrue(np.all(np.isfinite(state_out.body_qd.numpy())))
+        self.assertTrue(np.all(np.isfinite(state_out.particle_qd.numpy())))
+        self.assertTrue(bool(solver._solver_kamino._solver_fd.world_accepted.numpy()[0]))
 
     def test_capture_public_pure_cloth_step(self):
         """Capture and replay the public pure-cloth LOX step."""

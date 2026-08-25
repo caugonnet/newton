@@ -1203,6 +1203,7 @@ class SolverKaminoImpl(SolverBase):
         limits: LimitsKamino | None = None,
         contacts: ContactsKamino | None = None,
         detector: CollisionDetector | None = None,
+        post_detection_task: Callable | None = None,
     ):
         """
         Prepares kinematics, topology, and actuation for a forward solve.
@@ -1235,6 +1236,21 @@ class SolverKaminoImpl(SolverBase):
         if detector is not None:
             detector.collide(data=self._data, state=state_in, contacts=contacts)
 
+        if post_detection_task is None:
+            self._prepare_forward_dynamics_after_detection(state_in, state_out, control, limits, contacts)
+        else:
+            with post_detection_task():
+                self._prepare_forward_dynamics_after_detection(state_in, state_out, control, limits, contacts)
+
+    def _prepare_forward_dynamics_after_detection(
+        self,
+        state_in: StateKamino,
+        state_out: StateKamino,
+        control: ControlKamino,
+        limits: LimitsKamino | None,
+        contacts: ContactsKamino | None,
+    ) -> None:
+        """Prepare rigid kinematics and actuation after contact detection."""
         # If a limits container/detector is provided, run joint-limit
         # detection to generate active joint limits at the current state
         if limits is not None:

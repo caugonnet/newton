@@ -1032,8 +1032,13 @@ class DeformableFEMSystem:
         if self.has_iterative_components:
             self.preconditioner.factorize()
 
-    def set_unilateral_incidence(self, incidence: wp.array[wp.int32] | None) -> None:
-        """Freeze nodal unilateral support and rebuild the weighted linear system."""
+    def set_unilateral_incidence(
+        self,
+        incidence: wp.array[wp.int32] | None,
+        *,
+        finalize_consensus: bool = True,
+    ) -> None:
+        """Freeze nodal unilateral support and optionally rebuild the weighted system."""
         if incidence is None:
             self.unilateral_incidence.zero_()
         else:
@@ -1042,6 +1047,11 @@ class DeformableFEMSystem:
             if incidence.device != self.device:
                 raise ValueError(f"LOX deformable expected incidence on {self.device}, found {incidence.device}.")
             wp.copy(self.unilateral_incidence, incidence)
+        if finalize_consensus:
+            self._finalize_consensus_system()
+
+    def finalize_consensus_system(self) -> None:
+        """Build and factor the weighted system after unilateral incidence is frozen."""
         self._finalize_consensus_system()
 
     def update_proximal(self, time_step: wp.array[wp.float32]) -> None:
