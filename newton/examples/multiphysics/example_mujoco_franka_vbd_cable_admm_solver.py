@@ -37,7 +37,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverMuJoCo, SolverVBD, SolverXPBD
+from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD, SolverXPBD
 
 PAYLOAD_CENTER = wp.vec3(0.5, 0.0, 0.256)
 PAYLOAD_LENGTH = 0.42
@@ -135,6 +135,8 @@ class Example:
         template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         template.rigid_gap = 0.005
         SolverMuJoCo.register_custom_attributes(template)
+        if args.rigid_solver == "steel":
+            SolverSteel.register_custom_attributes(template)
         if self.payload_kind == "vbd-cable":
             SolverVBD.register_custom_attributes(template)
         self._emit_template(template)
@@ -157,12 +159,21 @@ class Example:
         mujoco_contact_budget = max(64, 16 * self.world_count)
         payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
         payload_solver = self._make_payload_solver(args)
+        if args.rigid_solver == "steel":
+            # Steel sizes its contact scratch from model.rigid_contact_max at construction and
+            # rejects a larger Contacts buffer at step time; pin the pipeline's estimate on the model.
+            from newton._src.sim.collide import _estimate_rigid_contact_max  # noqa: PLC0415
+
+            self.model.rigid_contact_max = _estimate_rigid_contact_max(self.model)
         self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
+                    name="mjc",  # coupling specs refer to the rigid entry by this name
+                    # Steel: ADMM iteration restarts need the mass matrix refreshed every step
+                    solver=(lambda v: SolverSteel(model=v, update_mass_matrix_interval=1))
+                    if args.rigid_solver == "steel"
+                    else lambda v: SolverMuJoCo(
                         model=v,
                         solver="newton",
                         integrator="implicitfast",
@@ -610,6 +621,13 @@ class Example:
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=8)
         parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")
+        parser.add_argument(
+            "--rigid-solver",
+            type=str,
+            choices=["mujoco", "steel"],
+            default="mujoco",
+            help="Rigid-body solver for the Franka entry.",
+        )
         parser.add_argument("--admm-iterations", type=int, default=5, help="ADMM iterations per coupled substep.")
         parser.add_argument("--rho", type=float, default=200.0, help="ADMM penalty parameter.")
         parser.add_argument("--gamma", type=float, default=0.001, help="ADMM proximal metric scale.")

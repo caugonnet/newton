@@ -92,6 +92,7 @@ KERNEL_CLASS_PREFIXES = [
     ("mujoco", ("mujoco_warp", "newton._src.solvers.mujoco")),
     ("kamino", ("newton._src.solvers.kamino", "kamino")),
     ("vbd", ("newton._src.solvers.vbd",)),
+    ("steel", ("newton._src.solvers.steel",)),
     ("xpbd", ("newton._src.solvers.xpbd",)),
     ("newton-core", ("newton._src.sim", "newton._src.geometry", "newton._src.core", "newton._src.utils", "newton._src.solvers.ik", "newton._src.solvers.solver", "newton.examples")),
     ("warp", ("warp",)),
