@@ -98,26 +98,29 @@ def _assert_default_steel(sv, state_out):
     assert not sv._sparse_diagonal_contact_solve
     assert sv._rigid_velocity_limit_slot is None
     assert state_out.body_parent_f is None
-    assert not sv._coupling_patch_history_restore_pending and not sv._coupling_patch_history_snapshot_pending
     assert sv.model.articulation_count
 
 
-def steel_advance_forked(sv, state_in, state_out, control, contacts, dt, task_pre, task_mass, task_rows, task_join, pre_hook=None):
+def steel_advance_forked(sv, state_in, state_out, control, contacts, dt, task_pre, task_mass, task_rows, task_join, pre_hook=None, post_hook=None):
     """SolverSteel.step() + _advance() (Newton main 1a497c00, defaults) with the
     mass-matrix chain and the row build recorded as sibling tasks. The four
     task_* arguments are factories returning the context manager of one task
     each; the tasks are opened one after the other (never nested). pre_hook
-    runs first inside the pre task (clear forces, collide)."""
+    runs first inside the pre task (clear forces, collide; it may return a
+    (control, contacts) pair that replaces the arguments), post_hook last
+    inside the join task."""
     _assert_default_steel(sv, state_out)
     model = sv.model
     with task_pre():
         if pre_hook is not None:
-            pre_hook()
+            r = pre_hook()
+            if r is not None:
+                control, contacts = r
         stage3_qd = _steel_pre(sv, state_in, state_out, control, contacts, dt)
     state_aug = sv  # _prepare_augmented_state returns the solver
     if control is None:
         control = model.control(clone_variables=False)
-    _steel_fork_tail(sv, state_aug, stage3_qd, state_in, state_out, control, contacts, dt, task_mass, task_rows, task_join)
+    _steel_fork_tail(sv, state_aug, stage3_qd, state_in, state_out, control, contacts, dt, task_mass, task_rows, task_join, post_hook)
 
 
 def _steel_pre(sv, state_in, state_out, control, contacts, dt):
@@ -126,7 +129,13 @@ def _steel_pre(sv, state_in, state_out, control, contacts, dt):
     sv.validate_observables(None, contacts)
     if contacts is not None and contacts.rigid_contact_max > sv._max_contacts_alloc:
         raise ValueError("Steel contact capacity mismatch")
-    # _advance() preamble
+    # _advance() preamble (the patch-history flags are set by the ADMM coupler on iteration restarts)
+    if sv._coupling_patch_history_restore_pending:
+        sv._friction_patches.restore_history()
+    elif sv._coupling_patch_history_snapshot_pending:
+        sv._friction_patches.snapshot_history()
+    sv._coupling_patch_history_restore_pending = False
+    sv._coupling_patch_history_snapshot_pending = False
     if sv._last_step_dt is not None and abs(sv._last_step_dt - dt) > 1.0e-8:
         sv._force_mass_update = True
     sv._last_step_dt = dt
@@ -158,7 +167,7 @@ def _steel_pre(sv, state_in, state_out, control, contacts, dt):
     return sv._stage1_fk_id(state_in, state_aug, state_out)
 
 
-def _steel_fork_tail(sv, state_aug, stage3_qd, state_in, state_out, control, contacts, dt, task_mass, task_rows, task_join):
+def _steel_fork_tail(sv, state_aug, stage3_qd, state_in, state_out, control, contacts, dt, task_mass, task_rows, task_join, post_hook=None):
     from newton._src.solvers.steel.solver_steel import finish_patch_impulses
 
     model = sv.model
@@ -231,6 +240,8 @@ def _steel_fork_tail(sv, state_aug, stage3_qd, state_in, state_out, control, con
             else:
                 sv._friction_patches.previous.valid.zero_()
         sv._step += 1
+        if post_hook is not None:
+            post_hook()
 
 
 def run_native(sc):

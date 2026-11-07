@@ -48,7 +48,8 @@ FRAMES = int(os.environ.get("BENCH_FRAMES", 200))
 EXAMPLE = os.environ.get("BENCH_EXAMPLE", "admm_contact")
 DOT = os.environ.get("BENCH_DOT")
 EXTRA_ARGS = shlex.split(os.environ.get("BENCH_ARGS", ""))
-ARM = os.environ.get("BENCH_ARM", "both")  # native | stf | both (one arm per process for nsys)
+ARM = os.environ.get("BENCH_ARM", "both")
+STEEL_FORK = os.environ.get("BENCH_STEEL_FORK", "0") == "1"  # also fork SolverSteel entries (level 2 inside level 1)  # native | stf | both (one arm per process for nsys)
 
 
 def _eval_ik(ex, s_in, s_out):
@@ -181,7 +182,7 @@ def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out):
     coupling = s._coupling
     dt = ex.sim_dt
     control, contacts = ex.control, ex.contacts
-    all_rw = [t_shared.rw()] + [t.rw() for t in toks.values()]
+    all_rw = [t_shared.rw()] + [toks[n].rw() for n in s._entries]
 
     with task(*all_rw, symbol="head"):
         state_in.clear_forces()
@@ -223,16 +224,13 @@ def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out):
         with task(*all_rw, symbol="accum"):
             s._accumulate_admm_forces(k, dt, refresh_jv=k == 0, initialize_contact_u=k == 0)
         for name, entry in s._entries.items():
+            if STEEL_FORK and type(entry.solver).__name__ == "SolverSteel":
+                _record_steel_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt)
+                continue
             with task(toks[name].rw(), t_shared.read(), symbol=f"solve-{name}"):
                 s._apply_admm_force_inputs(entry, s._admm_buffers[name], dt)
                 s._step_entry(entry, control, contacts, dt)
-                buf = s._admm_buffers[name]
-                if buf.body_qd_k is not None:
-                    wp.copy(buf.body_qd_k, entry.state_1.body_qd)
-                if buf.particle_qd_k is not None:
-                    wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
-                if buf.joint_qd_k is not None:
-                    wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
+                _copy_qd_k(s, name, entry)
         with task(*all_rw, symbol="dual"):
             s._update_admm_dual(k, dt)
 
@@ -242,6 +240,43 @@ def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out):
         if SUBSTEP_POST is not None:
             SUBSTEP_POST(ex, state_in, state_out)
     s._entry_output_state_valid = True
+
+
+def _copy_qd_k(s, name, entry):
+    buf = s._admm_buffers[name]
+    if buf.body_qd_k is not None:
+        wp.copy(buf.body_qd_k, entry.state_1.body_qd)
+    if buf.particle_qd_k is not None:
+        wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
+    if buf.joint_qd_k is not None:
+        wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
+
+
+def _record_steel_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt):
+    """Level 2 inside level 1: the Steel entry's solve task becomes the four
+    tasks of newton_steel_fork_bench.steel_advance_forked (pre, mass || rows,
+    join). SolverCoupled._step_entry's wrapping (contact filtering, control
+    copy) goes into the pre task; single-substep, non-in-place entries only."""
+    from newton._src.solvers.coupled.solver_coupled import _copy_control_to_entry
+    from newton.examples.steel.steel_fork_bench import steel_advance_forked
+
+    assert entry.substeps == 1 and not entry.in_place, "forked Steel entry: single substep only"
+    tm, tr = toks[f"{name}.mass"], toks[f"{name}.rows"]
+
+    def pre_hook():
+        s._apply_admm_force_inputs(entry, s._admm_buffers[name], dt)
+        # SolverCoupled._step_entry wrapping; both return persistent per-entry objects
+        return _copy_control_to_entry(control, entry), s._contacts_for_entry(entry, contacts)
+
+    steel_advance_forked(
+        entry.solver, entry.state_0, entry.state_1, None, None, dt,
+        task_pre=lambda: task(toks[name].rw(), t_shared.read(), symbol=f"solve-{name}-pre"),
+        task_mass=lambda: task(toks[name].read(), t_shared.read(), tm.rw(), symbol=f"solve-{name}-mass"),
+        task_rows=lambda: task(toks[name].read(), t_shared.read(), tr.rw(), symbol=f"solve-{name}-rows"),
+        task_join=lambda: task(toks[name].rw(), t_shared.read(), tm.read(), tr.read(), symbol=f"solve-{name}-join"),
+        pre_hook=pre_hook,
+        post_hook=lambda: _copy_qd_k(s, name, entry),
+    )
 
 
 _KERNEL_RX = re.compile(r"\|\s*([A-Za-z_]\w*?)_[0-9a-f]{8}_cuda_kernel_(?:forward|backward)")
@@ -323,8 +358,12 @@ def run_stf(ex):
     wp.synchronize()
     ctx = stf.stackable_context()
     toks = {name: ctx.token() for name in ex.solver._entries}
+    if STEEL_FORK:
+        for name, entry in ex.solver._entries.items():
+            if type(entry.solver).__name__ == "SolverSteel":
+                toks[f"{name}.mass"], toks[f"{name}.rows"] = ctx.token(), ctx.token()
     t_shared = ctx.token()
-    all_rw = [t_shared.rw()] + [t.rw() for t in toks.values()]
+    all_rw = [t_shared.rw()] + [toks[n].rw() for n in ex.solver._entries]
 
     def task(*deps, symbol):
         return _task_scope(ctx.task(*deps, symbol=symbol))
