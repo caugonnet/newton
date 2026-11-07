@@ -130,8 +130,12 @@ class _task_scope:
         wp.capture_begin(stream=self.stream, external=True)
         return self
 
+    # Warp's Graph.__del__ destroys the captured cudaGraph_t (release_or_defer(Graph)) even for an
+    # external capture, i.e. the STF-owned graph; keep every returned handle alive for the process.
+    retained = []
+
     def __exit__(self, *exc):
-        wp.capture_end(stream=self.stream)
+        _task_scope.retained.append(wp.capture_end(stream=self.stream))
         self.scope.__exit__(*exc)
         return self._t.__exit__(*exc)
 
