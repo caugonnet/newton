@@ -48,6 +48,11 @@ import newton.viewer
 import cuda.stf._experimental as stf
 from newton._src.solvers.coupled.solver_coupled import _copy_state
 
+try:
+    from mjwarp_stf_fork import ForkScopes, MjwForkShim, installed as _mjw_installed  # lab: prototypes/
+except ImportError:  # Newton fork branch copy
+    from newton.examples.multiphysics.mjwarp_stf_fork import ForkScopes, MjwForkShim, installed as _mjw_installed
+
 FRAMES = int(os.environ.get("BENCH_FRAMES", 200))
 EXAMPLE = os.environ.get("BENCH_EXAMPLE", "admm_contact")
 DOT = os.environ.get("BENCH_DOT")
@@ -58,6 +63,11 @@ STEEL_FORK = os.environ.get("BENCH_STEEL_FORK", "0") == "1"  # also fork SolverS
 # first substep's head/prepare/accumulate phases; the solve tasks read that token (they read control).
 PRE_SIBLING = os.environ.get("BENCH_PRE_SIBLING", "0") == "1"
 assert not (PRE_SIBLING and STEEL_FORK), "the forked Steel solve tasks do not take the prologue dependency yet"
+# 1: fork SolverMuJoCo entries inside their step (level 2 inside level 1, mujoco_warp unchanged):
+# after kinematics, the mass chain (crb, tendon armature), the constraint assembly and the
+# velocity chain (transmission, fwd_velocity, actuation) run as sibling tasks; join = acceleration,
+# constraint solve, integrator. See mjwarp_stf_fork.py.
+MJW_FORK = os.environ.get("BENCH_MJW_FORK", "0") == "1"
 
 
 def _eval_ik(ex, s_in, s_out):
@@ -288,6 +298,9 @@ def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out, solve_
             if STEEL_FORK and type(entry.solver).__name__ == "SolverSteel":
                 _record_steel_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt)
                 continue
+            if MJW_FORK and type(entry.solver).__name__ == "SolverMuJoCo":
+                _record_mujoco_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt, solve_extra)
+                continue
             with task(toks[name].rw(), t_shared.read(), *solve_extra, symbol=f"solve-{name}"):
                 s._apply_admm_force_inputs(entry, s._admm_buffers[name], dt)
                 s._step_entry(entry, control, contacts, dt)
@@ -311,6 +324,29 @@ def _copy_qd_k(s, name, entry):
         wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
     if buf.joint_qd_k is not None:
         wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
+
+
+def _record_mujoco_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt, solve_extra=()):
+    """Level 2 inside level 1 for a SolverMuJoCo entry: pre (Newton's state/contact
+    staging + kinematics) -> {mass, con, vel} -> join (acceleration, solve, integrator,
+    Newton's post-step copies)."""
+    t_e, t_m, t_c, t_v = toks[name], toks[f"{name}.mass"], toks[f"{name}.con"], toks[f"{name}.vel"]
+    specs = {
+        f"solve-{name}-pre": (t_e.rw(), t_shared.read(), t_m.rw(), t_c.rw(), t_v.rw(), *solve_extra),
+        "mass": (t_e.read(), t_m.rw()),
+        "con": (t_e.read(), t_c.rw()),
+        "vel": (t_e.read(), t_v.rw()),
+        "join": (t_e.rw(), t_m.read(), t_c.read(), t_v.read()),
+    }
+    scopes = ForkScopes(task, specs)
+    sv = entry.solver
+    scopes.enter(f"solve-{name}-pre")
+    s._apply_admm_force_inputs(entry, s._admm_buffers[name], dt)
+    with _mjw_installed(sv, MjwForkShim(type(sv)._mujoco_warp, scopes)) as shim:
+        s._step_entry(entry, control, contacts, dt)
+    assert shim.steps == 1, shim.steps
+    _copy_qd_k(s, name, entry)
+    scopes.exit()
 
 
 def _record_steel_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt):
@@ -423,6 +459,12 @@ def run_stf(ex):
         for name, entry in ex.solver._entries.items():
             if type(entry.solver).__name__ == "SolverSteel":
                 toks[f"{name}.mass"], toks[f"{name}.rows"] = ctx.token(), ctx.token()
+    if MJW_FORK:
+        for name, entry in ex.solver._entries.items():
+            if type(entry.solver).__name__ == "SolverMuJoCo":
+                assert not getattr(entry.solver, "_use_speculative_contacts", False)
+                for part in ("mass", "con", "vel"):
+                    toks[f"{name}.{part}"] = ctx.token()
     t_shared = ctx.token()
     all_rw = [t_shared.rw()] + [toks[n].rw() for n in ex.solver._entries]
 
