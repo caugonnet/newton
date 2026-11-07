@@ -38,14 +38,21 @@ SCENES = {
     "admm_contact": ("multiphysics.example_admm_contact_solver", []),
     "steel_arms": ("steel.example_steel_determinism_arms", []),
     "anymal_lox": ("kamino.example_kamino_robot_anymal_d", ["--dynamics-solver", "lox"]),
+    # NVIDIA/newton-samples (external checkout, env SHOT_SAMPLES_ROOT); absolute module path
+    "franka_pulley": ("examples.multiphysics.example_franka_pulley_mechanical_advantage", []),
 }
 
 
 def shoot(name, out_dir):
     module_path, extra = SCENES[name]
-    mod = importlib.import_module(f"newton.examples.{module_path}")
+    if module_path.startswith("examples."):
+        sys.path.insert(0, os.environ["SHOT_SAMPLES_ROOT"])
+        mod = importlib.import_module(module_path)
+    else:
+        mod = importlib.import_module(f"newton.examples.{module_path}")
     parser = mod.Example.create_parser() if hasattr(mod.Example, "create_parser") else newton.examples.create_parser()
-    args = parser.parse_args(["--viewer", "gl", "--headless", "--num-frames", str(FRAMES + 1), *extra])
+    headless = ["--headless"] if "--headless" in parser.format_help() else []  # newton-samples' runner has no --headless
+    args = parser.parse_args(["--viewer", "gl", *headless, "--num-frames", str(FRAMES + 1), *extra])
     viewer = newton.viewer.ViewerGL(headless=True, num_frames=FRAMES + 1, width=W, height=H)
     example = mod.Example(viewer, args)
     for _ in range(FRAMES):

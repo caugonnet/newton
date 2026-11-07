@@ -20,8 +20,10 @@ there). Timing is reported regardless; the topology line is what the
 measurement README must quote first.
 
 Environment: BENCH_EXAMPLE (admm_contact | mujoco_vbd_admm | kamino_mujoco_admm
-| franka_vbd_cable_admm), BENCH_FRAMES (default 200), BENCH_DOT (dot path),
-BENCH_ARGS (extra example CLI args, e.g. "--substeps 4").
+| franka_vbd_cable_admm | franka_pulley), BENCH_FRAMES (default 200), BENCH_DOT (dot path),
+BENCH_ARGS (extra example CLI args, e.g. "--substeps 4"). franka_pulley is the
+NVIDIA/newton-samples scene (examples/multiphysics/example_franka_pulley_mechanical_advantage.py);
+BENCH_SAMPLES_ROOT must point at a checkout of that repository.
 
 Rules carried from August: warm up before any capture; even substep counts so
 the state double-buffer returns to state_0; never cache a capture-time
@@ -29,10 +31,12 @@ allocation on a persistent attribute (the STF arm disables the example's own
 capture so Newton allocates for real during warm-up).
 """
 
+import contextlib
 import importlib
 import os
 import re
 import shlex
+import sys
 import time
 
 import numpy as np
@@ -50,6 +54,10 @@ DOT = os.environ.get("BENCH_DOT")
 EXTRA_ARGS = shlex.split(os.environ.get("BENCH_ARGS", ""))
 ARM = os.environ.get("BENCH_ARM", "both")
 STEEL_FORK = os.environ.get("BENCH_STEEL_FORK", "0") == "1"  # also fork SolverSteel entries (level 2 inside level 1)  # native | stf | both (one arm per process for nsys)
+# 1: the per-frame prologue (IK solve + control write) runs on its own token, as a sibling of the
+# first substep's head/prepare/accumulate phases; the solve tasks read that token (they read control).
+PRE_SIBLING = os.environ.get("BENCH_PRE_SIBLING", "0") == "1"
+assert not (PRE_SIBLING and STEEL_FORK), "the forked Steel solve tasks do not take the prologue dependency yet"
 
 
 def _eval_ik(ex, s_in, s_out):
@@ -74,16 +82,37 @@ def _franka_frame_pre(ex):
     wp.copy(dest=ex.control_joint_target_q[:, : ex.n_coords], src=ex.ik_joint_q)
 
 
-# name -> (module suffix, per-frame prologue, per-substep pre-step, per-substep post-step)
+def _pulley_frame_pre(ex):
+    # mirrors Example.simulate() of newton-samples' example_franka_pulley_mechanical_advantage
+    ex.ik_solver.step(ex.ik_joint_q, ex.ik_joint_q, iterations=ex.ik_iters)
+    mod = importlib.import_module("examples.multiphysics.example_franka_pulley_mechanical_advantage")
+    wp.launch(
+        mod.set_gripper_target,
+        dim=1,
+        inputs=[ex.ik_joint_q, ex.finger_position, ex.finger_index_0, ex.finger_index_1],
+        device=ex.device,
+    )
+    wp.copy(dest=ex.control_joint_target_q[:, : ex.n_coords], src=ex.ik_joint_q)
+
+
+# name -> (module, per-frame prologue, per-substep pre-step, per-substep post-step)
 # Each mirrors what the example's own simulate() does around solver.step().
 EXAMPLES = {
-    "admm_contact": ("example_admm_contact_solver", None, None, None),
-    "mujoco_vbd_admm": ("example_mujoco_vbd_admm_solver", None, None, _eval_ik),
-    "kamino_mujoco_admm": ("example_kamino_mujoco_admm_solver", None, None, None),
-    "franka_vbd_cable_admm": ("example_mujoco_franka_vbd_cable_admm_solver", _franka_frame_pre, _collide, _eval_ik),
+    "admm_contact": ("newton.examples.multiphysics.example_admm_contact_solver", None, None, None),
+    "mujoco_vbd_admm": ("newton.examples.multiphysics.example_mujoco_vbd_admm_solver", None, None, _eval_ik),
+    "kamino_mujoco_admm": ("newton.examples.multiphysics.example_kamino_mujoco_admm_solver", None, None, None),
+    "franka_vbd_cable_admm": (
+        "newton.examples.multiphysics.example_mujoco_franka_vbd_cable_admm_solver", _franka_frame_pre, _collide, _eval_ik
+    ),
+    # NVIDIA/newton-samples (external checkout, BENCH_SAMPLES_ROOT): MuJoCo Franka + VBD cable/pulleys, ADMM
+    "franka_pulley": (
+        "examples.multiphysics.example_franka_pulley_mechanical_advantage", _pulley_frame_pre, _collide, _eval_ik
+    ),
 }
 _mod_name, FRAME_PRE, SUBSTEP_PRE, SUBSTEP_POST = EXAMPLES[EXAMPLE]
-Example = importlib.import_module(f"newton.examples.multiphysics.{_mod_name}").Example
+if _mod_name.startswith("examples."):
+    sys.path.insert(0, os.environ["BENCH_SAMPLES_ROOT"])
+Example = importlib.import_module(_mod_name).Example
 
 # Kernel -> entry class for the topology summary, built from the Warp kernels
 # registered by each solver package (the CUDA symbol is <key>_<hash>_cuda_kernel_forward).
@@ -149,11 +178,38 @@ def _no_capture(self):
 _ExampleNoCapture = type("_ExampleNoCapture", (Example,), {"capture": _no_capture})
 
 
+class _NoScopedCapture:
+    """Stand-in for wp.ScopedCapture while an example that captures in __init__
+    (newton-samples) is constructed for the STF arm: the frame runs eagerly."""
+
+    graph = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def make_example(cls=Example):
     parser = cls.create_parser()
-    args = parser.parse_args(["--viewer", "null", "--headless", *EXTRA_ARGS])
+    headless = ["--headless"] if "--headless" in parser.format_help() else []
+    args = parser.parse_args(["--viewer", "null", *headless, *EXTRA_ARGS])
     viewer = newton.viewer.ViewerNull()
+    if cls is _ExampleNoCapture and not hasattr(Example, "capture"):
+        with _patched(wp, "ScopedCapture", _NoScopedCapture):
+            return cls(viewer, args)
     return cls(viewer, args)
+
+
+@contextlib.contextmanager
+def _patched(obj, name, value):
+    saved = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, saved)
 
 
 def fingerprint(ex):
@@ -178,10 +234,11 @@ def run_native(ex):
     return (time.perf_counter() - t0) / FRAMES * 1e3
 
 
-def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out):
+def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out, solve_extra=()):
     """SolverCoupled.step() + SolverCoupledADMM._step_coupled() (Newton main
     1a497c00) re-orchestrated as STF tasks, with the per-entry loops split into
-    width-N task groups."""
+    width-N task groups. `solve_extra`: extra dependencies of the solve tasks
+    (the control written by a sibling prologue task)."""
     s = ex.solver
     coupling = s._coupling
     dt = ex.sim_dt
@@ -231,7 +288,7 @@ def record_stf_solver_step(task, ex, toks, t_shared, state_in, state_out):
             if STEEL_FORK and type(entry.solver).__name__ == "SolverSteel":
                 _record_steel_entry_forked(task, s, name, entry, toks, t_shared, control, contacts, dt)
                 continue
-            with task(toks[name].rw(), t_shared.read(), symbol=f"solve-{name}"):
+            with task(toks[name].rw(), t_shared.read(), *solve_extra, symbol=f"solve-{name}"):
                 s._apply_admm_force_inputs(entry, s._admm_buffers[name], dt)
                 s._step_entry(entry, control, contacts, dt)
                 _copy_qd_k(s, name, entry)
@@ -374,13 +431,20 @@ def run_stf(ex):
 
     topo = None
     with ctx.launchable_graph_scope() as scope:
+        solve_extra = ()
         if FRAME_PRE is not None:
-            with task(*all_rw, symbol="frame-pre"):
-                FRAME_PRE(ex)
+            if PRE_SIBLING:
+                t_pre = ctx.token()
+                with task(t_pre.rw(), symbol="frame-pre"):
+                    FRAME_PRE(ex)
+                solve_extra = (t_pre.read(),)
+            else:
+                with task(*all_rw, symbol="frame-pre"):
+                    FRAME_PRE(ex)
         pair = (ex.state_0, ex.state_1)
         for i in range(ex.sim_substeps):
             s_in, s_out = pair if i % 2 == 0 else (pair[1], pair[0])
-            record_stf_solver_step(task, ex, toks, t_shared, s_in, s_out)
+            record_stf_solver_step(task, ex, toks, t_shared, s_in, s_out, solve_extra if i == 0 else ())
         if odd:
             with task(*all_rw, symbol="state-return"):
                 ex.state_0.assign(ex.state_1)
