@@ -478,6 +478,12 @@ class _NullScopes:
     def entry(self, name, phase):
         return contextlib.nullcontext()
 
+    def entry_call(self, name, entry):
+        return contextlib.nullcontext()
+
+    def native(self, symbol):
+        return contextlib.nullcontext()
+
 
 class SolverCoupled(SolverBase, CouplingInterface):
     """Couple multiple solvers through explicit ownership and coupling config.
@@ -3550,11 +3556,15 @@ class SolverCoupled(SolverBase, CouplingInterface):
         control_callback: Callable[[Control | None], None] | None = None,
     ) -> Contacts | None:
         """Step one sub-solver entry, honoring its local substep count."""
-        if filter_contacts:
-            contacts = self._contacts_for_entry(entry, contacts)
-        control = _copy_control_to_entry(control, entry)
-        if control_callback is not None:
-            control_callback(control)
+        # an entry that records its own scope is called inside a scope, where plain
+        # launches must be marked; any other entry runs inside a task already
+        sc = self._active_scopes if getattr(entry.solver, "stf_scoped", False) and self._active_scopes else None
+        with sc.native(f"{entry.name}-inputs") if sc is not None else contextlib.nullcontext():
+            if filter_contacts:
+                contacts = self._contacts_for_entry(entry, contacts)
+            control = _copy_control_to_entry(control, entry)
+            if control_callback is not None:
+                control_callback(control)
         entry_observables = None
         if self._active_observables is not None:
             entry_observables = self._active_observables.entry_observables[entry.name]

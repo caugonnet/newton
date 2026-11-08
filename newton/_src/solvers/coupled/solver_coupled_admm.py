@@ -99,6 +99,7 @@ from .model_view import ModelView
 try:  # optional: coupled step as cuda.stf tasks through cuda.stf's Warp adapter
     from cuda.stf._experimental.interop.warp import scope as _stf_scope
     from cuda.stf._experimental.interop.warp import token as _stf_token
+    from cuda.stf._experimental.interop.warp import warp_native as _stf_warp_native
     from cuda.stf._experimental.interop.warp import warp_task as _stf_warp_task
 except ImportError:  # pragma: no cover
     _stf_scope = None
@@ -466,6 +467,18 @@ class _TaskScopes:
 
     def entry(self, name, phase):
         return _stf_warp_task(self._ctx, self._tok[name].rw(), self._shared.read(), symbol=f"{phase}-{name}")
+
+    def native(self, symbol):
+        return _stf_warp_native(self._ctx, symbol)
+
+    def entry_call(self, name, entry):
+        """The call into the entry solver. A solver that records its own scope
+        (``entry.solver.stf_scoped``) gets a scope with this entry's dependencies
+        (a scope opened inside a task would not be ordered against the task's
+        own launches); any other solver runs inside a plain task."""
+        if getattr(entry.solver, "stf_scoped", False):
+            return _stf_scope(self._ctx, reads=(self._shared,), writes=(self._tok[name],))
+        return self.entry(name, "solve")
 
 
 class SolverCoupledADMM(SolverCoupled):
@@ -3087,19 +3100,32 @@ class SolverCoupledADMM(SolverCoupled):
                 self._accumulate_admm_forces(k, dt, refresh_jv=k == 0, initialize_contact_u=k == 0)
 
             for name, entry in self._entries.items():
-                with sc.entry(name, "solve"):
-                    self._apply_admm_force_inputs(entry, self._admm_buffers[name], dt)
-                    self._step_entry(entry, control, contacts, dt)
-                    buf = self._admm_buffers[name]
-                    if buf.body_qd_k is not None:
-                        wp.copy(buf.body_qd_k, entry.state_1.body_qd)
-                    if buf.particle_qd_k is not None:
-                        wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
-                    if buf.joint_qd_k is not None:
-                        wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
+                if getattr(entry.solver, "stf_scoped", False):
+                    # the entry records its own scope: give it a scope with this entry's
+                    # dependencies, with the input / output copies as tasks around it
+                    with sc.entry(name, "solve-in"):
+                        self._apply_admm_force_inputs(entry, self._admm_buffers[name], dt)
+                    with sc.entry_call(name, entry):
+                        self._step_entry(entry, control, contacts, dt)
+                    with sc.entry(name, "solve-out"):
+                        self._publish_admm_entry_velocity(name, entry)
+                else:
+                    with sc.entry(name, "solve"):
+                        self._apply_admm_force_inputs(entry, self._admm_buffers[name], dt)
+                        self._step_entry(entry, control, contacts, dt)
+                        self._publish_admm_entry_velocity(name, entry)
 
             with sc.barrier("dual"):
                 self._update_admm_dual(k, dt)
+
+    def _publish_admm_entry_velocity(self, name, entry):
+        buf = self._admm_buffers[name]
+        if buf.body_qd_k is not None:
+            wp.copy(buf.body_qd_k, entry.state_1.body_qd)
+        if buf.particle_qd_k is not None:
+            wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
+        if buf.joint_qd_k is not None:
+            wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
 
     #: cuda.stf context given by the frame owner; with ``Config.use_tasks`` the
     #: coupled step opens a scope on it (one node of the caller's graph).
