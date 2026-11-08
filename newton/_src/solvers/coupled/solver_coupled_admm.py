@@ -452,7 +452,9 @@ class _TaskScopes:
         self._scope = None
 
     def __enter__(self):
-        self._scope = _stf_scope(self._ctx) if self._nested else contextlib.nullcontext()
+        self._scope = (
+            _stf_scope(self._ctx, symbol="SolverCoupledADMM.step") if self._nested else contextlib.nullcontext()
+        )
         self._scope.__enter__()
         return self
 
@@ -477,7 +479,12 @@ class _TaskScopes:
         (a scope opened inside a task would not be ordered against the task's
         own launches); any other solver runs inside a plain task."""
         if getattr(entry.solver, "stf_scoped", False):
-            return _stf_scope(self._ctx, reads=(self._shared,), writes=(self._tok[name],))
+            return _stf_scope(
+                self._ctx,
+                reads=(self._shared,),
+                writes=(self._tok[name],),
+                symbol=f"entry {name}: {type(entry.solver).__name__}.step",
+            )
         return self.entry(name, "solve")
 
 
