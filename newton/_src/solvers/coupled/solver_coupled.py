@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from collections.abc import Callable, Iterable, Sequence
@@ -462,6 +463,22 @@ _RESET_RECONCILABLE_FREQUENCIES = frozenset(
 )
 
 
+class _NullScopes:
+    """Phase scopes that do nothing (the sequential coupled step)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def barrier(self, symbol):
+        return contextlib.nullcontext()
+
+    def entry(self, name, phase):
+        return contextlib.nullcontext()
+
+
 class SolverCoupled(SolverBase, CouplingInterface):
     """Couple multiple solvers through explicit ownership and coupling config.
 
@@ -479,6 +496,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
             couplers. The base class steps entries independently and
             reconciles owned state.
     """
+
+    _active_scopes = None
 
     @dataclass(frozen=True)
     class Entry:
@@ -3031,17 +3050,30 @@ class SolverCoupled(SolverBase, CouplingInterface):
         """
         self.validate_observables(observables, contacts)
         self._require_unreduced_contacts(contacts)
-        self._distribute_state(state_in, dt=dt)
-        self._active_observables = observables
-        try:
-            self._step_coupled(state_in, state_out, control, contacts, dt)
-        finally:
-            self._active_observables = None
-        _copy_state(state_in, state_out)
-        self._reconcile_state(state_out)
-        if observables is not None:
-            self._reconcile_observables(observables)
+        with self._step_scopes() as sc:
+            with sc.barrier("distribute"):
+                self._distribute_state(state_in, dt=dt)
+            self._active_observables = observables
+            self._active_scopes = sc
+            try:
+                self._step_coupled(state_in, state_out, control, contacts, dt)
+            finally:
+                self._active_observables = None
+                self._active_scopes = None
+            with sc.barrier("reconcile"):
+                _copy_state(state_in, state_out)
+                self._reconcile_state(state_out)
+                if observables is not None:
+                    self._reconcile_observables(observables)
         self._entry_output_state_valid = True
+
+    def _step_scopes(self):
+        """Phase scopes around :meth:`step`: a context manager whose
+        ``barrier(symbol)`` / ``entry(name, phase)`` wrap the phases of the
+        coupled step. The default does nothing; coupling schemes may return
+        cuda.stf scopes (see :class:`SolverCoupledADMM`). The active scopes
+        are available to :meth:`_step_coupled` as ``self._active_scopes``."""
+        return _NullScopes()
 
     def _reconcile_observables(self, observables: Observables) -> None:
         """Merge body-indexed entry observables into global observable arrays."""
