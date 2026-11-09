@@ -33,10 +33,11 @@ import warp as wp
 
 import newton
 import cuda.stf._experimental as stf
+from cuda.stf._experimental.interop.warp import release_graph_handles, scope, token, warp_task
 from newton.examples.steel.example_steel_determinism_arms import build_scene
 from newton.solvers import SolverSteel
 
-from newton.examples.multiphysics.admm_stf_bench import _task_scope, topology_summary
+from newton.examples.multiphysics.admm_stf_bench import topology_summary
 
 FRAMES = int(os.environ.get("BENCH_FRAMES", 200))
 WORLDS = int(os.environ.get("BENCH_WORLDS", 8))
@@ -263,13 +264,13 @@ def run_stf(sc, fork):
     sc.frame_native()  # warm eagerly
     wp.synchronize()
     ctx = stf.stackable_context()
-    t_s, t_m, t_r = ctx.token(), ctx.token(), ctx.token()
+    t_s, t_m, t_r = token(ctx, "steel"), token(ctx, "steel-mass"), token(ctx, "steel-rows")
 
     def task(*deps, symbol):
-        return _task_scope(ctx.task(*deps, symbol=symbol))
+        return warp_task(ctx, *deps, symbol=symbol)
 
     topo = None
-    with ctx.launchable_graph_scope() as scope:
+    with scope(ctx, launchable=True, symbol="frame: steel") as frame:
         for i in range(SUBSTEPS):
             s_in, s_out = (sc.state_0, sc.state_1) if i % 2 == 0 else (sc.state_1, sc.state_0)
             if not fork:
@@ -294,18 +295,19 @@ def run_stf(sc, fork):
             from cuda.bindings import runtime as cudart
 
             (err,) = cudart.cudaGraphDebugDotPrint(
-                scope.graph, DOT.encode(), cudart.cudaGraphDebugDotFlags.cudaGraphDebugDotFlagsVerbose
+                frame.graph, DOT.encode(), cudart.cudaGraphDebugDotFlags.cudaGraphDebugDotFlagsVerbose
             )
             assert err == cudart.cudaError_t.cudaSuccess, err
             topo = topology_summary(DOT)
-        scope.launch()
+        frame.launch()
         wp.synchronize()
         t0 = time.perf_counter()
         for _ in range(FRAMES):
-            scope.launch()
+            frame.launch()
         wp.synchronize()
         ms = (time.perf_counter() - t0) / FRAMES * 1e3
     ctx.finalize()
+    release_graph_handles()
     return ms, topo
 
 

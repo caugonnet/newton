@@ -5,9 +5,9 @@ frame re-orchestrated as cuda.stf tasks (plan N1 of
 docs/plan-fresh-branches-newton-warp-isaac-2026-11-07.md; this is the port of
 the August bench to Newton main 1a497c00, 2026-11-07).
 
-Recipe (topics/python-stf/README.md): stock Warp main, `cuda.stf._experimental`
-imported directly; every task body runs under `wp.ScopedStream` +
-`wp.capture_begin(external=True)` on the task's stream. Per ADMM iteration the
+Recipe: the frame is one launchable scope of cuda.stf's Warp adapter
+(`cuda.stf._experimental.interop.warp`: `scope`, `warp_task`, `token`); every
+phase is a `warp_task`, so nothing runs outside a task. Per ADMM iteration the
 per-entry prepare and solve loops become width-N task groups (one token per
 entry), the consensus steps (`_accumulate_admm_forces`, `_update_admm_dual`)
 are barrier tasks on every token.
@@ -46,6 +46,7 @@ import newton
 import newton.examples
 import newton.viewer
 import cuda.stf._experimental as stf
+from cuda.stf._experimental.interop.warp import release_graph_handles, scope, token, warp_task
 from newton._src.solvers.coupled.solver_coupled import _copy_state
 
 try:
@@ -152,31 +153,6 @@ def kernel_class_map():
         for key in getattr(module, "kernels", {}):
             out.setdefault(key, cls)
     return out
-
-
-class _task_scope:
-    """Run a task body on the task's stream with Warp adopting the external
-    capture, so allocator/sort paths are capture-safe."""
-
-    def __init__(self, t):
-        self._t = t
-
-    def __enter__(self):
-        self._t.__enter__()
-        self.stream = wp.Stream(wp.get_cuda_device(), cuda_stream=self._t.stream_ptr())
-        self.scope = wp.ScopedStream(self.stream, sync_enter=False, sync_exit=False)
-        self.scope.__enter__()
-        wp.capture_begin(stream=self.stream, external=True)
-        return self
-
-    # Warp's Graph.__del__ destroys the captured cudaGraph_t (release_or_defer(Graph)) even for an
-    # external capture, i.e. the STF-owned graph; keep every returned handle alive for the process.
-    retained = []
-
-    def __exit__(self, *exc):
-        _task_scope.retained.append(wp.capture_end(stream=self.stream))
-        self.scope.__exit__(*exc)
-        return self._t.__exit__(*exc)
 
 
 def _no_capture(self):
@@ -454,29 +430,29 @@ def run_stf(ex):
     ex.simulate()
     wp.synchronize()
     ctx = stf.stackable_context()
-    toks = {name: ctx.token() for name in ex.solver._entries}
+    toks = {name: token(ctx, name) for name in ex.solver._entries}
     if STEEL_FORK:
         for name, entry in ex.solver._entries.items():
             if type(entry.solver).__name__ == "SolverSteel":
-                toks[f"{name}.mass"], toks[f"{name}.rows"] = ctx.token(), ctx.token()
+                toks[f"{name}.mass"], toks[f"{name}.rows"] = token(ctx, f"{name}.mass"), token(ctx, f"{name}.rows")
     if MJW_FORK:
         for name, entry in ex.solver._entries.items():
             if type(entry.solver).__name__ == "SolverMuJoCo":
                 assert not getattr(entry.solver, "_use_speculative_contacts", False)
                 for part in ("mass", "con", "vel"):
-                    toks[f"{name}.{part}"] = ctx.token()
-    t_shared = ctx.token()
+                    toks[f"{name}.{part}"] = token(ctx, f"{name}.{part}")
+    t_shared = token(ctx, "consensus")
     all_rw = [t_shared.rw()] + [toks[n].rw() for n in ex.solver._entries]
 
     def task(*deps, symbol):
-        return _task_scope(ctx.task(*deps, symbol=symbol))
+        return warp_task(ctx, *deps, symbol=symbol)
 
     topo = None
-    with ctx.launchable_graph_scope() as scope:
+    with scope(ctx, launchable=True, symbol=f"frame: {EXAMPLE}") as frame:
         solve_extra = ()
         if FRAME_PRE is not None:
             if PRE_SIBLING:
-                t_pre = ctx.token()
+                t_pre = token(ctx, "frame-pre")
                 with task(t_pre.rw(), symbol="frame-pre"):
                     FRAME_PRE(ex)
                 solve_extra = (t_pre.read(),)
@@ -495,19 +471,20 @@ def run_stf(ex):
             from cuda.bindings import runtime as cudart
 
             (err,) = cudart.cudaGraphDebugDotPrint(
-                scope.graph, DOT.encode(), cudart.cudaGraphDebugDotFlags.cudaGraphDebugDotFlagsVerbose
+                frame.graph, DOT.encode(), cudart.cudaGraphDebugDotFlags.cudaGraphDebugDotFlagsVerbose
             )
             assert err == cudart.cudaError_t.cudaSuccess, err
             topo = topology_summary(DOT)
 
-        scope.launch()  # warm replay
+        frame.launch()  # warm replay
         wp.synchronize()
         t0 = time.perf_counter()
         for _ in range(FRAMES):
-            scope.launch()
+            frame.launch()
         wp.synchronize()
         ms = (time.perf_counter() - t0) / FRAMES * 1e3
     ctx.finalize()
+    release_graph_handles()
     return ms, topo
 
 

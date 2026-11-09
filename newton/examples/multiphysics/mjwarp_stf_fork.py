@@ -27,7 +27,8 @@ import contextlib
 
 class ForkScopes:
     """Sequentially opened task scopes from a dict name -> (deps...). `task(*deps, symbol=)`
-    returns a context manager running the body on the task's stream (the bench recipe)."""
+    returns the context manager of one task (the benches pass cuda.stf's Warp adapter:
+    `warp_task(ctx, *deps, symbol=)`)."""
 
     def __init__(self, task, specs):
         self._task, self._specs, self._cur = task, specs, None
