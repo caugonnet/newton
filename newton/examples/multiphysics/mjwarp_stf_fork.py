@@ -3,8 +3,9 @@
 """Intra-step fork of mujoco_warp's step (3.17.0) as cuda.stf tasks, with mujoco_warp and
 Newton unchanged: a stand-in for the `mujoco_warp` module is set on one SolverMuJoCo
 instance for the duration of a recording; its `step(m, d)` replays `mujoco_warp.step` /
-`forward` stage by stage as tasks: the three chains read the scope token and may overlap,
-the rest takes it read-write (newton._src.solvers.tasks).
+`forward` stage by stage as tasks: the three chains read the scope token, the rest takes
+it read-write (newton._src.solvers.tasks). `mass` may overlap with `con` and `vel`; `vel`
+follows `con` (a second token), see below.
 
 Data flow (MuJoCo's forward pipeline), after kinematics + com_pos + camlight + flex + tendon:
   con  : [collision] -> make_constraint                (geometry, tendon lengths, qvel)
@@ -12,6 +13,12 @@ Data flow (MuJoCo's forward pipeline), after kinematics + com_pos + camlight + f
   vel  : transmission -> fwd_velocity -> fwd_actuation (cdof, ten_J, qvel, ctrl)
 then, sequential again: sensors/energy, fwd_acceleration(factorize) [M, bias, passive,
 actuator], solve [efc, M], rne_postconstraint/sensor_acc, integrator.
+`con` and `vel` are not independent: the equality rows of make_constraint read `cvel` and
+`cdof_dot`, which com_vel (fwd_velocity) writes. mujoco_warp runs make_constraint first, so
+the rows see the previous step's values; `vel` therefore waits for `con` (overlapping them
+changed the result from run to run, measured 2026-11-11).
+Kept for the structure it identifies, not for speed: no gain separable from noise on the
+coupled scenes or on IsaacLab G1 rough (2026-11-11).
 `con` is recorded first: a stock Warp `capture_if`/`capture_while` inside a task re-attaches
 to every graph leaf on resume (hecate 2026-11-07 finding), so the task that may hold one
 (collision under m.opt.graph_conditional) must see no sibling leaves when it is recorded.
@@ -23,7 +30,7 @@ sequence (`installed` wraps `solver.step`), and the stand-in records the mujoco_
 
 import contextlib
 
-from newton._src.solvers.tasks import scope_token, warp_task
+from newton._src.solvers.tasks import scope_token, token, warp_task
 
 
 class MjwForkShim:
@@ -60,14 +67,15 @@ class MjwForkShim:
         seq = scope_token()
         with warp_task(seq.rw(), symbol="kinematics"):
             mjw.fwd_kinematics(m, d)
-        with warp_task(seq.read(), symbol="con"):
+        cvel = token(symbol="cvel")  # make_constraint reads cvel / cdof_dot before com_vel rewrites them
+        with warp_task(seq.read(), cvel.rw(), symbol="con"):
             if m.opt.run_collision_detection:
                 mjw.collision(m, d)
             constraint.make_constraint(m, d)
         with warp_task(seq.read(), symbol="mass"):
             smooth.crb(m, d)
             smooth.tendon_armature(m, d)
-        with warp_task(seq.read(), symbol="vel"):
+        with warp_task(seq.read(), cvel.rw(), symbol="vel"):
             smooth.transmission(m, d)
             mjw.fwd_velocity(m, d)
             mjw.fwd_actuation(m, d)
