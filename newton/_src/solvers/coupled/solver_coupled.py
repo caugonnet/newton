@@ -19,6 +19,7 @@ from ...core.reset import reset_world_selected as _reset_world_selected
 from ...geometry import ParticleFlags, ShapeFlags
 from ...sim import JointType, Model, ModelFlags, StateFlags
 from ..solver import SolverBase
+from ..tasks import scope_token, warp_task
 from .interface import (
     CouplingEndpointKind,
     CouplingInterface,
@@ -463,28 +464,6 @@ _RESET_RECONCILABLE_FREQUENCIES = frozenset(
 )
 
 
-class _NullScopes:
-    """Phase scopes that do nothing (the sequential coupled step)."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def barrier(self, symbol):
-        return contextlib.nullcontext()
-
-    def entry(self, name, phase):
-        return contextlib.nullcontext()
-
-    def entry_call(self, name, entry):
-        return contextlib.nullcontext()
-
-    def native(self, symbol):
-        return contextlib.nullcontext()
-
-
 class SolverCoupled(SolverBase, CouplingInterface):
     """Couple multiple solvers through explicit ownership and coupling config.
 
@@ -502,8 +481,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
             couplers. The base class steps entries independently and
             reconciles owned state.
     """
-
-    _active_scopes = None
 
     @dataclass(frozen=True)
     class Entry:
@@ -3056,30 +3033,22 @@ class SolverCoupled(SolverBase, CouplingInterface):
         """
         self.validate_observables(observables, contacts)
         self._require_unreduced_contacts(contacts)
-        with self._step_scopes() as sc:
-            with sc.barrier("distribute"):
-                self._distribute_state(state_in, dt=dt)
-            self._active_observables = observables
-            self._active_scopes = sc
-            try:
-                self._step_coupled(state_in, state_out, control, contacts, dt)
-            finally:
-                self._active_observables = None
-                self._active_scopes = None
-            with sc.barrier("reconcile"):
-                _copy_state(state_in, state_out)
-                self._reconcile_state(state_out)
-                if observables is not None:
-                    self._reconcile_observables(observables)
+        # Tasks only matter to a subclass that records its own (``records_tasks``, see
+        # newton._src.solvers.tasks); otherwise they are no-ops.
+        seq = scope_token()
+        with warp_task(seq.rw(), symbol="coupled-distribute"):
+            self._distribute_state(state_in, dt=dt)
+        self._active_observables = observables
+        try:
+            self._step_coupled(state_in, state_out, control, contacts, dt)
+        finally:
+            self._active_observables = None
+        with warp_task(seq.rw(), symbol="coupled-reconcile"):
+            _copy_state(state_in, state_out)
+            self._reconcile_state(state_out)
+            if observables is not None:
+                self._reconcile_observables(observables)
         self._entry_output_state_valid = True
-
-    def _step_scopes(self):
-        """Phase scopes around :meth:`step`: a context manager whose
-        ``barrier(symbol)`` / ``entry(name, phase)`` wrap the phases of the
-        coupled step. The default does nothing; coupling schemes may return
-        cuda.stf scopes (see :class:`SolverCoupledADMM`). The active scopes
-        are available to :meth:`_step_coupled` as ``self._active_scopes``."""
-        return _NullScopes()
 
     def _reconcile_observables(self, observables: Observables) -> None:
         """Merge body-indexed entry observables into global observable arrays."""
@@ -3556,10 +3525,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
         control_callback: Callable[[Control | None], None] | None = None,
     ) -> Contacts | None:
         """Step one sub-solver entry, honoring its local substep count."""
-        # an entry that records its own scope is called inside a scope, where plain
-        # launches must be marked; any other entry runs inside a task already
-        sc = self._active_scopes if getattr(entry.solver, "stf_scoped", False) and self._active_scopes else None
-        with sc.native(f"{entry.name}-inputs") if sc is not None else contextlib.nullcontext():
+        seq = scope_token()
+        with warp_task(seq.rw(), symbol=f"{entry.name}-inputs"):
             if filter_contacts:
                 contacts = self._contacts_for_entry(entry, contacts)
             control = _copy_control_to_entry(control, entry)
@@ -3574,10 +3541,17 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 entry_observables = None
 
         def step_solver(state_in: State, state_out: State, step_dt: float) -> None:
-            if entry_observables is None:
-                entry.solver.step(state_in, state_out, control, contacts, step_dt)
+            if getattr(entry.solver, "records_tasks", False):
+                step = contextlib.nullcontext()  # the solver records its own tasks
             else:
-                entry.solver.step(state_in, state_out, control, contacts, step_dt, observables=entry_observables)
+                step = warp_task(seq.rw(), symbol=entry.name)
+            with step:
+                if entry_observables is None:
+                    entry.solver.step(state_in, state_out, control, contacts, step_dt)
+                else:
+                    entry.solver.step(
+                        state_in, state_out, control, contacts, step_dt, observables=entry_observables
+                    )
 
         if entry.in_place:
             substep_dt = dt / float(entry.substeps)
@@ -3592,16 +3566,19 @@ class SolverCoupled(SolverBase, CouplingInterface):
         substep_dt = dt / float(entry.substeps)
         if entry.state_tmp is None:
             raise RuntimeError(f"SolverCoupled.Entry {entry.name!r} is missing a substep scratch state")
-        _copy_same_view_state(entry.state_0, entry.state_1)
+        with warp_task(seq.rw(), symbol=f"{entry.name}-substep-state"):
+            _copy_same_view_state(entry.state_0, entry.state_1)
         state_in = entry.state_1
         state_out = entry.state_tmp
         for substep in range(entry.substeps):
             if substep > 0:
-                _copy_forces(entry.state_0, state_in)
+                with warp_task(seq.rw(), symbol=f"{entry.name}-substep-forces"):
+                    _copy_forces(entry.state_0, state_in)
             step_solver(state_in, state_out, substep_dt)
             state_in, state_out = state_out, state_in
         if state_in is entry.state_tmp:
-            _copy_same_view_state(entry.state_tmp, entry.state_1)
+            with warp_task(seq.rw(), symbol=f"{entry.name}-substep-state"):
+                _copy_same_view_state(entry.state_tmp, entry.state_1)
         return contacts
 
     def _contacts_for_entry(self, entry: SolverEntry, contacts: Contacts | None) -> Contacts | None:

@@ -24,6 +24,7 @@ from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelBuilder,
 from ...sim.articulation import eval_fk, eval_jacobian, eval_mass_matrix
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
+from ..tasks import scope_token, warp_task
 from . import contact_compliance as _contact_compliance
 from ._testing import current_kernel_overrides
 from .contact_torsion import (
@@ -6982,15 +6983,17 @@ class SolverSteel(SolverBase, CouplingInterface):
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             # Rows are built only for articulated models; without articulations every contact reports zero.
             inv_dt = 1.0 / dt if self.model.articulation_count else 0.0
-            wp.launch(
-                compute_contact_spatial_force_from_impulses,
-                dim=observables.contact_f.shape[0],
-                inputs=[*self._contact_force_inputs(contacts, inv_dt), contacts.rigid_contact_max],
-                outputs=[observables.contact_f],
-                device=self.model.device,
-            )
+            with warp_task(scope_token().rw(), symbol="steel-contact-forces"):
+                wp.launch(
+                    compute_contact_spatial_force_from_impulses,
+                    dim=observables.contact_f.shape[0],
+                    inputs=[*self._contact_force_inputs(contacts, inv_dt), contacts.rigid_contact_max],
+                    outputs=[observables.contact_f],
+                    device=self.model.device,
+                )
         if observables is not None and observables.is_requested(self.ObservableKind.BODY_AWAKE):
-            self._copy_body_awake(observables)
+            with warp_task(scope_token().rw(), symbol="steel-body-awake"):
+                self._copy_body_awake(observables)
         return state_out
 
     def _advance(
@@ -7003,334 +7006,390 @@ class SolverSteel(SolverBase, CouplingInterface):
         body_parent_f: wp.array | None,
     ) -> State:
         """Run the stages of :meth:`step` after its input checks."""
-        if self._coupling_patch_history_restore_pending:
-            self._friction_patches.restore_history()
-        elif self._coupling_patch_history_snapshot_pending:
-            self._friction_patches.snapshot_history()
-        self._coupling_patch_history_restore_pending = False
-        self._coupling_patch_history_snapshot_pending = False
-        if self._contact_torsion_enabled:
-            validate_torsion_step(self)
-            if self._device_torsion is not None:
-                # Captured steps defer errors to the device; eager steps raise during preparation.
-                self._device_torsion.deferred_errors = wp.get_stream(self.model.device).is_capturing
-                self._device_torsion.begin_step(state_in, state_out)
-        if self._last_step_dt is not None and abs(self._last_step_dt - dt) > 1.0e-8:
-            # The augmented mass matrix depends on dt through the implicit drive terms.
-            self._force_mass_update = True
-        self._last_step_dt = dt
+        # Under a cuda.stf recording every launch of the step belongs to a task (newton._src.solvers.tasks).
+        # The tasks that take the scope token read-write form the sequence of the step; the two that
+        # read it may overlap.
+        seq = scope_token()
+        with warp_task(seq.rw(), symbol="steel-prepare"):
+            if self._coupling_patch_history_restore_pending:
+                self._friction_patches.restore_history()
+            elif self._coupling_patch_history_snapshot_pending:
+                self._friction_patches.snapshot_history()
+            self._coupling_patch_history_restore_pending = False
+            self._coupling_patch_history_snapshot_pending = False
+            if self._contact_torsion_enabled:
+                validate_torsion_step(self)
+                if self._device_torsion is not None:
+                    # Captured steps defer errors to the device; eager steps raise during preparation.
+                    self._device_torsion.deferred_errors = wp.get_stream(self.model.device).is_capturing
+                    self._device_torsion.begin_step(state_in, state_out)
+            if self._last_step_dt is not None and abs(self._last_step_dt - dt) > 1.0e-8:
+                # The augmented mass matrix depends on dt through the implicit drive terms.
+                self._force_mass_update = True
+            self._last_step_dt = dt
 
-        model = self.model
-        if control is None:
-            control = model.control(clone_variables=False)
-        if self._unarticulated_bodies.size:
+            model = self.model
+            if control is None:
+                control = model.control(clone_variables=False)
+            if self._unarticulated_bodies.size:
+                wp.launch(
+                    copy_unarticulated_body_state,
+                    dim=self._unarticulated_bodies.size,
+                    inputs=[self._unarticulated_bodies, state_in.body_q, state_in.body_qd],
+                    outputs=[state_out.body_q, state_out.body_qd],
+                    device=model.device,
+                )
+            if not model.articulation_count:
+                if model.joint_count:
+                    # Standalone joints keep their coordinates, as their bodies keep their state.
+                    wp.copy(state_out.joint_q, state_in.joint_q)
+                    wp.copy(state_out.joint_qd, state_in.joint_qd)
+                # Bodies outside every articulation carry no parent wrench.
+                for target in (body_parent_f, state_out.body_parent_f):
+                    if target is not None:
+                        target.zero_()
+                self._step += 1
+                return state_out
             wp.launch(
-                copy_unarticulated_body_state,
-                dim=self._unarticulated_bodies.size,
-                inputs=[self._unarticulated_bodies, state_in.body_q, state_in.body_qd],
-                outputs=[state_out.body_q, state_out.body_qd],
+                _flag_disabled_tree_joints,
+                dim=model.joint_count,
+                inputs=[model.joint_enabled, model.joint_articulation, model.joint_world, int(model.world_count)],
+                outputs=[self._disabled_tree_joint],
                 device=model.device,
             )
-        if not model.articulation_count:
-            if model.joint_count:
-                # Standalone joints keep their coordinates, as their bodies keep their state.
-                wp.copy(state_out.joint_q, state_in.joint_q)
-                wp.copy(state_out.joint_qd, state_in.joint_qd)
-            # Bodies outside every articulation carry no parent wrench.
-            for target in (body_parent_f, state_out.body_parent_f):
-                if target is not None:
-                    target.zero_()
-            self._step += 1
-            return state_out
-        wp.launch(
-            _flag_disabled_tree_joints,
-            dim=model.joint_count,
-            inputs=[model.joint_enabled, model.joint_articulation, model.joint_world, int(model.world_count)],
-            outputs=[self._disabled_tree_joint],
-            device=model.device,
-        )
-        if self._enable_joint_friction and model.joint_dof_count:
-            checks = [("joint_friction", model.joint_friction, self._friction_dof_supported)]
-            load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
-            if load_coefficient is not None:
-                supported = (
-                    self._friction_dof_supported if self._joint_friction_load_active else self._friction_dof_unsupported
-                )
-                checks.append(("steel:joint_friction_load_coefficient", load_coefficient, supported))
-            for name, array, _ in checks:
-                if array.shape != (model.joint_dof_count,):
-                    raise ValueError(f"{name} has shape {array.shape}, expected ({model.joint_dof_count},)")
-            for _, array, supported in checks:
-                wp.launch(
-                    flag_invalid_joint_friction,
-                    model.joint_dof_count,
-                    inputs=[array, supported, self._friction_dof_world],
-                    outputs=[self._joint_friction_invalid],
-                    device=model.device,
-                )
-        if self._sleeping is not None:
-            if not math.isfinite(dt) or dt <= 0.0:
-                raise ValueError("Experimental sleeping requires a finite positive timestep")
-            if any(
-                a.size and a.ptr == b.ptr
-                for a, b in (
-                    (state_in.joint_q, state_out.joint_q),
-                    (state_in.joint_qd, state_out.joint_qd),
-                    (state_in.body_q, state_out.body_q),
-                    (state_in.body_qd, state_out.body_qd),
-                )
-            ):
-                raise ValueError("Experimental sleeping requires distinct input/output states")
-            self._sleeping.begin(state_in, control, contacts)
-        if self._double_buffered:
-            self._select_double_buffer()
-        state_aug = self._prepare_augmented_state(state_in)
-        self._begin_dense_rows()
-
-        # Stage 1: forward kinematics, inverse dynamics with implicit drives, and CRBA.
-        self._profile_stage("fk_id_crba")
-        stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
-        # With sleeping, wrenches go to solver-owned history first, so frozen bodies never read a caller buffer.
-        computed_parent_f = self._sleeping.parent_wrenches if self._sleeping is not None else body_parent_f
-        self._stage1_joint_tau(state_in, state_aug, state_out, control, dt)
-        parent_wrench_prescale = None
-        if computed_parent_f is not None:
-            preelim_warning = self._preelim_active and self._connect_count and body_parent_f is not None
-            if preelim_warning and not self._parent_wrench_preelim_warned:
-                self._parent_wrench_preelim_warned = True
-                warnings.warn(
-                    "BODY_PARENT_F leaves out pre-eliminated loop-closure reactions; "
-                    "set enable_bilateral_preelimination=False to include them.",
-                    NewtonWarning,
-                    stacklevel=3,
-                )
-            if stage3_qd is not state_in.joint_qd:
-                # The dynamics start from prescaled velocities; joint_qdd will be measured from the input.
-                wp.launch(
-                    subtract_arrays,
-                    dim=model.joint_dof_count,
-                    inputs=[state_in.joint_qd, stage3_qd],
-                    outputs=[self._parent_wrench_prescale],
-                    device=model.device,
-                )
-                parent_wrench_prescale = self._parent_wrench_prescale
-        self._stage1_crba(state_aug)
-
-        # Stage 2: factor the augmented mass matrix of every articulation group.
-        self._profile_stage("factor")
-        for size in self._for_sizes():
-            if size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size):
-                continue
-            # Fused groups were assembled and factored in stage 1.
-            if self._crba_cholesky_kernels_by_size[size] or self._crba_cholesky_warp_kernels_by_size[size]:
-                pass
-            elif self._execution_plan.use_diagonal_mass(size):
-                self._stage2_factor_diagonal(size)
-            elif self._execution_plan.use_tiled_cholesky(size):
-                self._stage2_cholesky_tiled(size)
-            else:
-                self._stage2_cholesky_loop(size)
-            if size in self._Linv_by_size:
-                self._stage2_invert_lower_factor(size)
-            if self._inverse_cholesky_kernels_by_size[size] is not None:
-                wp.launch(
-                    self._inverse_cholesky_kernels_by_size[size],
-                    dim=self._n_arts_by_size[size] * 32,
-                    inputs=[self._L_by_size[size], self._group_to_art[size], self._mass_update_mask],
-                    outputs=[self._Hinv_by_size[size]],
-                    block_dim=256,
-                    device=model.device,
-                )
-
-        # Stage 3: unconstrained acceleration and velocity prediction.
-        self._profile_stage("unconstrained_velocity")
-        state_aug._joint_qdd.zero_()
-        for size in self._for_sizes():
-            if size == self._sparse_mass_matrix_size:
-                wp.launch(
-                    solve_sparse_mass_matrix,
-                    dim=self._n_arts_by_size[size] * 32,
-                    inputs=[
-                        self._group_to_art[size],
-                        self._articulation_dof_start,
-                        self._sparse_mass_matrix_indices,
-                        self._sparse_Linv,
-                        state_aug._joint_tau,
-                        self._dynamics_art_active,
-                    ],
-                    outputs=[self._sparse_mass_matrix_scratch, state_aug._joint_qdd],
-                    block_dim=128,
-                    device=model.device,
-                )
-                continue
-            if size == self._sparse_diagonal_response_size:
-                wp.launch(
-                    solve_compact_diagonal_mass,
-                    dim=self._n_arts_by_size[size] * size,
-                    inputs=[
-                        self._diagonal_inverse_mass,
-                        self._group_to_art[size],
-                        self._articulation_dof_start,
-                        size,
-                        state_aug._joint_tau,
-                        self._dynamics_art_active,
-                    ],
-                    outputs=[state_aug._joint_qdd],
-                    device=model.device,
-                )
-                continue
-            if self._execution_plan.use_diagonal_mass(size):
-                self._stage3_solve_diagonal(size, state_aug)
-                continue
-            use_tiled = self._trisolve_kernel == "tiled" or (
-                self._trisolve_kernel == "auto" and size > self._small_dof_threshold
-            )
-            if use_tiled:
-                self._stage3_trisolve_tiled(size, state_aug)
-            else:
-                self._stage3_trisolve_loop(size, state_aug)
-        self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
-        if self._joint_friction_load_active:
-            self._stage3_joint_friction_load(state_in, state_aug)
-
-        # Stage 4: constraint rows, responses Y = H^-1 J^T, diagonals and right-hand sides.
-        self._profile_stage("rows")
-        self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
-        if self._contact_torsion_enabled:
-            prepare_torsion_rows(self, state_in, state_aug, contacts)
-        has_contacts = contacts is not None and contacts.rigid_contact_max > 0
-        self._profile_stage("solve")
-        self._solve_matrix_free(state_in, state_aug, contacts, dt)
-
-        # Stage 7: convert the solved velocity to accelerations, integrate and publish.
-        self._profile_stage("integrate")
-        if self._velocity_iterations > 0:
-            # Positions follow the position solve; the velocity-only iterations then refine
-            # the velocity without the position bias.
-            wp.copy(self._v_out_snap, self._v_out)
-            self._compute_velocity_pass_rhs(dt)
-            self._pack_mf_meta(self._mf_rhs_unbiased)
-            freeze_drive_rows = self._velocity_drive_mode == "freeze"
-            if self._propagation_active:
-                self._compute_propagation_velocity_pass_rhs(dt)
-                self._launch_propagation_solve(
-                    self._rhs_unbiased,
-                    self._propagation_rhs_unbiased,
-                    self._velocity_iterations,
-                    regularize=False,
-                    freeze_drive_rows=freeze_drive_rows,
-                )
-            else:
-                self._launch_pgs_solve(
-                    self._rhs_unbiased,
-                    self._velocity_iterations,
-                    regularize=False,
-                    freeze_drive_rows=freeze_drive_rows,
-                )
-            wp.copy(self._qd_work, self._v_out_snap)
-            self._integrate(state_in, state_aug, state_out, dt, self._qd_work)
-            wp.launch(
-                update_qdd_from_velocity,
-                dim=model.joint_dof_count,
-                inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt, self._dynamics_dof_active],
-                outputs=[self._v_out, state_aug._joint_qdd],
-                device=model.device,
-            )
-            if computed_parent_f is not None:
-                # Measure the wrench from the final velocity, transport-corrected as _integrate does.
-                self._remove_free_root_transport(state_in, state_aug)
-            if self._free_root_joint_count:
-                # The integrator damped the position-solve velocity; damp the published one alike.
-                wp.launch(
-                    apply_free_root_damping,
-                    dim=self._free_root_joint_count,
-                    inputs=[
-                        self._free_root_joint_indices,
-                        model.joint_qd_start,
-                        self._kinematic_joint_mask,
-                        model.joint_child,
-                        self._rigid_body_angular_damping,
-                        self._rigid_body_linear_damping,
-                        dt,
-                    ],
-                    outputs=[self._v_out],
-                    device=model.device,
-                )
-            wp.copy(state_out.joint_qd, self._v_out)
-        else:
-            self._integrate(state_in, state_aug, state_out, dt, self._v_out)
-        if computed_parent_f is not None:
-            # Stage 7 replaces the start-of-step motion subspaces this reads.
-            articulation_active = self._dynamics_art_active
-            if self._sleeping is not None:
-                # Unrequested, the history only has to be current for articulations that may fall asleep.
-                articulation_active = self._sleeping.parent_wrench_history_mask(
-                    articulation_active, dt, body_parent_f is not None
-                )
-            self._compute_parent_wrenches(
-                state_in, state_aug, contacts, dt, computed_parent_f, parent_wrench_prescale, articulation_active
-            )
-        self._stage7_update_kinematics(state_out)
-        if self._sleeping is not None:
-            self._sleeping.finish(state_in, state_out, state_aug, dt)
-        if computed_parent_f is not None:
-            published = {}
-            for target in (body_parent_f, state_out.body_parent_f):
-                if target is not None and target.ptr != computed_parent_f.ptr:
-                    published[target.ptr] = target
-            for target in published.values():
-                target.assign(computed_parent_f)
-
-        if self._friction_anchors_enabled:
-            if has_contacts:
-                for route, parents, mu, impulses in self._patch_row_arrays():
+            if self._enable_joint_friction and model.joint_dof_count:
+                checks = [("joint_friction", model.joint_friction, self._friction_dof_supported)]
+                load_coefficient = self._namespaced_attribute("joint_friction_load_coefficient")
+                if load_coefficient is not None:
+                    supported = (
+                        self._friction_dof_supported if self._joint_friction_load_active else self._friction_dof_unsupported
+                    )
+                    checks.append(("steel:joint_friction_load_coefficient", load_coefficient, supported))
+                for name, array, _ in checks:
+                    if array.shape != (model.joint_dof_count,):
+                        raise ValueError(f"{name} has shape {array.shape}, expected ({model.joint_dof_count},)")
+                for _, array, supported in checks:
                     wp.launch(
-                        finish_patch_impulses,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self._friction_patches.current,
-                            state_in.body_q,
-                            state_out.body_q,
-                            state_out.body_qd,
-                            model.body_com,
-                            self._body_to_articulation,
-                            contacts.rigid_contact_surface_velocity,
-                            self._contact_world,
-                            self._contact_slot,
-                            self._contact_path,
-                            self._contact_slots_needed,
-                            route,
-                            parents,
-                            mu,
-                            impulses,
-                            dt,
-                        ],
+                        flag_invalid_joint_friction,
+                        model.joint_dof_count,
+                        inputs=[array, supported, self._friction_dof_world],
+                        outputs=[self._joint_friction_invalid],
                         device=model.device,
                     )
-                self._friction_patches.store(state_in)
-            else:
-                self._friction_patches.previous.valid.zero_()
-        if self._contact_warmstart:
-            self._snapshot_warmstart(contacts, dt)
-        if self._double_buffered:
-            self._clear_double_buffer()
-        if self._row_watermark:
-            self._accumulate_row_watermarks(contacts)
-        if self._device_torsion is not None:
-            self._device_torsion.end_step(state_out)
-            if self._reuse_kinematics_enabled and self._device_torsion.deferred_errors:
-                # A latched torsion error rolled state_out back to its input, which the carry published for the
-                # integrated coordinates no longer describes; the drop runs on the device, so it holds on replay.
-                wp.launch(
-                    _drop_carried_kinematics_on_status,
-                    dim=self.model.articulation_count,
-                    inputs=[self._device_torsion.work.status],
-                    outputs=[self._fk_id_valid],
-                    device=self.model.device,
+            if self._sleeping is not None:
+                if not math.isfinite(dt) or dt <= 0.0:
+                    raise ValueError("Experimental sleeping requires a finite positive timestep")
+                if any(
+                    a.size and a.ptr == b.ptr
+                    for a, b in (
+                        (state_in.joint_q, state_out.joint_q),
+                        (state_in.joint_qd, state_out.joint_qd),
+                        (state_in.body_q, state_out.body_q),
+                        (state_in.body_qd, state_out.body_qd),
+                    )
+                ):
+                    raise ValueError("Experimental sleeping requires distinct input/output states")
+                self._sleeping.begin(state_in, control, contacts)
+            if self._double_buffered:
+                self._select_double_buffer()
+            state_aug = self._prepare_augmented_state(state_in)
+            self._begin_dense_rows()
+
+            # Stage 1: forward kinematics, inverse dynamics with implicit drives, and CRBA.
+            self._profile_stage("fk_id_crba")
+            stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
+            # With sleeping, wrenches go to solver-owned history first, so frozen bodies never read a caller buffer.
+            computed_parent_f = self._sleeping.parent_wrenches if self._sleeping is not None else body_parent_f
+        # The mass-matrix chain (stages 1b-3) and the row build (stage 4a) both start from the FK /
+        # inverse-dynamics outputs and touch disjoint data: they read the scope token and may overlap;
+        # the solve below takes it read-write and waits for both.
+        chain = seq.read() if self._mass_chain_and_rows_independent(state_out, body_parent_f) else seq.rw()
+        with warp_task(chain, symbol="steel-mass"):
+            self._stage1_joint_tau(state_in, state_aug, state_out, control, dt)
+            parent_wrench_prescale = None
+            if computed_parent_f is not None:
+                preelim_warning = self._preelim_active and self._connect_count and body_parent_f is not None
+                if preelim_warning and not self._parent_wrench_preelim_warned:
+                    self._parent_wrench_preelim_warned = True
+                    warnings.warn(
+                        "BODY_PARENT_F leaves out pre-eliminated loop-closure reactions; "
+                        "set enable_bilateral_preelimination=False to include them.",
+                        NewtonWarning,
+                        stacklevel=3,
+                    )
+                if stage3_qd is not state_in.joint_qd:
+                    # The dynamics start from prescaled velocities; joint_qdd will be measured from the input.
+                    wp.launch(
+                        subtract_arrays,
+                        dim=model.joint_dof_count,
+                        inputs=[state_in.joint_qd, stage3_qd],
+                        outputs=[self._parent_wrench_prescale],
+                        device=model.device,
+                    )
+                    parent_wrench_prescale = self._parent_wrench_prescale
+            self._stage1_crba(state_aug)
+
+            # Stage 2: factor the augmented mass matrix of every articulation group.
+            self._profile_stage("factor")
+            for size in self._for_sizes():
+                if size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size):
+                    continue
+                # Fused groups were assembled and factored in stage 1.
+                if self._crba_cholesky_kernels_by_size[size] or self._crba_cholesky_warp_kernels_by_size[size]:
+                    pass
+                elif self._execution_plan.use_diagonal_mass(size):
+                    self._stage2_factor_diagonal(size)
+                elif self._execution_plan.use_tiled_cholesky(size):
+                    self._stage2_cholesky_tiled(size)
+                else:
+                    self._stage2_cholesky_loop(size)
+                if size in self._Linv_by_size:
+                    self._stage2_invert_lower_factor(size)
+                if self._inverse_cholesky_kernels_by_size[size] is not None:
+                    wp.launch(
+                        self._inverse_cholesky_kernels_by_size[size],
+                        dim=self._n_arts_by_size[size] * 32,
+                        inputs=[self._L_by_size[size], self._group_to_art[size], self._mass_update_mask],
+                        outputs=[self._Hinv_by_size[size]],
+                        block_dim=256,
+                        device=model.device,
+                    )
+
+            # Stage 3: unconstrained acceleration and velocity prediction.
+            self._profile_stage("unconstrained_velocity")
+            state_aug._joint_qdd.zero_()
+            for size in self._for_sizes():
+                if size == self._sparse_mass_matrix_size:
+                    wp.launch(
+                        solve_sparse_mass_matrix,
+                        dim=self._n_arts_by_size[size] * 32,
+                        inputs=[
+                            self._group_to_art[size],
+                            self._articulation_dof_start,
+                            self._sparse_mass_matrix_indices,
+                            self._sparse_Linv,
+                            state_aug._joint_tau,
+                            self._dynamics_art_active,
+                        ],
+                        outputs=[self._sparse_mass_matrix_scratch, state_aug._joint_qdd],
+                        block_dim=128,
+                        device=model.device,
+                    )
+                    continue
+                if size == self._sparse_diagonal_response_size:
+                    wp.launch(
+                        solve_compact_diagonal_mass,
+                        dim=self._n_arts_by_size[size] * size,
+                        inputs=[
+                            self._diagonal_inverse_mass,
+                            self._group_to_art[size],
+                            self._articulation_dof_start,
+                            size,
+                            state_aug._joint_tau,
+                            self._dynamics_art_active,
+                        ],
+                        outputs=[state_aug._joint_qdd],
+                        device=model.device,
+                    )
+                    continue
+                if self._execution_plan.use_diagonal_mass(size):
+                    self._stage3_solve_diagonal(size, state_aug)
+                    continue
+                use_tiled = self._trisolve_kernel == "tiled" or (
+                    self._trisolve_kernel == "auto" and size > self._small_dof_threshold
                 )
-        self._step += 1
+                if use_tiled:
+                    self._stage3_trisolve_tiled(size, state_aug)
+                else:
+                    self._stage3_trisolve_loop(size, state_aug)
+            self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
+            if self._joint_friction_load_active:
+                self._stage3_joint_friction_load(state_in, state_aug)
+
+        # Stage 4: constraint rows, responses Y = H^-1 J^T, diagonals and right-hand sides.
+        with warp_task(chain, symbol="steel-rows"):
+            self._profile_stage("rows")
+            self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
+        with warp_task(seq.rw(), symbol="steel-solve"):
+            if self._contact_torsion_enabled:
+                prepare_torsion_rows(self, state_in, state_aug, contacts)
+            has_contacts = contacts is not None and contacts.rigid_contact_max > 0
+            self._profile_stage("solve")
+            self._solve_matrix_free(state_in, state_aug, contacts, dt)
+
+            # Stage 7: convert the solved velocity to accelerations, integrate and publish.
+            self._profile_stage("integrate")
+            if self._velocity_iterations > 0:
+                # Positions follow the position solve; the velocity-only iterations then refine
+                # the velocity without the position bias.
+                wp.copy(self._v_out_snap, self._v_out)
+                self._compute_velocity_pass_rhs(dt)
+                self._pack_mf_meta(self._mf_rhs_unbiased)
+                freeze_drive_rows = self._velocity_drive_mode == "freeze"
+                if self._propagation_active:
+                    self._compute_propagation_velocity_pass_rhs(dt)
+                    self._launch_propagation_solve(
+                        self._rhs_unbiased,
+                        self._propagation_rhs_unbiased,
+                        self._velocity_iterations,
+                        regularize=False,
+                        freeze_drive_rows=freeze_drive_rows,
+                    )
+                else:
+                    self._launch_pgs_solve(
+                        self._rhs_unbiased,
+                        self._velocity_iterations,
+                        regularize=False,
+                        freeze_drive_rows=freeze_drive_rows,
+                    )
+                wp.copy(self._qd_work, self._v_out_snap)
+                self._integrate(state_in, state_aug, state_out, dt, self._qd_work)
+                wp.launch(
+                    update_qdd_from_velocity,
+                    dim=model.joint_dof_count,
+                    inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt, self._dynamics_dof_active],
+                    outputs=[self._v_out, state_aug._joint_qdd],
+                    device=model.device,
+                )
+                if computed_parent_f is not None:
+                    # Measure the wrench from the final velocity, transport-corrected as _integrate does.
+                    self._remove_free_root_transport(state_in, state_aug)
+                if self._free_root_joint_count:
+                    # The integrator damped the position-solve velocity; damp the published one alike.
+                    wp.launch(
+                        apply_free_root_damping,
+                        dim=self._free_root_joint_count,
+                        inputs=[
+                            self._free_root_joint_indices,
+                            model.joint_qd_start,
+                            self._kinematic_joint_mask,
+                            model.joint_child,
+                            self._rigid_body_angular_damping,
+                            self._rigid_body_linear_damping,
+                            dt,
+                        ],
+                        outputs=[self._v_out],
+                        device=model.device,
+                    )
+                wp.copy(state_out.joint_qd, self._v_out)
+            else:
+                self._integrate(state_in, state_aug, state_out, dt, self._v_out)
+            if computed_parent_f is not None:
+                # Stage 7 replaces the start-of-step motion subspaces this reads.
+                articulation_active = self._dynamics_art_active
+                if self._sleeping is not None:
+                    # Unrequested, the history only has to be current for articulations that may fall asleep.
+                    articulation_active = self._sleeping.parent_wrench_history_mask(
+                        articulation_active, dt, body_parent_f is not None
+                    )
+                self._compute_parent_wrenches(
+                    state_in, state_aug, contacts, dt, computed_parent_f, parent_wrench_prescale, articulation_active
+                )
+            self._stage7_update_kinematics(state_out)
+            if self._sleeping is not None:
+                self._sleeping.finish(state_in, state_out, state_aug, dt)
+            if computed_parent_f is not None:
+                published = {}
+                for target in (body_parent_f, state_out.body_parent_f):
+                    if target is not None and target.ptr != computed_parent_f.ptr:
+                        published[target.ptr] = target
+                for target in published.values():
+                    target.assign(computed_parent_f)
+
+            if self._friction_anchors_enabled:
+                if has_contacts:
+                    for route, parents, mu, impulses in self._patch_row_arrays():
+                        wp.launch(
+                            finish_patch_impulses,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                contacts.rigid_contact_count,
+                                self._friction_patches.current,
+                                state_in.body_q,
+                                state_out.body_q,
+                                state_out.body_qd,
+                                model.body_com,
+                                self._body_to_articulation,
+                                contacts.rigid_contact_surface_velocity,
+                                self._contact_world,
+                                self._contact_slot,
+                                self._contact_path,
+                                self._contact_slots_needed,
+                                route,
+                                parents,
+                                mu,
+                                impulses,
+                                dt,
+                            ],
+                            device=model.device,
+                        )
+                    self._friction_patches.store(state_in)
+                else:
+                    self._friction_patches.previous.valid.zero_()
+            if self._contact_warmstart:
+                self._snapshot_warmstart(contacts, dt)
+            if self._double_buffered:
+                self._clear_double_buffer()
+            if self._row_watermark:
+                self._accumulate_row_watermarks(contacts)
+            if self._device_torsion is not None:
+                self._device_torsion.end_step(state_out)
+                if self._reuse_kinematics_enabled and self._device_torsion.deferred_errors:
+                    # A latched torsion error rolled state_out back to its input, which the carry published for the
+                    # integrated coordinates no longer describes; the drop runs on the device, so it holds on replay.
+                    wp.launch(
+                        _drop_carried_kinematics_on_status,
+                        dim=self.model.articulation_count,
+                        inputs=[self._device_torsion.work.status],
+                        outputs=[self._fk_id_valid],
+                        device=self.model.device,
+                    )
+            self._step += 1
         return state_out
+
+    #: The step records its own tasks under a cuda.stf recording (see
+    #: :mod:`newton._src.solvers.tasks`): call it from a scope, not from inside a task.
+    records_tasks = True
+
+    #: Let the mass-matrix chain and the row build overlap; ``False`` keeps the step a sequence.
+    fork_tasks = True
+
+    def _mass_chain_and_rows_independent(self, state_out: State, body_parent_f: wp.array | None) -> bool:
+        """Whether stages 1b-3 (joint torques, mass matrix, factorization, velocity
+        prediction) and stage 4a (constraint rows) touch disjoint data.
+
+        Traced for the default configuration (the row build reads the FK outputs and the
+        contacts, nothing from stages 1b-3). Every option under which the row build reads
+        the velocity prediction, or that was not traced, answers ``False``.
+        """
+        if not self.fork_tasks:
+            return False
+        for flag in (
+            "_contact_compliance",
+            "_contact_torsion_enabled",
+            "_double_buffered",
+            "_enable_joint_friction",
+            "_contact_warmstart",
+            "_row_watermark",
+            "_enable_joint_limits",
+            "_enable_joint_velocity_limits",
+            "_joint_friction_load_active",
+            "_reuse_kinematics_enabled",
+            "_preelim_active",
+            "_sparse_diagonal_contact_solve",
+        ):
+            if getattr(self, flag):
+                return False
+        return (
+            self._sleeping is None
+            and self._device_torsion is None
+            and self._velocity_iterations == 0
+            and self._sparse_mass_matrix_size is None
+            and self._sparse_diagonal_response_size is None
+            and self._rigid_velocity_limit_slot is None
+            and body_parent_f is None
+            and state_out.body_parent_f is None
+        )
 
     def _profile_stage(self, name: str | None) -> None:
         """Close the open stage range and open the NVTX range of stage ``name`` when ``NEWTON_PROFILE`` is set."""

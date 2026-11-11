@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import math
 import warnings
@@ -20,6 +19,7 @@ from ...exceptions import NewtonDeprecationWarning
 from ...geometry.flags import ShapeFlags
 from ...math import quat_between_vectors_robust
 from ...sim import BodyFlags, JointType, ModelFlags, StateFlags
+from ..tasks import scope_token, solver_step, warp_task
 from .admm_contact_stream import (
     AdmmContactStream,
     AdmmContactType,
@@ -95,21 +95,11 @@ from .interface import (
     CouplingEndpointKind,
 )
 from .model_view import ModelView
-
-try:  # optional: coupled step as cuda.stf tasks through cuda.stf's Warp adapter
-    from cuda.stf._experimental.interop.warp import scope as _stf_scope
-    from cuda.stf._experimental.interop.warp import token as _stf_token
-    from cuda.stf._experimental.interop.warp import warp_native as _stf_warp_native
-    from cuda.stf._experimental.interop.warp import warp_task as _stf_warp_task
-except ImportError:  # pragma: no cover
-    _stf_scope = None
-
 from .solver_coupled import (
     SolverCoupled,
     SolverEntry,
     _copy_mapped_spatial_vector,
     _copy_mapped_vec3,
-    _NullScopes,
 )
 
 if TYPE_CHECKING:
@@ -438,58 +428,12 @@ _AdmmQuadraticGroup = (
 _AdmmContactGroup = _AdmmRigidRigidContactGroup | _AdmmRigidParticleContactGroup | _AdmmParticleParticleContactGroup
 
 
-class _TaskScopes:
-    """Phase scopes as cuda.stf tasks inside the solver's own scope: one token
-    per entry, one shared token. Entry phases are siblings (own token rw,
-    shared read); barriers take every token rw. The caller's context is the
-    solver's ``stf_context``; the scope is one node of the caller's graph."""
-
-    def __init__(self, ctx, tokens, shared, nested=True):
-        self._ctx = ctx
-        self._tok = tokens
-        self._shared = shared
-        self._nested = nested  # False: tasks go into the caller's scope (measurement knob)
-        self._scope = None
-
-    def __enter__(self):
-        self._scope = (
-            _stf_scope(self._ctx, symbol="SolverCoupledADMM.step") if self._nested else contextlib.nullcontext()
-        )
-        self._scope.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        sc, self._scope = self._scope, None
-        return sc.__exit__(*exc)
-
-    def barrier(self, symbol):
-        return _stf_warp_task(
-            self._ctx, self._shared.rw(), *[t.rw() for t in self._tok.values()], symbol=f"admm-{symbol}"
-        )
-
-    def entry(self, name, phase):
-        return _stf_warp_task(self._ctx, self._tok[name].rw(), self._shared.read(), symbol=f"{phase}-{name}")
-
-    def native(self, symbol):
-        return _stf_warp_native(self._ctx, symbol)
-
-    def entry_call(self, name, entry):
-        """The call into the entry solver. A solver that records its own scope
-        (``entry.solver.stf_scoped``) gets a scope with this entry's dependencies
-        (a scope opened inside a task would not be ordered against the task's
-        own launches); any other solver runs inside a plain task."""
-        if getattr(entry.solver, "stf_scoped", False):
-            return _stf_scope(
-                self._ctx,
-                reads=(self._shared,),
-                writes=(self._tok[name],),
-                symbol=f"entry {name}: {type(entry.solver).__name__}.step",
-            )
-        return self.entry(name, "solve")
-
-
 class SolverCoupledADMM(SolverCoupled):
     """Couple multiple solvers with linearized ADMM over model-derived constraints."""
+
+    #: The step records its own tasks under a cuda.stf recording (see
+    #: :mod:`newton._src.solvers.tasks`): call it from a scope, not from inside a task.
+    records_tasks = True
 
     BODY_PARTICLE_ATTACHMENT_FREQUENCY = "coupling:body_particle_attachment"
     BODY_PARTICLE_ATTACHMENT_BODY_ATTR = "coupling:body_particle_attachment_body"
@@ -740,12 +684,6 @@ class SolverCoupledADMM(SolverCoupled):
         """
 
         contact_reduction_hashtable_size_factor: float | None = field(default=None, kw_only=True)
-        use_tasks: bool = False
-        """Express the coupled step as cuda.stf tasks (entries as sibling
-        branches, consensus as barriers) through
-        ``cuda.stf._experimental.interop.warp``, inside a scope of the
-        caller's context (``solver.stf_context = ctx``). Without a context or
-        without ``cuda-stf`` the step runs sequentially (one warning)."""
         """Multiplier controlling the internal contact-reduction hash table size.
 
         Must be finite and positive. Increase this independently of the
@@ -3058,18 +2996,15 @@ class SolverCoupledADMM(SolverCoupled):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        """Run ADMM iterations over all sub-solvers.
-
-        With ``Config.use_tasks`` the phases are issued as cuda.stf tasks:
-        per-entry prepare/solve phases are siblings (one token per entry),
-        consensus phases are barriers. The sequence of launches is unchanged.
-        """
+        """Run ADMM iterations over all sub-solvers."""
         del state_out
         coupling = self._coupling
         iters = int(coupling.iterations)
-
-        sc = self._active_scopes or _NullScopes()
-        with sc.barrier("head"):
+        # Under a cuda.stf recording every launch belongs to a task (newton._src.solvers.tasks).
+        # The consensus phases take the scope token read-write and form the sequence of the step;
+        # the per-entry phases touch one entry each, read it, and may overlap.
+        seq = scope_token()
+        with warp_task(seq.rw(), symbol="admm-begin"):
             self._refresh_collision_contact_groups(state_in)
             if float(coupling.gamma) > 0.0:
                 self._refresh_admm_proximal_masks()
@@ -3094,7 +3029,7 @@ class SolverCoupledADMM(SolverCoupled):
 
         for k in range(iters):
             for name, entry in self._entries.items():
-                with sc.entry(name, "prep"):
+                with warp_task(seq.read(), symbol=f"prep-{name}"):
                     self._prepare_admm_iteration_state(
                         entry,
                         self._admm_buffers[name],
@@ -3103,72 +3038,27 @@ class SolverCoupledADMM(SolverCoupled):
                         iteration_restart=k > 0,
                     )
 
-            with sc.barrier("accumulate"):
+            with warp_task(seq.rw(), symbol="admm-accumulate"):
                 self._accumulate_admm_forces(k, dt, refresh_jv=k == 0, initialize_contact_u=k == 0)
 
             for name, entry in self._entries.items():
-                if getattr(entry.solver, "stf_scoped", False):
-                    # the entry records its own scope: give it a scope with this entry's
-                    # dependencies, with the input / output copies as tasks around it
-                    with sc.entry(name, "solve-in"):
+                # One task, or a scope of its own for a solver that records its tasks.
+                with solver_step(entry.solver, seq.read(), symbol=f"solve-{name}"):
+                    entry_seq = scope_token()
+                    with warp_task(entry_seq.rw(), symbol=f"{name}-admm-inputs"):
                         self._apply_admm_force_inputs(entry, self._admm_buffers[name], dt)
-                    with sc.entry_call(name, entry):
-                        self._step_entry(entry, control, contacts, dt)
-                    with sc.entry(name, "solve-out"):
-                        self._publish_admm_entry_velocity(name, entry)
-                else:
-                    with sc.entry(name, "solve"):
-                        self._apply_admm_force_inputs(entry, self._admm_buffers[name], dt)
-                        self._step_entry(entry, control, contacts, dt)
-                        self._publish_admm_entry_velocity(name, entry)
+                    self._step_entry(entry, control, contacts, dt)
+                    with warp_task(entry_seq.rw(), symbol=f"{name}-admm-publish"):
+                        buf = self._admm_buffers[name]
+                        if buf.body_qd_k is not None:
+                            wp.copy(buf.body_qd_k, entry.state_1.body_qd)
+                        if buf.particle_qd_k is not None:
+                            wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
+                        if buf.joint_qd_k is not None:
+                            wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
 
-            with sc.barrier("dual"):
+            with warp_task(seq.rw(), symbol="admm-dual"):
                 self._update_admm_dual(k, dt)
-
-    def _publish_admm_entry_velocity(self, name, entry):
-        buf = self._admm_buffers[name]
-        if buf.body_qd_k is not None:
-            wp.copy(buf.body_qd_k, entry.state_1.body_qd)
-        if buf.particle_qd_k is not None:
-            wp.copy(buf.particle_qd_k, entry.state_1.particle_qd)
-        if buf.joint_qd_k is not None:
-            wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
-
-    #: cuda.stf context given by the frame owner; with ``Config.use_tasks`` the
-    #: coupled step opens a scope on it (one node of the caller's graph).
-    @property
-    def stf_context(self):
-        return getattr(self, "_stf_context", None)
-
-    @stf_context.setter
-    def stf_context(self, ctx):
-        # tokens are created where the context is assigned (the caller's level),
-        # so they outlive every scope the solver opens later
-        self._stf_context = ctx
-        self._stf_tokens = (
-            {name: _stf_token(ctx, f"admm-{name}") for name in self._entries} if ctx is not None else None
-        )
-        self._stf_shared = _stf_token(ctx, "admm-consensus") if ctx is not None else None
-
-    #: open the solver's own scope (one node of the caller's graph; CUDA forbids
-    #: allocation nodes in a child graph) or issue the tasks into the caller's scope
-    stf_nested_scope = True
-
-    _stf_warned = False
-
-    def _step_scopes(self):
-        """Phase scopes for :meth:`SolverCoupled.step`: tasks inside the
-        solver's own scope when ``Config.use_tasks`` and a context was given,
-        no-ops otherwise (warn once)."""
-        if not getattr(self._coupling, "use_tasks", False):
-            return _NullScopes()
-        if _stf_scope is None or self.stf_context is None:
-            if not SolverCoupledADMM._stf_warned:
-                SolverCoupledADMM._stf_warned = True
-                why = "cuda-stf is not installed" if _stf_scope is None else "no stf_context was set on the solver"
-                warnings.warn(f"SolverCoupledADMM.Config.use_tasks=True but {why}; running sequentially", stacklevel=2)
-            return _NullScopes()
-        return _TaskScopes(self.stf_context, self._stf_tokens, self._stf_shared, nested=self.stf_nested_scope)
 
     def _refresh_collision_contact_groups(self, state_in: State) -> None:
         if (
